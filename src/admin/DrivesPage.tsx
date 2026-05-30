@@ -4,6 +4,7 @@ import {
   ChevronDown,
   ChevronRight,
   Download,
+  Filter,
   FolderTree,
   HardDrive,
   PlayCircle,
@@ -411,19 +412,34 @@ export function DrivesPage() {
 
             {/* 如果不是爬虫网盘，内嵌显示跳过目录设置 */}
             {d.kind !== "spider91" && (
-              <SkipDirsPanel
-                drive={d}
-                onSaved={(saved) => {
-                  setList((prev) =>
-                    prev.map((item) =>
-                      item.id === saved.id
-                        ? { ...item, skipDirIds: saved.skipDirIds }
-                        : item
-                    )
-                  );
-                  refreshDriveList();
-                }}
-              />
+              <>
+                <ScanSizeFilterPanel
+                  drive={d}
+                  onSaved={(saved) => {
+                    setList((prev) =>
+                      prev.map((item) =>
+                        item.id === saved.id
+                          ? { ...item, minScanFileSizeBytes: saved.minScanFileSizeBytes }
+                          : item
+                      )
+                    );
+                    refreshDriveList();
+                  }}
+                />
+                <SkipDirsPanel
+                  drive={d}
+                  onSaved={(saved) => {
+                    setList((prev) =>
+                      prev.map((item) =>
+                        item.id === saved.id
+                          ? { ...item, skipDirIds: saved.skipDirIds }
+                          : item
+                      )
+                    );
+                    refreshDriveList();
+                  }}
+                />
+              </>
             )}
           </div>
 
@@ -1118,6 +1134,86 @@ function defaultRootId(kind: Kind): string {
   if (kind === "onedrive") return "root";
   if (kind === "spider91") return "/";
   return "0";
+}
+
+function bytesToMBInput(bytes: number | undefined): string {
+  const n = bytes ?? 0;
+  if (n <= 0) return "";
+  return (n / 1024 / 1024).toFixed(2).replace(/\.?0+$/, "");
+}
+
+type ScanSizeFilterPanelProps = {
+  drive: api.AdminDrive;
+  onSaved: (saved: { id: string; minScanFileSizeBytes: number }) => void;
+};
+
+function ScanSizeFilterPanel({ drive, onSaved }: ScanSizeFilterPanelProps) {
+  const { show } = useToast();
+  const [input, setInput] = useState(() => bytesToMBInput(drive.minScanFileSizeBytes));
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    setInput(bytesToMBInput(drive.minScanFileSizeBytes));
+  }, [drive.id, drive.minScanFileSizeBytes]);
+
+  async function handleSave() {
+    const raw = input.trim();
+    const mb = raw === "" ? 0 : Number(raw);
+    if (!Number.isFinite(mb) || mb < 0) {
+      show("最小文件大小必须是大于等于 0 的数字", "error");
+      return;
+    }
+    const minFileSizeBytes = Math.round(mb * 1024 * 1024);
+    setSaving(true);
+    try {
+      const resp = await api.setDriveScanFilter(drive.id, minFileSizeBytes);
+      onSaved({ id: drive.id, minScanFileSizeBytes: resp.minFileSizeBytes });
+      show("扫描过滤已保存", "success");
+    } catch (e) {
+      show(e instanceof Error ? e.message : "保存失败", "error");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  const current = drive.minScanFileSizeBytes ?? 0;
+
+  return (
+    <div className="admin-detail-card">
+      <header className="admin-detail-card__title">
+        <div className="admin-detail-card__title-left">
+          <Filter size={16} />
+          <span>扫描文件大小过滤</span>
+        </div>
+        <button
+          className="admin-btn is-primary"
+          onClick={handleSave}
+          disabled={saving}
+          style={{ padding: "4px 10px", fontSize: "12px", height: "auto" }}
+        >
+          {saving ? "保存中..." : "保存更改"}
+        </button>
+      </header>
+
+      <div className="admin-form" style={{ maxWidth: "none" }}>
+        <div className="admin-form__row">
+          <label>最小文件大小 (MB)</label>
+          <input
+            type="number"
+            min="0"
+            step="1"
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
+            placeholder="0"
+          />
+          <div className="admin-form__help">
+            0 表示不过滤；小于该大小的视频文件会在下次扫描时跳过。当前值：
+            {current > 0 ? formatBytes(current) : "未启用"}。
+          </div>
+        </div>
+      </div>
+    </div>
+  );
 }
 
 

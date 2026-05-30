@@ -90,6 +90,48 @@ func TestRunIgnoresZeroSizeVideoFiles(t *testing.T) {
 	}
 }
 
+func TestRunSkipsVideoFilesBelowMinSize(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cat.Close(); err != nil {
+			t.Fatalf("close catalog: %v", err)
+		}
+	})
+
+	drv := &scannerFakeDrive{
+		entries: []drives.Entry{
+			{ID: "ad-file", Name: "ad.mp4", Size: 99},
+			{ID: "movie-file", Name: "movie.mp4", Size: 100},
+		},
+	}
+	sc := New(cat, drv, []string{".mp4"}, nil, nil)
+	sc.MinFileSizeBytes = 100
+
+	stats, err := sc.Run(ctx, "")
+	if err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	if stats.Added != 1 {
+		t.Fatalf("added = %d, want only file meeting min size", stats.Added)
+	}
+	if _, ok := stats.SeenFileIDs["ad-file"]; ok {
+		t.Fatalf("seen file ids = %#v, want small file excluded", stats.SeenFileIDs)
+	}
+	if _, ok := stats.SeenFileIDs["movie-file"]; !ok {
+		t.Fatalf("seen file ids = %#v, want movie-file", stats.SeenFileIDs)
+	}
+	if _, err := cat.GetVideo(ctx, "fake-drive-ad-file"); err != sql.ErrNoRows {
+		t.Fatalf("small video lookup error = %v, want sql.ErrNoRows", err)
+	}
+	if _, err := cat.GetVideo(ctx, "fake-drive-movie-file"); err != nil {
+		t.Fatalf("movie video was not added: %v", err)
+	}
+}
+
 func TestRunBackfillsRemoteThumbnailForExistingVideo(t *testing.T) {
 	ctx := context.Background()
 	cat, err := catalog.Open(t.TempDir() + "/catalog.db")

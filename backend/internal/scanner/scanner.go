@@ -23,6 +23,10 @@ type Scanner struct {
 	//
 	// nil / 空集合 → 行为等同于不跳过任何目录。
 	SkipDirIDs map[string]struct{}
+	// MinFileSizeBytes 是扫描入库的最小文件大小阈值。0 表示关闭大小过滤。
+	// 小于该值的视频文件不会进入 SeenFileIDs，因此下一次完整扫描会把既有小文件
+	// 元数据当作不再可见并清理掉。
+	MinFileSizeBytes int64
 	// 回调：新视频被加入后触发 teaser 生成
 	OnNewVideo func(v *catalog.Video)
 	// ProgressInterval 控制扫描内部 heartbeat 的最小输出间隔。
@@ -149,6 +153,9 @@ func (s *Scanner) walk(ctx context.Context, dirID, dirName string, stats *Stats,
 			continue
 		}
 		if e.Size <= 0 {
+			continue
+		}
+		if s.MinFileSizeBytes > 0 && e.Size < s.MinFileSizeBytes {
 			continue
 		}
 		stats.SeenFileIDs[e.ID] = struct{}{}

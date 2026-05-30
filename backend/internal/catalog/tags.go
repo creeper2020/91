@@ -74,6 +74,11 @@ func (c *Catalog) migrate(ctx context.Context) error {
 	if err := c.addColumnIfMissing(ctx, "drives", "skip_dir_ids", "TEXT NOT NULL DEFAULT '[]'"); err != nil {
 		return err
 	}
+	// drives.min_scan_file_size_bytes：每盘扫描入库的最小文件大小阈值。默认 0
+	// 保持旧行为；用户可设为如 100MB，用来过滤下载目录里的广告小视频。
+	if err := c.addColumnIfMissing(ctx, "drives", "min_scan_file_size_bytes", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
 	// 一次性修正：早期版本（短暂存在过）会把现存 drive 的 teaser_enabled 同步成
 	// 旧的全局 preview.enabled 值，导致升级后所有 drive 都是关。"默认开启"约定下，
 	// 这里一次性把所有 drive 强制重置为 1，并用 marker setting 记号，避免之后

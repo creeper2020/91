@@ -1003,13 +1003,14 @@ func (a *App) runScan(ctx context.Context, driveID string) {
 		return
 	}
 	sc := scanner.New(a.cat, drv, a.cfg.Scanner.VideoExtensions, d.SkipDirIDs, onNew)
+	sc.MinFileSizeBytes = d.MinScanFileSizeBytes
 
 	startID := d.ScanRootID
 	if startID == "" {
 		startID = d.RootID
 	}
 
-	log.Printf("[scan] drive=%s start=%s skip_dirs=%d", driveID, startID, len(d.SkipDirIDs))
+	log.Printf("[scan] drive=%s start=%s skip_dirs=%d min_size=%d", driveID, startID, len(d.SkipDirIDs), d.MinScanFileSizeBytes)
 	stats, err := sc.Run(ctx, startID)
 	if err != nil {
 		log.Printf("[scan] drive=%s error: %v", driveID, err)

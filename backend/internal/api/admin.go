@@ -103,6 +103,7 @@ func (a *AdminServer) Register(r chi.Router) {
 			r.Post("/drives/{id}/rescan", a.handleRescan)
 			r.Post("/drives/{id}/teaser-enabled", a.handleSetDriveTeaserEnabled)
 			r.Post("/drives/{id}/skip-dirs", a.handleSetDriveSkipDirs)
+			r.Post("/drives/{id}/scan-filter", a.handleSetDriveScanFilter)
 			r.Get("/drives/{id}/dirtree", a.handleListDriveDirTree)
 			r.Post("/drives/{id}/previews/failed/regenerate", a.handleRegenFailedPreviews)
 			r.Post("/drives/{id}/thumbnails/failed/regenerate", a.handleRegenFailedThumbnails)
@@ -366,6 +367,8 @@ func (a *AdminServer) handleListDrives(w http.ResponseWriter, r *http.Request) {
 		// 前端用它在"设置跳过目录"弹窗里回显已选项；JSON 字段名 camelCase 与
 		// catalog.Drive 保持一致。
 		SkipDirIDs []string `json:"skipDirIds"`
+		// MinScanFileSizeBytes 是扫描入库的最小文件大小阈值；0 表示关闭大小过滤。
+		MinScanFileSizeBytes int64 `json:"minScanFileSizeBytes"`
 		// LastCrawlAt 是 spider91 上次成功爬取的 unix 秒（来自 credentials.last_crawl_at）。
 		// 其它 kind 留 0；前端用它显示"上次抓取: N 小时前"。
 		LastCrawlAt               int64            `json:"lastCrawlAt,omitempty"`
@@ -417,6 +420,7 @@ func (a *AdminServer) handleListDrives(w http.ResponseWriter, r *http.Request) {
 			HasCredential:             hasCred,
 			TeaserEnabled:             d.TeaserEnabled,
 			SkipDirIDs:                append([]string{}, d.SkipDirIDs...),
+			MinScanFileSizeBytes:      d.MinScanFileSizeBytes,
 			LastCrawlAt:               lastCrawlAt,
 			ThumbnailGenerationStatus: generation.Thumbnail,
 			PreviewGenerationStatus:   generation.Preview,
@@ -446,6 +450,8 @@ type upsertDriveReq struct {
 	// 推荐前端"设置跳过目录"走专用 POST /drives/{id}/skip-dirs；
 	// 这里支持是为了允许批量编辑场景一次性提交。
 	SkipDirIDs *[]string `json:"skipDirIds,omitempty"`
+	// MinScanFileSizeBytes 同样支持"未传 = 沿用旧值"；新建时默认 0。
+	MinScanFileSizeBytes *int64 `json:"minScanFileSizeBytes,omitempty"`
 }
 
 func (a *AdminServer) handleUpsertDrive(w http.ResponseWriter, r *http.Request) {
@@ -491,13 +497,26 @@ func (a *AdminServer) handleUpsertDrive(w http.ResponseWriter, r *http.Request) 
 		skipDirIDs = existing.SkipDirIDs
 	}
 
+	minScanFileSizeBytes := int64(0)
+	switch {
+	case body.MinScanFileSizeBytes != nil:
+		minScanFileSizeBytes = *body.MinScanFileSizeBytes
+	case existing != nil:
+		minScanFileSizeBytes = existing.MinScanFileSizeBytes
+	}
+	if minScanFileSizeBytes < 0 {
+		http.Error(w, "minScanFileSizeBytes must be >= 0", http.StatusBadRequest)
+		return
+	}
+
 	d := &catalog.Drive{
 		ID: body.ID, Kind: body.Kind, Name: body.Name,
 		RootID: body.RootID, ScanRootID: body.ScanRootID,
-		Credentials:   body.Credentials,
-		Status:        "disconnected",
-		TeaserEnabled: teaserEnabled,
-		SkipDirIDs:    skipDirIDs,
+		Credentials:          body.Credentials,
+		Status:               "disconnected",
+		TeaserEnabled:        teaserEnabled,
+		SkipDirIDs:           skipDirIDs,
+		MinScanFileSizeBytes: minScanFileSizeBytes,
 	}
 	if err := a.Catalog.UpsertDrive(r.Context(), d); err != nil {
 		writeErr(w, http.StatusInternalServerError, err)
@@ -632,6 +651,44 @@ func (a *AdminServer) handleSetDriveSkipDirs(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "skipDirIds": cleaned})
+}
+
+// scanFilterReq 是 POST /admin/api/drives/{id}/scan-filter 的入参。
+type scanFilterReq struct {
+	MinFileSizeBytes int64 `json:"minFileSizeBytes"`
+}
+
+// handleSetDriveScanFilter 更新某盘的扫描过滤阈值。
+//
+// minFileSizeBytes=0 表示关闭大小过滤。设置后不会立即触发扫描；下次扫描时，小于
+// 阈值的视频文件不会入库，也不会进入 SeenFileIDs，完整扫描会顺带清理既有小文件记录。
+func (a *AdminServer) handleSetDriveScanFilter(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	if id == "" {
+		http.Error(w, "id is required", http.StatusBadRequest)
+		return
+	}
+	var body scanFilterReq
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	if body.MinFileSizeBytes < 0 {
+		http.Error(w, "minFileSizeBytes must be >= 0", http.StatusBadRequest)
+		return
+	}
+	if err := a.Catalog.SetDriveMinScanFileSizeBytes(r.Context(), id, body.MinFileSizeBytes); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			http.Error(w, "drive not found", http.StatusNotFound)
+			return
+		}
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":               true,
+		"minFileSizeBytes": body.MinFileSizeBytes,
+	})
 }
 
 // handleListDriveDirTree 列出某 drive 在指定父目录下的直接子目录。

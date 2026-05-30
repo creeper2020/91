@@ -78,6 +78,9 @@ CREATE TABLE IF NOT EXISTS drives (
     -- 全部子目录都不会被递归扫描，也不会进入 SeenFileIDs / VisitedDirIDs 统计。
     -- 替代了早期硬编码"影视"目录的特例分支。
     skip_dir_ids  TEXT NOT NULL DEFAULT '[]',
+    -- 扫描入库的最小视频文件大小；0 表示不按大小过滤。
+    -- 小于该值的文件不会入库，用来过滤下载目录里夹带的广告小视频。
+    min_scan_file_size_bytes INTEGER NOT NULL DEFAULT 0,
     created_at    INTEGER NOT NULL,
     updated_at    INTEGER NOT NULL
 );

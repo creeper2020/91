@@ -250,6 +250,49 @@ func TestHandleUpsertDrivePreservesExistingCredentialsWhenRequestCredentialsEmpt
 	}
 }
 
+func TestHandleUpsertDrivePreservesExistingMinScanFileSizeWhenOmitted(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cat.Close(); err != nil {
+			t.Fatalf("close catalog: %v", err)
+		}
+	})
+
+	if err := cat.UpsertDrive(ctx, &catalog.Drive{
+		ID: "p115-main", Kind: "p115", Name: "115", RootID: "0", Status: "ok",
+		MinScanFileSizeBytes: 150 * 1024 * 1024,
+	}); err != nil {
+		t.Fatalf("seed drive: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/admin/api/drives", strings.NewReader(`{
+		"id": "p115-main",
+		"kind": "p115",
+		"name": "115 renamed",
+		"rootId": "0",
+		"scanRootId": "0",
+		"credentials": {}
+	}`))
+	rr := httptest.NewRecorder()
+
+	(&AdminServer{Catalog: cat}).handleUpsertDrive(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	got, err := cat.GetDrive(ctx, "p115-main")
+	if err != nil {
+		t.Fatalf("get drive: %v", err)
+	}
+	if got.MinScanFileSizeBytes != 150*1024*1024 {
+		t.Fatalf("min scan size = %d, want 150MiB", got.MinScanFileSizeBytes)
+	}
+}
+
 func TestHandleUpsertDriveReplacesExistingCredentialsWhenProvided(t *testing.T) {
 	ctx := context.Background()
 	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
@@ -297,6 +340,41 @@ func TestHandleUpsertDriveReplacesExistingCredentialsWhenProvided(t *testing.T) 
 	}
 	if got.Credentials["cookie"] != "new-cookie" {
 		t.Fatalf("cookie credential = %q, want new-cookie", got.Credentials["cookie"])
+	}
+}
+
+func TestHandleSetDriveScanFilter(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cat.Close(); err != nil {
+			t.Fatalf("close catalog: %v", err)
+		}
+	})
+	if err := cat.UpsertDrive(ctx, &catalog.Drive{ID: "p115-main", Kind: "p115", Name: "115", RootID: "0"}); err != nil {
+		t.Fatalf("seed drive: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/admin/api/drives/p115-main/scan-filter", strings.NewReader(`{"minFileSizeBytes":104857600}`))
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add("id", "p115-main")
+	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+	rr := httptest.NewRecorder()
+
+	(&AdminServer{Catalog: cat}).handleSetDriveScanFilter(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	got, err := cat.GetDrive(ctx, "p115-main")
+	if err != nil {
+		t.Fatalf("get drive: %v", err)
+	}
+	if got.MinScanFileSizeBytes != 104857600 {
+		t.Fatalf("min scan size = %d, want 104857600", got.MinScanFileSizeBytes)
 	}
 }
 

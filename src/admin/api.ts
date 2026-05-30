@@ -92,6 +92,8 @@ export type AdminDrive = {
    * 替代旧版硬编码 p115 "影视" 目录例外分支。
    */
   skipDirIds: string[];
+  /** 扫描入库的最小文件大小阈值。0 表示不按大小过滤。 */
+  minScanFileSizeBytes: number;
   // spider91 上次成功爬取时间（unix 秒）；其它 kind 留空。
   lastCrawlAt?: number;
   thumbnailGenerationStatus?: DriveGenerationStatus;
@@ -144,6 +146,8 @@ export type UpsertDriveInput = {
    * 这里允许同时上传是为了批量编辑场景。
    */
   skipDirIds?: string[];
+  /** 可选：最小扫描文件大小阈值，单位 bytes。undefined 表示不变。 */
+  minScanFileSizeBytes?: number;
 };
 
 export function upsertDrive(body: UpsertDriveInput) {
@@ -215,6 +219,19 @@ export function setDriveSkipDirIds(id: string, dirIds: string[]) {
     {
       method: "POST",
       body: JSON.stringify({ dirIds }),
+    }
+  );
+}
+
+/**
+ * 设置扫描入库的最小文件大小阈值。0 表示关闭大小过滤。
+ */
+export function setDriveScanFilter(id: string, minFileSizeBytes: number) {
+  return request<{ ok: boolean; minFileSizeBytes: number }>(
+    `/drives/${encodeURIComponent(id)}/scan-filter`,
+    {
+      method: "POST",
+      body: JSON.stringify({ minFileSizeBytes }),
     }
   );
 }

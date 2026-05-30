@@ -1151,9 +1151,11 @@ type Drive struct {
 	// scanner 在 walk 时命中其中任意一个就直接 continue —— 不递归、不收集文件，也
 	// 不参与 stats 统计。替代旧版硬编码"影视"目录的特例分支。
 	// 含义按"目录 ID 自身"匹配，所以同名目录在不同父级下需要分别选定。
-	SkipDirIDs []string  `json:"skipDirIds,omitempty"`
-	CreatedAt  time.Time `json:"createdAt"`
-	UpdatedAt  time.Time `json:"updatedAt"`
+	SkipDirIDs []string `json:"skipDirIds,omitempty"`
+	// MinScanFileSizeBytes 是扫描入库的最小文件大小阈值；0 表示关闭大小过滤。
+	MinScanFileSizeBytes int64     `json:"minScanFileSizeBytes"`
+	CreatedAt            time.Time `json:"createdAt"`
+	UpdatedAt            time.Time `json:"updatedAt"`
 }
 
 func (c *Catalog) UpsertDrive(ctx context.Context, d *Drive) error {
@@ -1162,6 +1164,9 @@ func (c *Catalog) UpsertDrive(ctx context.Context, d *Drive) error {
 	if skipDirs == nil {
 		skipDirs = []string{}
 	}
+	if d.MinScanFileSizeBytes < 0 {
+		d.MinScanFileSizeBytes = 0
+	}
 	skipDirsJSON, _ := json.Marshal(skipDirs)
 	now := time.Now().UnixMilli()
 	if d.CreatedAt.IsZero() {
@@ -1169,26 +1174,27 @@ func (c *Catalog) UpsertDrive(ctx context.Context, d *Drive) error {
 	}
 	d.UpdatedAt = time.UnixMilli(now)
 	_, err := c.db.ExecContext(ctx, `
-INSERT INTO drives (id, kind, name, root_id, scan_root_id, credentials, status, last_error, teaser_enabled, skip_dir_ids, created_at, updated_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+INSERT INTO drives (id, kind, name, root_id, scan_root_id, credentials, status, last_error, teaser_enabled, skip_dir_ids, min_scan_file_size_bytes, created_at, updated_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(id) DO UPDATE SET
-  kind           = excluded.kind,
-  name           = excluded.name,
-  root_id        = excluded.root_id,
-  scan_root_id   = excluded.scan_root_id,
-  credentials    = excluded.credentials,
-  status         = excluded.status,
-  last_error     = excluded.last_error,
-  teaser_enabled = excluded.teaser_enabled,
-  skip_dir_ids   = excluded.skip_dir_ids,
-  updated_at     = excluded.updated_at
-`, d.ID, d.Kind, d.Name, d.RootID, d.ScanRootID, string(cred), d.Status, d.LastError, boolToInt(d.TeaserEnabled), string(skipDirsJSON),
+  kind                     = excluded.kind,
+  name                     = excluded.name,
+  root_id                  = excluded.root_id,
+  scan_root_id             = excluded.scan_root_id,
+  credentials              = excluded.credentials,
+  status                   = excluded.status,
+  last_error               = excluded.last_error,
+  teaser_enabled           = excluded.teaser_enabled,
+  skip_dir_ids             = excluded.skip_dir_ids,
+  min_scan_file_size_bytes = excluded.min_scan_file_size_bytes,
+  updated_at               = excluded.updated_at
+`, d.ID, d.Kind, d.Name, d.RootID, d.ScanRootID, string(cred), d.Status, d.LastError, boolToInt(d.TeaserEnabled), string(skipDirsJSON), d.MinScanFileSizeBytes,
 		d.CreatedAt.UnixMilli(), d.UpdatedAt.UnixMilli())
 	return err
 }
 
 func (c *Catalog) ListDrives(ctx context.Context) ([]*Drive, error) {
-	rows, err := c.db.QueryContext(ctx, `SELECT id, kind, name, root_id, COALESCE(scan_root_id, ''), COALESCE(credentials, '{}'), status, COALESCE(last_error, ''), COALESCE(teaser_enabled, 1), COALESCE(skip_dir_ids, '[]'), created_at, updated_at FROM drives ORDER BY created_at ASC`)
+	rows, err := c.db.QueryContext(ctx, `SELECT id, kind, name, root_id, COALESCE(scan_root_id, ''), COALESCE(credentials, '{}'), status, COALESCE(last_error, ''), COALESCE(teaser_enabled, 1), COALESCE(skip_dir_ids, '[]'), COALESCE(min_scan_file_size_bytes, 0), created_at, updated_at FROM drives ORDER BY created_at ASC`)
 	if err != nil {
 		return nil, err
 	}
@@ -1199,7 +1205,7 @@ func (c *Catalog) ListDrives(ctx context.Context) ([]*Drive, error) {
 		var credsStr, skipDirsStr string
 		var teaserEnabled int
 		var createdAt, updatedAt int64
-		if err := rows.Scan(&d.ID, &d.Kind, &d.Name, &d.RootID, &d.ScanRootID, &credsStr, &d.Status, &d.LastError, &teaserEnabled, &skipDirsStr, &createdAt, &updatedAt); err != nil {
+		if err := rows.Scan(&d.ID, &d.Kind, &d.Name, &d.RootID, &d.ScanRootID, &credsStr, &d.Status, &d.LastError, &teaserEnabled, &skipDirsStr, &d.MinScanFileSizeBytes, &createdAt, &updatedAt); err != nil {
 			return nil, err
 		}
 		_ = json.Unmarshal([]byte(credsStr), &d.Credentials)
@@ -1213,12 +1219,12 @@ func (c *Catalog) ListDrives(ctx context.Context) ([]*Drive, error) {
 }
 
 func (c *Catalog) GetDrive(ctx context.Context, id string) (*Drive, error) {
-	row := c.db.QueryRowContext(ctx, `SELECT id, kind, name, root_id, COALESCE(scan_root_id, ''), COALESCE(credentials, '{}'), status, COALESCE(last_error, ''), COALESCE(teaser_enabled, 1), COALESCE(skip_dir_ids, '[]'), created_at, updated_at FROM drives WHERE id = ?`, id)
+	row := c.db.QueryRowContext(ctx, `SELECT id, kind, name, root_id, COALESCE(scan_root_id, ''), COALESCE(credentials, '{}'), status, COALESCE(last_error, ''), COALESCE(teaser_enabled, 1), COALESCE(skip_dir_ids, '[]'), COALESCE(min_scan_file_size_bytes, 0), created_at, updated_at FROM drives WHERE id = ?`, id)
 	d := &Drive{}
 	var credsStr, skipDirsStr string
 	var teaserEnabled int
 	var createdAt, updatedAt int64
-	if err := row.Scan(&d.ID, &d.Kind, &d.Name, &d.RootID, &d.ScanRootID, &credsStr, &d.Status, &d.LastError, &teaserEnabled, &skipDirsStr, &createdAt, &updatedAt); err != nil {
+	if err := row.Scan(&d.ID, &d.Kind, &d.Name, &d.RootID, &d.ScanRootID, &credsStr, &d.Status, &d.LastError, &teaserEnabled, &skipDirsStr, &d.MinScanFileSizeBytes, &createdAt, &updatedAt); err != nil {
 		return nil, err
 	}
 	_ = json.Unmarshal([]byte(credsStr), &d.Credentials)
@@ -1279,6 +1285,28 @@ func (c *Catalog) SetDriveSkipDirIDs(ctx context.Context, id string, ids []strin
 	res, err := c.db.ExecContext(ctx,
 		`UPDATE drives SET skip_dir_ids = ?, updated_at = ? WHERE id = ?`,
 		string(payload), time.Now().UnixMilli(), id)
+	if err != nil {
+		return err
+	}
+	if rows, err := res.RowsAffected(); err == nil && rows == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
+// SetDriveMinScanFileSizeBytes 重写某盘的最小扫描文件大小阈值。
+//
+// bytes <= 0 等价于关闭大小过滤。drive 不存在时返回 sql.ErrNoRows。
+func (c *Catalog) SetDriveMinScanFileSizeBytes(ctx context.Context, id string, bytes int64) error {
+	if id == "" {
+		return fmt.Errorf("catalog: set drive min_scan_file_size_bytes: empty id")
+	}
+	if bytes < 0 {
+		bytes = 0
+	}
+	res, err := c.db.ExecContext(ctx,
+		`UPDATE drives SET min_scan_file_size_bytes = ?, updated_at = ? WHERE id = ?`,
+		bytes, time.Now().UnixMilli(), id)
 	if err != nil {
 		return err
 	}
