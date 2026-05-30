@@ -27,6 +27,12 @@ type Scanner struct {
 	// 小于该值的视频文件不会进入 SeenFileIDs，因此下一次完整扫描会把既有小文件
 	// 元数据当作不再可见并清理掉。
 	MinFileSizeBytes int64
+	// SkipFileNameKeywords 是按文件名跳过视频的关键词列表。命中后文件不会进入
+	// SeenFileIDs；完整扫描会把既有记录当作不再可见并清理掉，但不会删除源文件。
+	SkipFileNameKeywords []string
+	// DryRun 只收集扫描统计，不写 catalog、不触发新视频回调。清理预览使用它来
+	// 计算如果现在完整扫描会移除哪些媒体库记录。
+	DryRun bool
 	// 回调：新视频被加入后触发 teaser 生成
 	OnNewVideo func(v *catalog.Video)
 	// ProgressInterval 控制扫描内部 heartbeat 的最小输出间隔。
@@ -65,11 +71,12 @@ func New(cat *catalog.Catalog, drv drives.Drive, exts []string, skipDirIDs []str
 }
 
 type Stats struct {
-	Scanned       int
-	Added         int
-	Errors        int
-	SeenFileIDs   map[string]struct{}
-	VisitedDirIDs map[string]struct{}
+	Scanned        int
+	Added          int
+	Errors         int
+	SeenFileIDs    map[string]struct{}
+	SkippedFileIDs map[string]string
+	VisitedDirIDs  map[string]struct{}
 }
 
 // Run 从 Drive.RootID 开始扫描
@@ -78,8 +85,9 @@ func (s *Scanner) Run(ctx context.Context, startDirID string) (Stats, error) {
 		startDirID = s.Drive.RootID()
 	}
 	stats := Stats{
-		SeenFileIDs:   make(map[string]struct{}),
-		VisitedDirIDs: make(map[string]struct{}),
+		SeenFileIDs:    make(map[string]struct{}),
+		SkippedFileIDs: make(map[string]string),
+		VisitedDirIDs:  make(map[string]struct{}),
 	}
 
 	// heartbeat 闭包：进 / 退每个目录、每处理完一个文件后调一下，用一个时间戳节流。
@@ -156,9 +164,18 @@ func (s *Scanner) walk(ctx context.Context, dirID, dirName string, stats *Stats,
 			continue
 		}
 		if s.MinFileSizeBytes > 0 && e.Size < s.MinFileSizeBytes {
+			stats.SkippedFileIDs[e.ID] = "min_size"
+			continue
+		}
+		if keyword, skip := s.matchSkipFileNameKeyword(e.Name); skip {
+			stats.SkippedFileIDs[e.ID] = "filename_keyword:" + keyword
 			continue
 		}
 		stats.SeenFileIDs[e.ID] = struct{}{}
+		if s.DryRun {
+			progress(dirName)
+			continue
+		}
 
 		id := s.Drive.Kind() + "-" + s.Drive.ID() + "-" + e.ID
 		parsed := Parse(e.Name)
@@ -244,6 +261,20 @@ func (s *Scanner) walk(ctx context.Context, dirID, dirName string, stats *Stats,
 		progress(dirName)
 	}
 	return nil
+}
+
+func (s *Scanner) matchSkipFileNameKeyword(name string) (string, bool) {
+	name = strings.ToLower(name)
+	for _, raw := range s.SkipFileNameKeywords {
+		keyword := strings.TrimSpace(raw)
+		if keyword == "" {
+			continue
+		}
+		if strings.Contains(name, strings.ToLower(keyword)) {
+			return keyword, true
+		}
+	}
+	return "", false
 }
 
 func (s *Scanner) findDuplicate(ctx context.Context, hash, fileName string, size int64, currentID string) *catalog.Video {

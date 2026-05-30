@@ -62,12 +62,39 @@ type AdminServer struct {
 	// 用于"设置跳过目录"弹窗按需展开浏览网盘目录树；只返回目录条目，文件忽略。
 	// 调用方应当处理 error 并以 5xx 返回前端。
 	ListDriveDirChildren func(ctx context.Context, driveID, parentID string) ([]DriveDirEntry, error)
+	// GetDriveCleanupPreview dry-run 扫描某个 drive，返回如果现在执行扫描清理会
+	// 从媒体库移除的记录。实现方不能删除源文件或写 catalog。
+	GetDriveCleanupPreview func(ctx context.Context, driveID string) (DriveCleanupPreview, error)
 }
 
 // DriveDirEntry 是 dirtree 接口的一条返回项：网盘上的一个目录节点。
 type DriveDirEntry struct {
 	ID   string `json:"id"`
 	Name string `json:"name"`
+}
+
+type DriveCleanupPreviewItem struct {
+	ID             string `json:"id"`
+	Title          string `json:"title"`
+	FileName       string `json:"fileName"`
+	FileID         string `json:"fileId"`
+	ParentID       string `json:"parentId,omitempty"`
+	Category       string `json:"category,omitempty"`
+	SizeBytes      int64  `json:"sizeBytes"`
+	Reason         string `json:"reason"`
+	MatchedKeyword string `json:"matchedKeyword,omitempty"`
+}
+
+type DriveCleanupPreview struct {
+	DriveID       string                    `json:"driveId"`
+	Scanned       int                       `json:"scanned"`
+	Errors        int                       `json:"errors"`
+	FullDriveScan bool                      `json:"fullDriveScan"`
+	SafeToClean   bool                      `json:"safeToClean"`
+	Reason        string                    `json:"reason,omitempty"`
+	Total         int                       `json:"total"`
+	Limited       bool                      `json:"limited"`
+	Items         []DriveCleanupPreviewItem `json:"items"`
 }
 
 type GenerationStatus struct {
@@ -104,6 +131,7 @@ func (a *AdminServer) Register(r chi.Router) {
 			r.Post("/drives/{id}/teaser-enabled", a.handleSetDriveTeaserEnabled)
 			r.Post("/drives/{id}/skip-dirs", a.handleSetDriveSkipDirs)
 			r.Post("/drives/{id}/scan-filter", a.handleSetDriveScanFilter)
+			r.Get("/drives/{id}/cleanup-preview", a.handleDriveCleanupPreview)
 			r.Get("/drives/{id}/dirtree", a.handleListDriveDirTree)
 			r.Post("/drives/{id}/previews/failed/regenerate", a.handleRegenFailedPreviews)
 			r.Post("/drives/{id}/thumbnails/failed/regenerate", a.handleRegenFailedThumbnails)
@@ -369,6 +397,8 @@ func (a *AdminServer) handleListDrives(w http.ResponseWriter, r *http.Request) {
 		SkipDirIDs []string `json:"skipDirIds"`
 		// MinScanFileSizeBytes 是扫描入库的最小文件大小阈值；0 表示关闭大小过滤。
 		MinScanFileSizeBytes int64 `json:"minScanFileSizeBytes"`
+		// SkipFileNameKeywords 是扫描时按文件名跳过视频的关键词列表。
+		SkipFileNameKeywords []string `json:"skipFileNameKeywords"`
 		// LastCrawlAt 是 spider91 上次成功爬取的 unix 秒（来自 credentials.last_crawl_at）。
 		// 其它 kind 留 0；前端用它显示"上次抓取: N 小时前"。
 		LastCrawlAt               int64            `json:"lastCrawlAt,omitempty"`
@@ -421,6 +451,7 @@ func (a *AdminServer) handleListDrives(w http.ResponseWriter, r *http.Request) {
 			TeaserEnabled:             d.TeaserEnabled,
 			SkipDirIDs:                append([]string{}, d.SkipDirIDs...),
 			MinScanFileSizeBytes:      d.MinScanFileSizeBytes,
+			SkipFileNameKeywords:      append([]string{}, d.SkipFileNameKeywords...),
 			LastCrawlAt:               lastCrawlAt,
 			ThumbnailGenerationStatus: generation.Thumbnail,
 			PreviewGenerationStatus:   generation.Preview,
@@ -452,6 +483,8 @@ type upsertDriveReq struct {
 	SkipDirIDs *[]string `json:"skipDirIds,omitempty"`
 	// MinScanFileSizeBytes 同样支持"未传 = 沿用旧值"；新建时默认 0。
 	MinScanFileSizeBytes *int64 `json:"minScanFileSizeBytes,omitempty"`
+	// SkipFileNameKeywords 同样支持"未传 = 沿用旧值"；新建时默认空数组。
+	SkipFileNameKeywords *[]string `json:"skipFileNameKeywords,omitempty"`
 }
 
 func (a *AdminServer) handleUpsertDrive(w http.ResponseWriter, r *http.Request) {
@@ -509,6 +542,14 @@ func (a *AdminServer) handleUpsertDrive(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	var skipFileNameKeywords []string
+	switch {
+	case body.SkipFileNameKeywords != nil:
+		skipFileNameKeywords = cleanStringList(*body.SkipFileNameKeywords)
+	case existing != nil:
+		skipFileNameKeywords = existing.SkipFileNameKeywords
+	}
+
 	d := &catalog.Drive{
 		ID: body.ID, Kind: body.Kind, Name: body.Name,
 		RootID: body.RootID, ScanRootID: body.ScanRootID,
@@ -517,6 +558,7 @@ func (a *AdminServer) handleUpsertDrive(w http.ResponseWriter, r *http.Request) 
 		TeaserEnabled:        teaserEnabled,
 		SkipDirIDs:           skipDirIDs,
 		MinScanFileSizeBytes: minScanFileSizeBytes,
+		SkipFileNameKeywords: skipFileNameKeywords,
 	}
 	if err := a.Catalog.UpsertDrive(r.Context(), d); err != nil {
 		writeErr(w, http.StatusInternalServerError, err)
@@ -655,13 +697,15 @@ func (a *AdminServer) handleSetDriveSkipDirs(w http.ResponseWriter, r *http.Requ
 
 // scanFilterReq 是 POST /admin/api/drives/{id}/scan-filter 的入参。
 type scanFilterReq struct {
-	MinFileSizeBytes int64 `json:"minFileSizeBytes"`
+	MinFileSizeBytes     int64     `json:"minFileSizeBytes"`
+	SkipFileNameKeywords *[]string `json:"skipFileNameKeywords,omitempty"`
 }
 
 // handleSetDriveScanFilter 更新某盘的扫描过滤阈值。
 //
-// minFileSizeBytes=0 表示关闭大小过滤。设置后不会立即触发扫描；下次扫描时，小于
-// 阈值的视频文件不会入库，也不会进入 SeenFileIDs，完整扫描会顺带清理既有小文件记录。
+// minFileSizeBytes=0 表示关闭大小过滤；skipFileNameKeywords 为空表示关闭文件名
+// 关键词过滤。设置后不会立即触发扫描；下次扫描时，被过滤的视频文件不会入库，也
+// 不会进入 SeenFileIDs，完整扫描会顺带清理既有记录。
 func (a *AdminServer) handleSetDriveScanFilter(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 	if id == "" {
@@ -677,7 +721,21 @@ func (a *AdminServer) handleSetDriveScanFilter(w http.ResponseWriter, r *http.Re
 		http.Error(w, "minFileSizeBytes must be >= 0", http.StatusBadRequest)
 		return
 	}
-	if err := a.Catalog.SetDriveMinScanFileSizeBytes(r.Context(), id, body.MinFileSizeBytes); err != nil {
+
+	keywords := []string{}
+	if body.SkipFileNameKeywords != nil {
+		keywords = cleanStringList(*body.SkipFileNameKeywords)
+	} else if existing, err := a.Catalog.GetDrive(r.Context(), id); err == nil {
+		keywords = existing.SkipFileNameKeywords
+	} else if errors.Is(err, sql.ErrNoRows) {
+		http.Error(w, "drive not found", http.StatusNotFound)
+		return
+	} else {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	if err := a.Catalog.SetDriveScanFilter(r.Context(), id, body.MinFileSizeBytes, keywords); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			http.Error(w, "drive not found", http.StatusNotFound)
 			return
@@ -686,9 +744,53 @@ func (a *AdminServer) handleSetDriveScanFilter(w http.ResponseWriter, r *http.Re
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"ok":               true,
-		"minFileSizeBytes": body.MinFileSizeBytes,
+		"ok":                   true,
+		"minFileSizeBytes":     body.MinFileSizeBytes,
+		"skipFileNameKeywords": keywords,
 	})
+}
+
+func (a *AdminServer) handleDriveCleanupPreview(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	if id == "" {
+		http.Error(w, "id is required", http.StatusBadRequest)
+		return
+	}
+	if a.GetDriveCleanupPreview == nil {
+		http.Error(w, "cleanup preview is not available", http.StatusNotImplemented)
+		return
+	}
+	preview, err := a.GetDriveCleanupPreview(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			http.Error(w, "drive not found", http.StatusNotFound)
+			return
+		}
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, preview)
+}
+
+func cleanStringList(values []string) []string {
+	out := make([]string, 0, len(values))
+	seen := map[string]struct{}{}
+	for _, raw := range values {
+		value := strings.TrimSpace(raw)
+		if value == "" {
+			continue
+		}
+		key := strings.ToLower(value)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, value)
+	}
+	if out == nil {
+		return []string{}
+	}
+	return out
 }
 
 // handleListDriveDirTree 列出某 drive 在指定父目录下的直接子目录。

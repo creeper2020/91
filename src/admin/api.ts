@@ -94,6 +94,8 @@ export type AdminDrive = {
   skipDirIds: string[];
   /** 扫描入库的最小文件大小阈值。0 表示不按大小过滤。 */
   minScanFileSizeBytes: number;
+  /** 扫描时按文件名跳过的视频关键词。命中后不会入库，下次完整扫描会清理既有记录。 */
+  skipFileNameKeywords: string[];
   // spider91 上次成功爬取时间（unix 秒）；其它 kind 留空。
   lastCrawlAt?: number;
   thumbnailGenerationStatus?: DriveGenerationStatus;
@@ -148,6 +150,8 @@ export type UpsertDriveInput = {
   skipDirIds?: string[];
   /** 可选：最小扫描文件大小阈值，单位 bytes。undefined 表示不变。 */
   minScanFileSizeBytes?: number;
+  /** 可选：文件名跳过关键词。undefined 表示不变，空数组表示清空。 */
+  skipFileNameKeywords?: string[];
 };
 
 export function upsertDrive(body: UpsertDriveInput) {
@@ -224,15 +228,54 @@ export function setDriveSkipDirIds(id: string, dirIds: string[]) {
 }
 
 /**
- * 设置扫描入库的最小文件大小阈值。0 表示关闭大小过滤。
+ * 设置扫描过滤条件。minFileSizeBytes=0 表示关闭大小过滤；关键词空数组表示
+ * 关闭文件名过滤。
  */
-export function setDriveScanFilter(id: string, minFileSizeBytes: number) {
-  return request<{ ok: boolean; minFileSizeBytes: number }>(
+export function setDriveScanFilter(
+  id: string,
+  minFileSizeBytes: number,
+  skipFileNameKeywords: string[]
+) {
+  return request<{
+    ok: boolean;
+    minFileSizeBytes: number;
+    skipFileNameKeywords: string[];
+  }>(
     `/drives/${encodeURIComponent(id)}/scan-filter`,
     {
       method: "POST",
-      body: JSON.stringify({ minFileSizeBytes }),
+      body: JSON.stringify({ minFileSizeBytes, skipFileNameKeywords }),
     }
+  );
+}
+
+export type DriveCleanupPreviewItem = {
+  id: string;
+  title: string;
+  fileName: string;
+  fileId: string;
+  parentId?: string;
+  category?: string;
+  sizeBytes: number;
+  reason: "missing" | "min_size" | "filename_keyword" | string;
+  matchedKeyword?: string;
+};
+
+export type DriveCleanupPreview = {
+  driveId: string;
+  scanned: number;
+  errors: number;
+  fullDriveScan: boolean;
+  safeToClean: boolean;
+  reason?: string;
+  total: number;
+  limited: boolean;
+  items: DriveCleanupPreviewItem[];
+};
+
+export function getDriveCleanupPreview(id: string) {
+  return request<DriveCleanupPreview>(
+    `/drives/${encodeURIComponent(id)}/cleanup-preview`
   );
 }
 

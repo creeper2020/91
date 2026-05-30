@@ -132,6 +132,48 @@ func TestRunSkipsVideoFilesBelowMinSize(t *testing.T) {
 	}
 }
 
+func TestRunSkipsVideoFilesByFileNameKeyword(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cat.Close(); err != nil {
+			t.Fatalf("close catalog: %v", err)
+		}
+	})
+
+	drv := &scannerFakeDrive{
+		entries: []drives.Entry{
+			{ID: "ad-file", Name: "开头广告_telegram.mp4", Size: 1024},
+			{ID: "movie-file", Name: "movie.mp4", Size: 1024},
+		},
+	}
+	sc := New(cat, drv, []string{".mp4"}, nil, nil)
+	sc.SkipFileNameKeywords = []string{"广告", "Telegram"}
+
+	stats, err := sc.Run(ctx, "")
+	if err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	if stats.Added != 1 {
+		t.Fatalf("added = %d, want only file without keyword", stats.Added)
+	}
+	if _, ok := stats.SeenFileIDs["ad-file"]; ok {
+		t.Fatalf("seen file ids = %#v, want keyword file excluded", stats.SeenFileIDs)
+	}
+	if got := stats.SkippedFileIDs["ad-file"]; got != "filename_keyword:广告" {
+		t.Fatalf("skipped reason = %q, want filename_keyword:广告", got)
+	}
+	if _, err := cat.GetVideo(ctx, "fake-drive-ad-file"); err != sql.ErrNoRows {
+		t.Fatalf("keyword video lookup error = %v, want sql.ErrNoRows", err)
+	}
+	if _, err := cat.GetVideo(ctx, "fake-drive-movie-file"); err != nil {
+		t.Fatalf("movie video was not added: %v", err)
+	}
+}
+
 func TestRunBackfillsRemoteThumbnailForExistingVideo(t *testing.T) {
 	ctx := context.Background()
 	cat, err := catalog.Open(t.TempDir() + "/catalog.db")

@@ -81,6 +81,9 @@ CREATE TABLE IF NOT EXISTS drives (
     -- 扫描入库的最小视频文件大小；0 表示不按大小过滤。
     -- 小于该值的文件不会入库，用来过滤下载目录里夹带的广告小视频。
     min_scan_file_size_bytes INTEGER NOT NULL DEFAULT 0,
+    -- 扫描时按文件名关键词跳过的视频文件（JSON array of string）。
+    -- 命中关键词的文件不会入库，用来过滤广告、防迷路、推广等夹带小视频。
+    skip_file_name_keywords TEXT NOT NULL DEFAULT '[]',
     created_at    INTEGER NOT NULL,
     updated_at    INTEGER NOT NULL
 );

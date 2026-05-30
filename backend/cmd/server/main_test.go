@@ -15,6 +15,7 @@ import (
 	"github.com/video-site/backend/internal/drives"
 	"github.com/video-site/backend/internal/fingerprint"
 	"github.com/video-site/backend/internal/preview"
+	"github.com/video-site/backend/internal/proxy"
 )
 
 func TestRegisterPreviewWorkerBackfillsPendingWhenDriveTeaserEnabled(t *testing.T) {
@@ -547,6 +548,96 @@ func TestCleanupMissingPikPakVideosRemovesDatabaseRowsAndLocalAssets(t *testing.
 	}
 }
 
+func TestPreviewDriveCleanupReportsFilteredAndMissingVideosWithoutDeleting(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(filepath.Join(t.TempDir(), "catalog.db"))
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cat.Close(); err != nil {
+			t.Fatalf("close catalog: %v", err)
+		}
+	})
+
+	if err := cat.UpsertDrive(ctx, &catalog.Drive{
+		ID:                   "p115-main",
+		Kind:                 "p115",
+		Name:                 "115",
+		RootID:               "root",
+		MinScanFileSizeBytes: 100,
+		SkipFileNameKeywords: []string{"广告"},
+	}); err != nil {
+		t.Fatalf("seed drive: %v", err)
+	}
+
+	now := time.Date(2026, 5, 29, 12, 0, 0, 0, time.UTC)
+	for _, v := range []*catalog.Video{
+		{ID: "video-live", DriveID: "p115-main", FileID: "live-file", FileName: "movie.mp4", Title: "Movie", ParentID: "root", Size: 200},
+		{ID: "video-ad", DriveID: "p115-main", FileID: "ad-file", FileName: "片头广告.mp4", Title: "Ad", ParentID: "root", Size: 200},
+		{ID: "video-small", DriveID: "p115-main", FileID: "small-file", FileName: "small.mp4", Title: "Small", ParentID: "root", Size: 50},
+		{ID: "video-missing", DriveID: "p115-main", FileID: "missing-file", FileName: "missing.mp4", Title: "Missing", ParentID: "root", Size: 200},
+	} {
+		v.PreviewStatus = "ready"
+		v.PublishedAt = now
+		v.CreatedAt = now
+		v.UpdatedAt = now
+		if err := cat.UpsertVideo(ctx, v); err != nil {
+			t.Fatalf("seed video %s: %v", v.ID, err)
+		}
+	}
+
+	reg := proxy.NewRegistry()
+	reg.Set("p115-main", &serverCleanupPreviewFakeDrive{
+		id:     "p115-main",
+		kind:   "p115",
+		rootID: "root",
+		entries: map[string][]drives.Entry{
+			"root": {
+				{ID: "live-file", ParentID: "root", Name: "movie.mp4", Size: 200},
+				{ID: "ad-file", ParentID: "root", Name: "片头广告.mp4", Size: 200},
+				{ID: "small-file", ParentID: "root", Name: "small.mp4", Size: 50},
+			},
+		},
+	})
+	app := &App{
+		cfg:      &config.Config{Scanner: config.Scanner{VideoExtensions: []string{".mp4"}}},
+		cat:      cat,
+		registry: reg,
+	}
+
+	preview, err := app.previewDriveCleanup(ctx, "p115-main")
+	if err != nil {
+		t.Fatalf("preview cleanup: %v", err)
+	}
+	if !preview.SafeToClean {
+		t.Fatalf("safeToClean = false, reason=%q", preview.Reason)
+	}
+	if preview.Total != 3 {
+		t.Fatalf("total = %d, want 3", preview.Total)
+	}
+	reasons := map[string]string{}
+	keywords := map[string]string{}
+	for _, item := range preview.Items {
+		reasons[item.FileID] = item.Reason
+		keywords[item.FileID] = item.MatchedKeyword
+	}
+	if reasons["ad-file"] != "filename_keyword" || keywords["ad-file"] != "广告" {
+		t.Fatalf("ad reason=%q keyword=%q, want filename_keyword/广告", reasons["ad-file"], keywords["ad-file"])
+	}
+	if reasons["small-file"] != "min_size" {
+		t.Fatalf("small reason = %q, want min_size", reasons["small-file"])
+	}
+	if reasons["missing-file"] != "missing" {
+		t.Fatalf("missing reason = %q, want missing", reasons["missing-file"])
+	}
+	for _, id := range []string{"video-ad", "video-small", "video-missing"} {
+		if _, err := cat.GetVideo(ctx, id); err != nil {
+			t.Fatalf("preview deleted %s: %v", id, err)
+		}
+	}
+}
+
 func TestCleanupDuplicateVideoAssetsRemovesOnlyDuplicateLocalAssets(t *testing.T) {
 	ctx := context.Background()
 	localDir := t.TempDir()
@@ -710,6 +801,38 @@ func (d *serverFakeDrive) EnsureDir(context.Context, string) (string, error) {
 	return "", drives.ErrNotSupported
 }
 func (d *serverFakeDrive) RootID() string { return "root" }
+
+type serverCleanupPreviewFakeDrive struct {
+	id      string
+	kind    string
+	rootID  string
+	entries map[string][]drives.Entry
+}
+
+func (d *serverCleanupPreviewFakeDrive) Kind() string { return d.kind }
+func (d *serverCleanupPreviewFakeDrive) ID() string   { return d.id }
+func (d *serverCleanupPreviewFakeDrive) Init(context.Context) error {
+	return nil
+}
+func (d *serverCleanupPreviewFakeDrive) List(_ context.Context, parentID string) ([]drives.Entry, error) {
+	if parentID == "" {
+		parentID = d.rootID
+	}
+	return d.entries[parentID], nil
+}
+func (d *serverCleanupPreviewFakeDrive) Stat(context.Context, string) (*drives.Entry, error) {
+	return nil, drives.ErrNotSupported
+}
+func (d *serverCleanupPreviewFakeDrive) StreamURL(context.Context, string) (*drives.StreamLink, error) {
+	return nil, drives.ErrNotSupported
+}
+func (d *serverCleanupPreviewFakeDrive) Upload(context.Context, string, string, io.Reader, int64) (string, error) {
+	return "", drives.ErrNotSupported
+}
+func (d *serverCleanupPreviewFakeDrive) EnsureDir(context.Context, string) (string, error) {
+	return "", drives.ErrNotSupported
+}
+func (d *serverCleanupPreviewFakeDrive) RootID() string { return d.rootID }
 
 type serverFingerprintFakeDrive struct {
 	serverFakeDrive

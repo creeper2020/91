@@ -358,7 +358,7 @@ func TestHandleSetDriveScanFilter(t *testing.T) {
 		t.Fatalf("seed drive: %v", err)
 	}
 
-	req := httptest.NewRequest(http.MethodPost, "/admin/api/drives/p115-main/scan-filter", strings.NewReader(`{"minFileSizeBytes":104857600}`))
+	req := httptest.NewRequest(http.MethodPost, "/admin/api/drives/p115-main/scan-filter", strings.NewReader(`{"minFileSizeBytes":104857600,"skipFileNameKeywords":["广告"," telegram ","广告"]}`))
 	rctx := chi.NewRouteContext()
 	rctx.URLParams.Add("id", "p115-main")
 	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
@@ -375,6 +375,65 @@ func TestHandleSetDriveScanFilter(t *testing.T) {
 	}
 	if got.MinScanFileSizeBytes != 104857600 {
 		t.Fatalf("min scan size = %d, want 104857600", got.MinScanFileSizeBytes)
+	}
+	if len(got.SkipFileNameKeywords) != 2 || got.SkipFileNameKeywords[0] != "广告" || got.SkipFileNameKeywords[1] != "telegram" {
+		t.Fatalf("skip keywords = %#v, want cleaned keywords", got.SkipFileNameKeywords)
+	}
+	var body struct {
+		MinFileSizeBytes     int64    `json:"minFileSizeBytes"`
+		SkipFileNameKeywords []string `json:"skipFileNameKeywords"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if body.MinFileSizeBytes != 104857600 || len(body.SkipFileNameKeywords) != 2 {
+		t.Fatalf("response = %#v, want filter values", body)
+	}
+}
+
+func TestHandleDriveCleanupPreview(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/admin/api/drives/p115-main/cleanup-preview", nil)
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add("id", "p115-main")
+	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+	rr := httptest.NewRecorder()
+
+	called := false
+	(&AdminServer{
+		GetDriveCleanupPreview: func(ctx context.Context, driveID string) (DriveCleanupPreview, error) {
+			called = true
+			if driveID != "p115-main" {
+				t.Fatalf("driveID = %q, want p115-main", driveID)
+			}
+			return DriveCleanupPreview{
+				DriveID:       driveID,
+				Scanned:       3,
+				FullDriveScan: true,
+				SafeToClean:   true,
+				Total:         1,
+				Items: []DriveCleanupPreviewItem{{
+					ID:       "video-1",
+					Title:    "Ad",
+					FileName: "广告.mp4",
+					FileID:   "file-1",
+					Reason:   "filename_keyword",
+				}},
+			}, nil
+		},
+	}).handleDriveCleanupPreview(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	if !called {
+		t.Fatalf("preview callback was not called")
+	}
+	var body DriveCleanupPreview
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if body.Total != 1 || len(body.Items) != 1 || body.Items[0].Reason != "filename_keyword" {
+		t.Fatalf("response = %#v, want cleanup preview item", body)
 	}
 }
 

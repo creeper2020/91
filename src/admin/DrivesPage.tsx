@@ -13,6 +13,7 @@ import {
   PowerOff,
   RefreshCw,
   RotateCcw,
+  Search,
   Trash2,
 } from "lucide-react";
 import * as api from "./api";
@@ -419,7 +420,11 @@ export function DrivesPage() {
                     setList((prev) =>
                       prev.map((item) =>
                         item.id === saved.id
-                          ? { ...item, minScanFileSizeBytes: saved.minScanFileSizeBytes }
+                          ? {
+                              ...item,
+                              minScanFileSizeBytes: saved.minScanFileSizeBytes,
+                              skipFileNameKeywords: saved.skipFileNameKeywords,
+                            }
                           : item
                       )
                     );
@@ -1142,19 +1147,43 @@ function bytesToMBInput(bytes: number | undefined): string {
   return (n / 1024 / 1024).toFixed(2).replace(/\.?0+$/, "");
 }
 
+function parseKeywordInput(input: string): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of input.split(/\r?\n|[,，]/)) {
+    const value = raw.trim();
+    if (!value) continue;
+    const key = value.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(value);
+  }
+  return out;
+}
+
 type ScanSizeFilterPanelProps = {
   drive: api.AdminDrive;
-  onSaved: (saved: { id: string; minScanFileSizeBytes: number }) => void;
+  onSaved: (saved: {
+    id: string;
+    minScanFileSizeBytes: number;
+    skipFileNameKeywords: string[];
+  }) => void;
 };
 
 function ScanSizeFilterPanel({ drive, onSaved }: ScanSizeFilterPanelProps) {
   const { show } = useToast();
   const [input, setInput] = useState(() => bytesToMBInput(drive.minScanFileSizeBytes));
+  const [keywordsInput, setKeywordsInput] = useState(() => (drive.skipFileNameKeywords ?? []).join("\n"));
+  const [preview, setPreview] = useState<api.DriveCleanupPreview | null>(null);
   const [saving, setSaving] = useState(false);
+  const [previewing, setPreviewing] = useState(false);
+  const savedKeywordsText = (drive.skipFileNameKeywords ?? []).join("\n");
 
   useEffect(() => {
     setInput(bytesToMBInput(drive.minScanFileSizeBytes));
-  }, [drive.id, drive.minScanFileSizeBytes]);
+    setKeywordsInput(savedKeywordsText);
+    setPreview(null);
+  }, [drive.id, drive.minScanFileSizeBytes, savedKeywordsText]);
 
   async function handleSave() {
     const raw = input.trim();
@@ -1164,10 +1193,17 @@ function ScanSizeFilterPanel({ drive, onSaved }: ScanSizeFilterPanelProps) {
       return;
     }
     const minFileSizeBytes = Math.round(mb * 1024 * 1024);
+    const skipFileNameKeywords = parseKeywordInput(keywordsInput);
     setSaving(true);
     try {
-      const resp = await api.setDriveScanFilter(drive.id, minFileSizeBytes);
-      onSaved({ id: drive.id, minScanFileSizeBytes: resp.minFileSizeBytes });
+      const resp = await api.setDriveScanFilter(drive.id, minFileSizeBytes, skipFileNameKeywords);
+      setKeywordsInput((resp.skipFileNameKeywords ?? []).join("\n"));
+      setPreview(null);
+      onSaved({
+        id: drive.id,
+        minScanFileSizeBytes: resp.minFileSizeBytes,
+        skipFileNameKeywords: resp.skipFileNameKeywords ?? [],
+      });
       show("扫描过滤已保存", "success");
     } catch (e) {
       show(e instanceof Error ? e.message : "保存失败", "error");
@@ -1176,23 +1212,52 @@ function ScanSizeFilterPanel({ drive, onSaved }: ScanSizeFilterPanelProps) {
     }
   }
 
+  async function handlePreview() {
+    setPreviewing(true);
+    try {
+      const resp = await api.getDriveCleanupPreview(drive.id);
+      setPreview(resp);
+      if (resp.safeToClean) {
+        show(`预览完成：下次重扫会清理 ${resp.total} 条媒体库记录`, "success");
+      } else {
+        show(resp.reason || "预览完成，但当前不建议执行清理", "error");
+      }
+    } catch (e) {
+      show(e instanceof Error ? e.message : "预览失败", "error");
+    } finally {
+      setPreviewing(false);
+    }
+  }
+
   const current = drive.minScanFileSizeBytes ?? 0;
+  const keywordCount = parseKeywordInput(keywordsInput).length;
 
   return (
     <div className="admin-detail-card">
       <header className="admin-detail-card__title">
         <div className="admin-detail-card__title-left">
           <Filter size={16} />
-          <span>扫描文件大小过滤</span>
+          <span>扫描过滤与清理预览</span>
         </div>
-        <button
-          className="admin-btn is-primary"
-          onClick={handleSave}
-          disabled={saving}
-          style={{ padding: "4px 10px", fontSize: "12px", height: "auto" }}
-        >
-          {saving ? "保存中..." : "保存更改"}
-        </button>
+        <div className="admin-detail-actions-inline">
+          <button
+            className="admin-btn"
+            onClick={handlePreview}
+            disabled={previewing}
+            style={{ padding: "4px 10px", fontSize: "12px", height: "auto" }}
+          >
+            <Search size={13} />
+            {previewing ? "预览中..." : "清理预览"}
+          </button>
+          <button
+            className="admin-btn is-primary"
+            onClick={handleSave}
+            disabled={saving}
+            style={{ padding: "4px 10px", fontSize: "12px", height: "auto" }}
+          >
+            {saving ? "保存中..." : "保存更改"}
+          </button>
+        </div>
       </header>
 
       <div className="admin-form" style={{ maxWidth: "none" }}>
@@ -1211,9 +1276,81 @@ function ScanSizeFilterPanel({ drive, onSaved }: ScanSizeFilterPanelProps) {
             {current > 0 ? formatBytes(current) : "未启用"}。
           </div>
         </div>
+        <div className="admin-form__row">
+          <label>文件名跳过关键词</label>
+          <textarea
+            value={keywordsInput}
+            onChange={(e) => setKeywordsInput(e.target.value)}
+            placeholder={"广告\n防迷路\ntelegram"}
+            rows={4}
+          />
+          <div className="admin-form__help">
+            每行或用逗号分隔一个关键词；命中文件名的视频会被跳过。当前 {keywordCount} 个关键词。
+          </div>
+        </div>
       </div>
+
+      {preview && (
+        <div className="admin-cleanup-preview">
+          <div className="admin-cleanup-preview__summary">
+            <span>扫描文件 {preview.scanned}</span>
+            <span>待清理 {preview.total}</span>
+            <span>{preview.fullDriveScan ? "完整扫描" : "局部扫描"}</span>
+          </div>
+          {preview.reason && (
+            <div className={`admin-cleanup-preview__notice ${preview.safeToClean ? "" : "is-warning"}`}>
+              {preview.reason}
+            </div>
+          )}
+          {preview.limited && (
+            <div className="admin-cleanup-preview__notice">
+              仅显示前 {preview.items.length} 条，实际待清理 {preview.total} 条。
+            </div>
+          )}
+          {preview.items.length === 0 ? (
+            <p className="admin-text-faint" style={{ margin: 0, fontSize: "12px" }}>
+              没有发现会被清理的媒体库记录。
+            </p>
+          ) : (
+            <div className="admin-cleanup-preview__table-wrap">
+              <table className="admin-table admin-cleanup-preview__table">
+                <thead>
+                  <tr>
+                    <th>标题</th>
+                    <th>文件名</th>
+                    <th>大小</th>
+                    <th>原因</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {preview.items.map((item) => (
+                    <tr key={item.id}>
+                      <td data-label="标题">
+                        <div className="admin-video-title">{item.title || item.id}</div>
+                        <div className="admin-video-filemeta">{item.fileId}</div>
+                      </td>
+                      <td data-label="文件名">{item.fileName || "-"}</td>
+                      <td data-label="大小">{formatBytes(item.sizeBytes ?? 0)}</td>
+                      <td data-label="原因">{cleanupReasonLabel(item)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
+}
+
+function cleanupReasonLabel(item: api.DriveCleanupPreviewItem): string {
+  if (item.reason === "min_size") return "小于最小大小";
+  if (item.reason === "filename_keyword") {
+    return item.matchedKeyword ? `文件名关键词：${item.matchedKeyword}` : "文件名关键词";
+  }
+  if (item.reason === "missing") return "扫描未发现";
+  return item.reason || "待清理";
 }
 
 

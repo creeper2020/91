@@ -216,6 +216,9 @@ func main() {
 		ListDriveDirChildren: func(reqCtx context.Context, driveID, parentID string) ([]api.DriveDirEntry, error) {
 			return app.listDriveDirChildren(reqCtx, driveID, parentID)
 		},
+		GetDriveCleanupPreview: func(reqCtx context.Context, driveID string) (api.DriveCleanupPreview, error) {
+			return app.previewDriveCleanup(reqCtx, driveID)
+		},
 	}
 
 	r := chi.NewRouter()
@@ -1004,13 +1007,17 @@ func (a *App) runScan(ctx context.Context, driveID string) {
 	}
 	sc := scanner.New(a.cat, drv, a.cfg.Scanner.VideoExtensions, d.SkipDirIDs, onNew)
 	sc.MinFileSizeBytes = d.MinScanFileSizeBytes
+	sc.SkipFileNameKeywords = d.SkipFileNameKeywords
 
 	startID := d.ScanRootID
 	if startID == "" {
 		startID = d.RootID
 	}
+	if startID == "" {
+		startID = drv.RootID()
+	}
 
-	log.Printf("[scan] drive=%s start=%s skip_dirs=%d min_size=%d", driveID, startID, len(d.SkipDirIDs), d.MinScanFileSizeBytes)
+	log.Printf("[scan] drive=%s start=%s skip_dirs=%d min_size=%d skip_keywords=%d", driveID, startID, len(d.SkipDirIDs), d.MinScanFileSizeBytes, len(d.SkipFileNameKeywords))
 	stats, err := sc.Run(ctx, startID)
 	if err != nil {
 		log.Printf("[scan] drive=%s error: %v", driveID, err)
@@ -1038,6 +1045,105 @@ func (a *App) runScan(ctx context.Context, driveID string) {
 	}
 	a.enqueueDriveGeneration(ctx, driveID, worker, thumbWorker)
 	a.enqueueFingerprints(ctx, driveID, fingerprintWorker)
+}
+
+const cleanupPreviewLimit = 200
+
+func (a *App) previewDriveCleanup(ctx context.Context, driveID string) (api.DriveCleanupPreview, error) {
+	d, err := a.cat.GetDrive(ctx, driveID)
+	if err != nil {
+		return api.DriveCleanupPreview{}, err
+	}
+	out := api.DriveCleanupPreview{
+		DriveID: driveID,
+		Items:   []api.DriveCleanupPreviewItem{},
+	}
+	if d.Kind == spider91.Kind || d.ID == localupload.DriveID {
+		out.SafeToClean = false
+		out.Reason = "此类型不参与扫描清理"
+		return out, nil
+	}
+
+	drv, ok := a.registry.Get(driveID)
+	if !ok {
+		return out, fmt.Errorf("drive %s not attached", driveID)
+	}
+
+	sc := scanner.New(a.cat, drv, a.cfg.Scanner.VideoExtensions, d.SkipDirIDs, nil)
+	sc.MinFileSizeBytes = d.MinScanFileSizeBytes
+	sc.SkipFileNameKeywords = d.SkipFileNameKeywords
+	sc.DryRun = true
+	sc.ProgressInterval = -1
+
+	startID := d.ScanRootID
+	if startID == "" {
+		startID = d.RootID
+	}
+	if startID == "" {
+		startID = drv.RootID()
+	}
+	stats, err := sc.Run(ctx, startID)
+	if err != nil {
+		return out, err
+	}
+	fullDriveScan := startID == drv.RootID()
+	out.Scanned = stats.Scanned
+	out.Errors = stats.Errors
+	out.FullDriveScan = fullDriveScan
+	out.SafeToClean = stats.Errors == 0
+	if stats.Errors > 0 {
+		out.Reason = fmt.Sprintf("扫描过程中有 %d 个目录错误，实际扫描会跳过清理", stats.Errors)
+		return out, nil
+	}
+
+	items, err := a.cat.ListVideosByDrive(ctx, driveID)
+	if err != nil {
+		return out, err
+	}
+	for _, v := range items {
+		if _, ok := stats.SeenFileIDs[v.FileID]; ok {
+			continue
+		}
+		if !fullDriveScan {
+			if _, ok := stats.VisitedDirIDs[v.ParentID]; !ok {
+				continue
+			}
+		}
+
+		out.Total++
+		if len(out.Items) >= cleanupPreviewLimit {
+			out.Limited = true
+			continue
+		}
+		reason, keyword := cleanupPreviewReason(stats.SkippedFileIDs[v.FileID])
+		title := strings.TrimSpace(v.Title)
+		if title == "" {
+			title = v.FileName
+		}
+		out.Items = append(out.Items, api.DriveCleanupPreviewItem{
+			ID:             v.ID,
+			Title:          title,
+			FileName:       v.FileName,
+			FileID:         v.FileID,
+			ParentID:       v.ParentID,
+			Category:       v.Category,
+			SizeBytes:      v.Size,
+			Reason:         reason,
+			MatchedKeyword: keyword,
+		})
+	}
+	return out, nil
+}
+
+func cleanupPreviewReason(raw string) (reason string, keyword string) {
+	if raw == "min_size" {
+		return "min_size", ""
+	}
+	const keywordPrefix = "filename_keyword:"
+	if strings.HasPrefix(raw, keywordPrefix) {
+		return "filename_keyword", strings.TrimPrefix(raw, keywordPrefix)
+	}
+	return "missing", ""
 }
 
 func (a *App) cleanupMissingDriveVideos(ctx context.Context, driveID string, liveFileIDs map[string]struct{}, visitedDirIDs map[string]struct{}, fullDriveScan bool) (int, error) {
