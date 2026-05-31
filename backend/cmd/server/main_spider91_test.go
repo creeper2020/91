@@ -35,6 +35,28 @@ func TestSpider91IntCredFallbacks(t *testing.T) {
 	}
 }
 
+func TestSpider91TargetNewFromSourcesJSON(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  string
+		want int
+	}{
+		{"empty", "", 0},
+		{"invalid", "not-json", 0},
+		{"camel", `[{"url":"https://91porn.com/v.php?category=top&viewtype=basic","targetNew":15},{"url":"https://91porn.com/v.php?category=mf&viewtype=basic","targetNew":50}]`, 65},
+		{"snake", `[{"url":"https://91porn.com/v.php?category=top&viewtype=basic","target_new":7}]`, 7},
+		{"ignores non-positive", `[{"targetNew":10},{"targetNew":0},{"target_new":5}]`, 15},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := spider91TargetNewFromSourcesJSON(tc.raw)
+			if got != tc.want {
+				t.Fatalf("target from sources = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestSpider91UploadDriveIDDoesNotAutoSelectTarget(t *testing.T) {
 	reg := proxy.NewRegistry()
 	reg.Set("p115-one", &spider91UploadTargetFakeDrive{id: "p115-one", kind: "p115"})

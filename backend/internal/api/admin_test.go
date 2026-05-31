@@ -448,6 +448,104 @@ func TestHandleSetDriveScanDirs(t *testing.T) {
 	}
 }
 
+func TestHandleSetSpider91Sources(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cat.Close(); err != nil {
+			t.Fatalf("close catalog: %v", err)
+		}
+	})
+	if err := cat.UpsertDrive(ctx, &catalog.Drive{
+		ID:     "91Spider",
+		Kind:   "spider91",
+		Name:   "91",
+		RootID: "/",
+		Credentials: map[string]string{
+			"last_crawl_at": "1780212269",
+		},
+		Status:        "ok",
+		TeaserEnabled: true,
+	}); err != nil {
+		t.Fatalf("seed drive: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/admin/api/drives/91Spider/spider91-sources", strings.NewReader(`{
+		"sources": [
+			{"url":"https://www.91porn.com/v.php?category=top&viewtype=basic","targetNew":15},
+			{"url":"https://91porn.com/v.php?category=mf&viewtype=basic","targetNew":50}
+		]
+	}`))
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add("id", "91Spider")
+	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+	rr := httptest.NewRecorder()
+
+	(&AdminServer{Catalog: cat}).handleSetSpider91Sources(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	got, err := cat.GetDrive(ctx, "91Spider")
+	if err != nil {
+		t.Fatalf("get drive: %v", err)
+	}
+	if got.Credentials["last_crawl_at"] != "1780212269" {
+		t.Fatalf("last_crawl_at = %q, want preserved", got.Credentials["last_crawl_at"])
+	}
+	if got.Credentials["target_new"] != "65" {
+		t.Fatalf("target_new = %q, want 65", got.Credentials["target_new"])
+	}
+	var stored []spider91SourceConfig
+	if err := json.Unmarshal([]byte(got.Credentials[spider91ListSourcesCredentialKey]), &stored); err != nil {
+		t.Fatalf("stored sources json: %v", err)
+	}
+	if len(stored) != 2 || stored[0].TargetNew != 15 || stored[1].TargetNew != 50 {
+		t.Fatalf("stored sources = %#v, want top=15 mf=50", stored)
+	}
+	var body struct {
+		Sources   []spider91SourceConfig `json:"sources"`
+		TargetNew int                    `json:"targetNew"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if body.TargetNew != 65 || len(body.Sources) != 2 {
+		t.Fatalf("response = %#v, want target 65 and 2 sources", body)
+	}
+}
+
+func TestHandleSetSpider91SourcesRejectsNonSpider91Drive(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cat.Close(); err != nil {
+			t.Fatalf("close catalog: %v", err)
+		}
+	})
+	if err := cat.UpsertDrive(ctx, &catalog.Drive{ID: "p115-main", Kind: "p115", Name: "115", RootID: "0"}); err != nil {
+		t.Fatalf("seed drive: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/admin/api/drives/p115-main/spider91-sources", strings.NewReader(`{"sources":[{"url":"https://91porn.com/v.php?category=mf&viewtype=basic","targetNew":50}]}`))
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add("id", "p115-main")
+	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+	rr := httptest.NewRecorder()
+
+	(&AdminServer{Catalog: cat}).handleSetSpider91Sources(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body = %s", rr.Code, rr.Body.String())
+	}
+}
+
 func TestHandleDriveCleanupPreview(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/admin/api/drives/p115-main/cleanup-preview", nil)
 	rctx := chi.NewRouteContext()
@@ -1069,6 +1167,29 @@ func TestHandleRegenFailedPreviewsInvokesHookWithDriveID(t *testing.T) {
 	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
 	rr := httptest.NewRecorder()
 	server.handleRegenFailedPreviews(rr, req)
+
+	if rr.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	if calledWith != "PikPak" {
+		t.Fatalf("hook called with %q, want PikPak", calledWith)
+	}
+}
+
+func TestHandleRegenFailedFingerprintsInvokesHookWithDriveID(t *testing.T) {
+	calledWith := ""
+	server := &AdminServer{
+		OnRegenFailedFingerprints: func(driveID string) {
+			calledWith = driveID
+		},
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/admin/api/drives/PikPak/fingerprints/failed/regenerate", nil)
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add("id", "PikPak")
+	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+	rr := httptest.NewRecorder()
+	server.handleRegenFailedFingerprints(rr, req)
 
 	if rr.Code != http.StatusAccepted {
 		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())

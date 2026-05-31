@@ -17,6 +17,7 @@ INSTALL_SCRIPT_REF="${INSTALL_SCRIPT_REF:-main}"
 INSTALL_SCRIPT_URL="${INSTALL_SCRIPT_URL:-${GH_PROXY}https://raw.githubusercontent.com/${GITHUB_REPO}/${INSTALL_SCRIPT_REF}/install.sh}"
 VIDEO_SITE_SKIP_SELF_UPDATE="${VIDEO_SITE_SKIP_SELF_UPDATE:-0}"
 SERVICE_READY_TIMEOUT="${SERVICE_READY_TIMEOUT:-90}"
+HJ_ENV_PATH="${HJ_ENV_PATH:-/home/hj/.env}"
 VERSION_FILE="$INSTALL_PATH/.version"
 MANAGER_PATH="/usr/local/sbin/${APP_NAME}-manager"
 COMMAND_LINK="/usr/local/bin/91"
@@ -45,7 +46,7 @@ usage() {
   cat <<EOF
 Usage:
   sudo bash install.sh [install]
-  91 [update|restart|stop|status|logs|uninstall]
+  91 [update|restart|stop|status|logs|tg-start|tg-stop|tg-status|tg-logs|uninstall]
 
 Default action:
   install.sh with no args downloads the prebuilt release package and starts the service.
@@ -58,6 +59,10 @@ Actions:
   stop       Stop service
   status     Show service status
   logs       Follow service logs
+  tg-start   Start Telegram import bot
+  tg-stop    Stop Telegram import bot
+  tg-status  Show Telegram import bot status
+  tg-logs    Follow Telegram import bot logs
   uninstall  Remove service and optionally delete installed files
 
 Options via environment:
@@ -73,6 +78,7 @@ Options via environment:
   INSTALL_SCRIPT_REF=$INSTALL_SCRIPT_REF
   INSTALL_SCRIPT_URL=$INSTALL_SCRIPT_URL
   SERVICE_READY_TIMEOUT=$SERVICE_READY_TIMEOUT
+  HJ_ENV_PATH=$HJ_ENV_PATH
 
 Examples:
   sudo bash install.sh
@@ -80,6 +86,7 @@ Examples:
   91
   91 update
   91 logs
+  91 tg-start
 EOF
 }
 
@@ -129,11 +136,11 @@ install_deps() {
     export DEBIAN_FRONTEND=noninteractive
     log "installing runtime dependencies"
     apt-get update
-    apt-get install -y ca-certificates curl tar ffmpeg openssl iproute2 python3 python3-requests python3-bs4 python3-lxml
+    apt-get install -y ca-certificates curl tar ffmpeg openssl iproute2 aria2 python3 python3-venv python3-pip python3-requests python3-bs4 python3-lxml
     return
   fi
 
-  for cmd in curl tar ffmpeg ffprobe openssl; do
+  for cmd in curl tar ffmpeg ffprobe openssl aria2c; do
     command -v "$cmd" >/dev/null 2>&1 || die "missing command: $cmd"
   done
 }
@@ -173,7 +180,7 @@ backup_install_files() {
   local backup="$1"
   mkdir -p "$backup"
   cp -a "$INSTALL_PATH/server" "$backup/server"
-  for item in dist config.example.yaml 91VideoSpider config.yaml .version; do
+  for item in dist config.example.yaml 91VideoSpider scripts config.yaml .version .env.import; do
     if [[ -e "$INSTALL_PATH/$item" ]]; then
       cp -a "$INSTALL_PATH/$item" "$backup/$item"
     fi
@@ -184,7 +191,7 @@ restore_install_files() {
   local backup="$1"
   mkdir -p "$INSTALL_PATH"
   cp -a "$backup/server" "$INSTALL_PATH/server"
-  for item in dist config.example.yaml 91VideoSpider config.yaml .version; do
+  for item in dist config.example.yaml 91VideoSpider scripts config.yaml .version .env.import; do
     rm -rf "${INSTALL_PATH:?}/$item"
     if [[ -e "$backup/$item" ]]; then
       cp -a "$backup/$item" "$INSTALL_PATH/$item"
@@ -219,6 +226,19 @@ prepare_config() {
   fi
 }
 
+prepare_import_env() {
+  local target="$INSTALL_PATH/.env.import"
+  if [[ -f "$target" ]]; then
+    chmod 600 "$target" 2>/dev/null || true
+    return
+  fi
+  if [[ -f "$HJ_ENV_PATH" ]]; then
+    cp "$HJ_ENV_PATH" "$target"
+    chmod 600 "$target"
+    log "migrated import env from $HJ_ENV_PATH to $target"
+  fi
+}
+
 write_service() {
   cat >"/etc/systemd/system/${SERVICE_NAME}.service" <<EOF
 [Unit]
@@ -233,6 +253,7 @@ ExecStart=${INSTALL_PATH}/server
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=20
+EnvironmentFile=-${INSTALL_PATH}/.env.import
 Environment=VIDEO_CONFIG=${INSTALL_PATH}/config.yaml
 Environment=VIDEO_FRONTEND_DIR=${INSTALL_PATH}/dist
 Environment=VIDEO_VERSION_FILE=${VERSION_FILE}
@@ -247,8 +268,41 @@ SyslogIdentifier=${SERVICE_NAME}
 [Install]
 WantedBy=multi-user.target
 EOF
+  write_tg_import_service
   systemctl daemon-reload
   systemctl enable "${SERVICE_NAME}.service" >/dev/null
+}
+
+write_tg_import_service() {
+  local port
+  port="$(listen_port_from_config)"
+  cat >"/etc/systemd/system/${SERVICE_NAME}-tg-import.service" <<EOF
+[Unit]
+Description=Video Site 91 Telegram Import Bot
+After=network-online.target ${SERVICE_NAME}.service
+Wants=network-online.target
+ConditionPathExists=${INSTALL_PATH}/.env.import
+ConditionPathExists=${INSTALL_PATH}/scripts/tg_import_bot.py
+
+[Service]
+Type=simple
+WorkingDirectory=${INSTALL_PATH}
+ExecStart=${INSTALL_PATH}/.venv-import/bin/python ${INSTALL_PATH}/scripts/tg_import_bot.py
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=20
+EnvironmentFile=-${INSTALL_PATH}/.env.import
+Environment=IMPORT_API_BASE=http://127.0.0.1:${port}
+Environment=TG_IMPORT_DATA_DIR=${INSTALL_PATH}/data/tg-import
+Environment=HOME=/root
+Environment=PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=${SERVICE_NAME}-tg-import
+
+[Install]
+WantedBy=multi-user.target
+EOF
 }
 
 install_cli() {
@@ -413,6 +467,20 @@ fetch_and_unpack() {
     rm -rf "$INSTALL_PATH/91VideoSpider"
     cp -R "$root/91VideoSpider" "$INSTALL_PATH/91VideoSpider"
   fi
+  if [[ -d "$root/scripts" ]]; then
+    rm -rf "$INSTALL_PATH/scripts"
+    cp -R "$root/scripts" "$INSTALL_PATH/scripts"
+    chmod +x "$INSTALL_PATH"/scripts/*.py 2>/dev/null || true
+  fi
+  if [[ -f "$INSTALL_PATH/scripts/requirements-import.txt" ]]; then
+    if command -v python3 >/dev/null 2>&1; then
+      python3 -m venv "$INSTALL_PATH/.venv-import" || warn "create import venv failed"
+      if [[ -x "$INSTALL_PATH/.venv-import/bin/pip" ]]; then
+        "$INSTALL_PATH/.venv-import/bin/pip" install -r "$INSTALL_PATH/scripts/requirements-import.txt" || warn "install import python deps failed"
+        "$INSTALL_PATH/.venv-import/bin/python" -m playwright install chromium || warn "install playwright chromium failed"
+      fi
+    fi
+  fi
   chmod +x "$INSTALL_PATH/server"
   rm -rf "$tmp"
 }
@@ -506,6 +574,7 @@ install_app() {
   systemctl stop "${SERVICE_NAME}.service" 2>/dev/null || true
   fetch_and_unpack || die "install failed"
   prepare_config
+  prepare_import_env
   write_service
   install_cli
   open_firewall_port
@@ -536,7 +605,7 @@ update_app() {
   backup_install_files "$backup"
 
   systemctl stop "${SERVICE_NAME}.service" 2>/dev/null || true
-  if ! (fetch_and_unpack && prepare_config && write_service && install_cli); then
+  if ! (fetch_and_unpack && prepare_config && prepare_import_env && write_service && install_cli); then
     warn "update failed; restoring previous files"
     restore_install_files "$backup"
     systemctl start "${SERVICE_NAME}.service" 2>/dev/null || true
@@ -551,14 +620,18 @@ update_app() {
     rm -rf "$backup"
     exit 1
   fi
+  if systemctl is-active --quiet "${SERVICE_NAME}-tg-import.service"; then
+    systemctl restart "${SERVICE_NAME}-tg-import.service" || warn "Telegram import bot restart failed"
+  fi
   record_version
   rm -rf "$backup"
   log "updated"
 }
 
 uninstall_app() {
+  systemctl disable --now "${SERVICE_NAME}-tg-import.service" 2>/dev/null || true
   systemctl disable --now "${SERVICE_NAME}.service" 2>/dev/null || true
-  rm -f "/etc/systemd/system/${SERVICE_NAME}.service"
+  rm -f "/etc/systemd/system/${SERVICE_NAME}.service" "/etc/systemd/system/${SERVICE_NAME}-tg-import.service"
   systemctl daemon-reload
   rm -f "$COMMAND_LINK" "$APP_COMMAND_LINK" "$MANAGER_PATH"
 
@@ -590,9 +663,12 @@ show_menu() {
     echo "4、重启 91"
     echo "5、停止 91"
     echo "6、卸载 91"
+    echo "7、启动 TG 导入机器人"
+    echo "8、停止 TG 导入机器人"
+    echo "9、查看 TG 导入机器人日志"
     echo "0、退出"
     echo
-    read -r -p "请输入选项 [0-6]: " choice
+    read -r -p "请输入选项 [0-9]: " choice
 
     case "$choice" in
       1) main status ;;
@@ -601,6 +677,9 @@ show_menu() {
       4) main restart ;;
       5) main stop ;;
       6) main uninstall ;;
+      7) main tg-start ;;
+      8) main tg-stop ;;
+      9) main tg-logs ;;
       0) exit 0 ;;
       *) echo "无效的选项" ;;
     esac
@@ -642,6 +721,22 @@ main() {
       ;;
     logs)
       journalctl -u "${SERVICE_NAME}.service" -f
+      ;;
+    tg-start)
+      need_root "$@"
+      write_tg_import_service
+      systemctl daemon-reload
+      systemctl enable --now "${SERVICE_NAME}-tg-import.service"
+      ;;
+    tg-stop)
+      need_root "$@"
+      systemctl disable --now "${SERVICE_NAME}-tg-import.service"
+      ;;
+    tg-status)
+      systemctl --no-pager --full status "${SERVICE_NAME}-tg-import.service" || true
+      ;;
+    tg-logs)
+      journalctl -u "${SERVICE_NAME}-tg-import.service" -f
       ;;
     menu)
       show_menu

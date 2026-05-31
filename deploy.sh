@@ -275,6 +275,7 @@ RestartSec=5
 TimeoutStopSec=20
 Environment=HOME=${DEPLOY_HOME}
 Environment=PATH=/usr/local/go/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+EnvironmentFile=-${REPO_DIR}/.env.import
 ${env_lines}LimitNOFILE=65536
 StandardOutput=journal
 StandardError=journal

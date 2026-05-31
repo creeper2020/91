@@ -17,7 +17,8 @@ CREATE TABLE IF NOT EXISTS videos (
     ext              TEXT,
     quality          TEXT,                      -- HD / SD
     thumbnail_url    TEXT,
-    thumbnail_status TEXT DEFAULT 'pending',    -- pending / ready / failed
+    thumbnail_status TEXT DEFAULT 'pending',    -- pending / ready / failed / skipped
+    thumbnail_failures INTEGER DEFAULT 0,
     preview_file_id  TEXT,                      -- deprecated: 旧版回写网盘后的 teaser file id
     preview_local    TEXT,                      -- 本地 teaser 路径（兜底）
     preview_status   TEXT DEFAULT 'pending',    -- pending / ready / failed
@@ -64,6 +65,12 @@ CREATE TABLE IF NOT EXISTS video_tags (
 
 CREATE INDEX IF NOT EXISTS idx_video_tags_tag ON video_tags(tag_id);
 CREATE INDEX IF NOT EXISTS idx_video_tags_video ON video_tags(video_id);
+
+CREATE TABLE IF NOT EXISTS deleted_tags (
+    label      TEXT PRIMARY KEY COLLATE NOCASE,
+    source     TEXT NOT NULL DEFAULT '',
+    deleted_at INTEGER NOT NULL
+);
 
 -- 网盘账户
 CREATE TABLE IF NOT EXISTS drives (

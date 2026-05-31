@@ -19,6 +19,7 @@ import (
 var (
 	ErrUnknownTag = errors.New("unknown tag")
 	ErrSystemTag  = errors.New("system tag cannot be deleted")
+	ErrDeletedTag = errors.New("tag was previously deleted")
 )
 
 const avTagLabel = "AV"
@@ -62,6 +63,9 @@ func (c *Catalog) migrate(ctx context.Context) error {
 		return err
 	}
 	if err := c.addColumnIfMissing(ctx, "videos", "thumbnail_status", "TEXT DEFAULT 'pending'"); err != nil {
+		return err
+	}
+	if err := c.addColumnIfMissing(ctx, "videos", "thumbnail_failures", "INTEGER DEFAULT 0"); err != nil {
 		return err
 	}
 	if err := c.addColumnIfMissing(ctx, "videos", "hls_dir", "TEXT DEFAULT ''"); err != nil {
@@ -130,6 +134,14 @@ UPDATE videos
 	// 不受影响，但直接 SQL 查会以为有 N 千个待生成）。
 	// 这里把"url 已写但 status 仍是 pending"的修正为 ready；status=failed 不动。
 	if err := c.reconcileThumbnailStatusOnce(ctx); err != nil {
+		return err
+	}
+	if _, err := c.db.ExecContext(ctx, `
+CREATE TABLE IF NOT EXISTS deleted_tags (
+    label      TEXT PRIMARY KEY COLLATE NOCASE,
+    source     TEXT NOT NULL DEFAULT '',
+    deleted_at INTEGER NOT NULL
+)`); err != nil {
 		return err
 	}
 	if _, err := c.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_videos_content_hash ON videos(content_hash)`); err != nil {
@@ -244,8 +256,8 @@ func (c *Catalog) resetDriveTeaserEnabledToDefaultOnce(ctx context.Context) erro
 //   - 管理员凭直觉认知字段名时会被误导
 //
 // 修正策略：
-//   - thumbnail_url 非空 + status 非 'ready' + status 非 'failed' → 改成 'ready'
-//   - status='failed' 不动（这是 worker 显式标的失败，要保留以便管理员手动重生）
+//   - thumbnail_url 非空 + status 非 'ready' / 'failed' / 'skipped' → 改成 'ready'
+//   - status='failed' / 'skipped' 不动（这是 worker 显式标的终态，要保留以便管理员手动处理）
 //
 // 幂等保证：marker setting 写过就不再跑，避免每次重启都 update 一遍。
 func (c *Catalog) reconcileThumbnailStatusOnce(ctx context.Context) error {
@@ -262,7 +274,7 @@ UPDATE videos
    SET thumbnail_status = 'ready',
        updated_at = ?
  WHERE COALESCE(thumbnail_url, '') != ''
-   AND COALESCE(thumbnail_status, 'pending') NOT IN ('ready', 'failed')
+   AND COALESCE(thumbnail_status, 'pending') NOT IN ('ready', 'failed', 'skipped')
 `, time.Now().UnixMilli())
 	if err != nil {
 		return fmt.Errorf("reconcile thumbnail_status: %w", err)
@@ -405,6 +417,9 @@ GROUP BY category`)
 		if !LooksLikeCollectionTag(stat.category) {
 			continue
 		}
+		if c.tagDeleted(ctx, stat.category) {
+			continue
+		}
 		if _, err := c.ensureTag(ctx, stat.category, nil, "collection"); err != nil {
 			return err
 		}
@@ -463,6 +478,9 @@ func (c *Catalog) DeleteTag(ctx context.Context, tagID int64) (int, error) {
 		return 0, err
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM tags WHERE id = ?`, tagID); err != nil {
+		return 0, err
+	}
+	if err := markDeletedTagTx(ctx, tx, tag); err != nil {
 		return 0, err
 	}
 
@@ -552,6 +570,9 @@ func (c *Catalog) EnsureCollectionTag(ctx context.Context, label string) (string
 	if !LooksLikeCollectionTag(label) {
 		return "", false, nil
 	}
+	if c.tagDeleted(ctx, label) {
+		return "", false, nil
+	}
 	if !c.tagExists(ctx, label) {
 		count, err := c.categoryVideoCount(ctx, label)
 		if err != nil {
@@ -582,6 +603,14 @@ func (c *Catalog) ensureTag(ctx context.Context, label string, aliases []string,
 	}
 	if source == "" {
 		source = "user"
+	}
+	if source != "system" && source != "user" && c.tagDeleted(ctx, label) {
+		return Tag{}, ErrDeletedTag
+	}
+	if source == "system" || source == "user" {
+		if err := c.restoreDeletedTag(ctx, label); err != nil {
+			return Tag{}, err
+		}
 	}
 	aliases = cleanAliases(aliases, label)
 	aliasesJSON, _ := json.Marshal(aliases)
@@ -656,9 +685,15 @@ FROM videos`)
 
 func (c *Catalog) replaceVideoTags(ctx context.Context, videoID string, labels []string, source string, manual bool, createMissing bool) error {
 	labels = uniqueStrings(cleanLabels(labels))
+	if source != "manual" {
+		labels = c.filterDeletedTagLabels(ctx, labels)
+	}
 	if createMissing {
 		for _, label := range labels {
 			if _, err := c.ensureTag(ctx, label, nil, "legacy"); err != nil {
+				if errors.Is(err, ErrDeletedTag) {
+					continue
+				}
 				return err
 			}
 		}
@@ -701,7 +736,11 @@ func (c *Catalog) replaceVideoTags(ctx context.Context, videoID string, labels [
 }
 
 func (c *Catalog) addVideoTags(ctx context.Context, videoID string, labels []string, source string, createMissing bool) error {
-	for _, label := range uniqueStrings(cleanLabels(labels)) {
+	labels = uniqueStrings(cleanLabels(labels))
+	if source != "manual" {
+		labels = c.filterDeletedTagLabels(ctx, labels)
+	}
+	for _, label := range labels {
 		if _, err := c.addVideoTag(ctx, videoID, label, source, createMissing); err != nil {
 			return err
 		}
@@ -710,8 +749,14 @@ func (c *Catalog) addVideoTags(ctx context.Context, videoID string, labels []str
 }
 
 func (c *Catalog) addVideoTag(ctx context.Context, videoID, label, source string, createMissing bool) (bool, error) {
+	if source != "manual" && c.tagDeleted(ctx, label) {
+		return false, nil
+	}
 	if createMissing {
 		if _, err := c.ensureTag(ctx, label, nil, "legacy"); err != nil {
+			if errors.Is(err, ErrDeletedTag) {
+				return false, nil
+			}
 			return false, err
 		}
 	}
@@ -903,6 +948,39 @@ func (c *Catalog) tagExists(ctx context.Context, label string) bool {
 	return err == nil
 }
 
+func (c *Catalog) tagDeleted(ctx context.Context, label string) bool {
+	label = cleanTagLabel(label)
+	if label == "" {
+		return false
+	}
+	var exists int
+	err := c.db.QueryRowContext(ctx, `SELECT 1 FROM deleted_tags WHERE label = ? COLLATE NOCASE`, label).Scan(&exists)
+	return err == nil
+}
+
+func (c *Catalog) filterDeletedTagLabels(ctx context.Context, labels []string) []string {
+	if len(labels) == 0 {
+		return labels
+	}
+	out := labels[:0]
+	for _, label := range labels {
+		if c.tagDeleted(ctx, label) {
+			continue
+		}
+		out = append(out, label)
+	}
+	return out
+}
+
+func (c *Catalog) restoreDeletedTag(ctx context.Context, label string) error {
+	label = cleanTagLabel(label)
+	if label == "" {
+		return nil
+	}
+	_, err := c.db.ExecContext(ctx, `DELETE FROM deleted_tags WHERE label = ? COLLATE NOCASE`, label)
+	return err
+}
+
 func (c *Catalog) categoryVideoCount(ctx context.Context, category string) (int, error) {
 	var count int
 	err := c.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM videos WHERE category = ?`, category).Scan(&count)
@@ -927,6 +1005,21 @@ func hasManualTagsTx(ctx context.Context, tx *sql.Tx, videoID string) bool {
 	var manual int
 	err := tx.QueryRowContext(ctx, `SELECT COALESCE(tags_manual, 0) FROM videos WHERE id = ?`, videoID).Scan(&manual)
 	return err == nil && manual == 1
+}
+
+func markDeletedTagTx(ctx context.Context, tx *sql.Tx, tag Tag) error {
+	label := cleanTagLabel(tag.Label)
+	if label == "" {
+		return nil
+	}
+	_, err := tx.ExecContext(ctx, `
+INSERT INTO deleted_tags (label, source, deleted_at)
+VALUES (?, ?, ?)
+ON CONFLICT(label) DO UPDATE SET
+    source = excluded.source,
+    deleted_at = excluded.deleted_at`,
+		label, tag.Source, time.Now().UnixMilli())
+	return err
 }
 
 func syncVideoTagsJSONTx(ctx context.Context, tx *sql.Tx, videoID string, manual bool) error {

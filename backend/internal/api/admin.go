@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	neturl "net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -43,6 +44,7 @@ type AdminServer struct {
 	OnRegenAllPreviews         func()
 	OnRegenFailedPreviews      func(driveID string)
 	OnRegenFailedThumbnails    func(driveID string)
+	OnRegenFailedFingerprints  func(driveID string)
 	GetDriveGenerationStatuses func() map[string]DriveGenerationStatuses
 	// OnTeaserEnabledChanged 在 per-drive teaser 开关被切换后调用。
 	// enabled=true 时上层应该重新把 pending teaser 入队（类似旧的全局开关从关到开）；
@@ -54,10 +56,14 @@ type AdminServer struct {
 	// Spider91 上传目标 drive ID 读写
 	GetSpider91UploadDriveID func() string
 	SetSpider91UploadDriveID func(driveID string) error
+	// 本地上传/链接导入默认上传目标 drive ID 读写。
+	GetImportUploadDriveID func() string
+	SetImportUploadDriveID func(driveID string) error
 	// OnRunNightlyJob 触发一次完整的凌晨流水线（Phase1 扫盘 + Phase2 91 爬虫 +
 	// Phase3 迁移）。立即返回 —— 实际任务在后台跑，admin 在日志或下次状态查询里
-	// 看进度。若流水线正在跑，Runner 最多保留一个待触发请求，当前轮结束后再跑一轮。
-	OnRunNightlyJob func()
+	// 看进度。返回 false 表示当前已有运行中或排队中的任务，没有叠加新任务。
+	OnRunNightlyJob     func() bool
+	GetNightlyJobStatus func() NightlyJobStatus
 	// OnRunSpider91Migration 只触发 spider91 本地视频迁移，不重新爬取。
 	OnRunSpider91Migration func() error
 	// ListDriveDirChildren 列出某个 drive 在 parentID 目录下的直接子目录。
@@ -114,6 +120,98 @@ type DriveGenerationStatuses struct {
 	Fingerprint GenerationStatus `json:"fingerprint"`
 }
 
+type NightlyJobStatus struct {
+	State          string `json:"state"`
+	Running        bool   `json:"running"`
+	Queued         bool   `json:"queued"`
+	StartedAt      string `json:"startedAt,omitempty"`
+	LastFinishedAt string `json:"lastFinishedAt,omitempty"`
+}
+
+const spider91ListSourcesCredentialKey = "list_sources_json"
+
+type spider91SourceConfig struct {
+	URL       string `json:"url"`
+	TargetNew int    `json:"targetNew"`
+}
+
+func defaultSpider91Sources() []spider91SourceConfig {
+	return []spider91SourceConfig{
+		{URL: "https://www.91porn.com/v.php?category=top&viewtype=basic", TargetNew: 15},
+		{URL: "https://91porn.com/v.php?category=mf&viewtype=basic", TargetNew: 50},
+	}
+}
+
+func spider91SourcesFromCredentials(creds map[string]string) []spider91SourceConfig {
+	raw := strings.TrimSpace(creds[spider91ListSourcesCredentialKey])
+	if raw == "" {
+		return defaultSpider91Sources()
+	}
+	var sources []spider91SourceConfig
+	if err := json.Unmarshal([]byte(raw), &sources); err != nil {
+		return defaultSpider91Sources()
+	}
+	cleaned, err := cleanSpider91Sources(sources)
+	if err != nil || len(cleaned) == 0 {
+		return defaultSpider91Sources()
+	}
+	return cleaned
+}
+
+func cleanSpider91Sources(sources []spider91SourceConfig) ([]spider91SourceConfig, error) {
+	if len(sources) == 0 {
+		return nil, errors.New("sources is required")
+	}
+	out := make([]spider91SourceConfig, 0, len(sources))
+	seen := map[string]struct{}{}
+	for _, source := range sources {
+		rawURL := strings.TrimSpace(source.URL)
+		if rawURL == "" {
+			return nil, errors.New("source url is required")
+		}
+		if len(rawURL) > 600 {
+			return nil, errors.New("source url is too long")
+		}
+		u, err := neturl.Parse(rawURL)
+		if err != nil || u.Scheme == "" || u.Host == "" {
+			return nil, fmt.Errorf("invalid source url: %s", rawURL)
+		}
+		if u.Scheme != "http" && u.Scheme != "https" {
+			return nil, fmt.Errorf("unsupported source url scheme: %s", u.Scheme)
+		}
+		if source.TargetNew <= 0 {
+			return nil, fmt.Errorf("targetNew must be > 0 for %s", rawURL)
+		}
+		if source.TargetNew > 500 {
+			return nil, fmt.Errorf("targetNew must be <= 500 for %s", rawURL)
+		}
+		canonical := u.String()
+		key := strings.ToLower(canonical)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, spider91SourceConfig{
+			URL:       canonical,
+			TargetNew: source.TargetNew,
+		})
+	}
+	if len(out) == 0 {
+		return nil, errors.New("sources is required")
+	}
+	return out, nil
+}
+
+func spider91SourcesTargetNew(sources []spider91SourceConfig) int {
+	total := 0
+	for _, source := range sources {
+		if source.TargetNew > 0 {
+			total += source.TargetNew
+		}
+	}
+	return total
+}
+
 func (a *AdminServer) Register(r chi.Router) {
 	r.Route("/admin/api", func(r chi.Router) {
 		// 登录、登出和首次部署初始化不需要鉴权
@@ -137,10 +235,12 @@ func (a *AdminServer) Register(r chi.Router) {
 			r.Post("/drives/{id}/skip-dirs", a.handleSetDriveSkipDirs)
 			r.Post("/drives/{id}/scan-dirs", a.handleSetDriveScanDirs)
 			r.Post("/drives/{id}/scan-filter", a.handleSetDriveScanFilter)
+			r.Post("/drives/{id}/spider91-sources", a.handleSetSpider91Sources)
 			r.Get("/drives/{id}/cleanup-preview", a.handleDriveCleanupPreview)
 			r.Get("/drives/{id}/dirtree", a.handleListDriveDirTree)
 			r.Post("/drives/{id}/previews/failed/regenerate", a.handleRegenFailedPreviews)
 			r.Post("/drives/{id}/thumbnails/failed/regenerate", a.handleRegenFailedThumbnails)
+			r.Post("/drives/{id}/fingerprints/failed/regenerate", a.handleRegenFailedFingerprints)
 
 			// 视频
 			r.Get("/videos", a.handleAdminListVideos)
@@ -161,6 +261,7 @@ func (a *AdminServer) Register(r chi.Router) {
 
 			// 运维任务
 			r.Get("/update/check", a.handleCheckUpdate)
+			r.Get("/jobs/nightly/status", a.handleNightlyJobStatus)
 			r.Post("/jobs/nightly/run", a.handleRunNightlyJob)
 			r.Post("/jobs/spider91/migrate", a.handleRunSpider91Migration)
 		})
@@ -417,21 +518,24 @@ func (a *AdminServer) handleListDrives(w http.ResponseWriter, r *http.Request) {
 		SkipFileNameKeywords []string `json:"skipFileNameKeywords"`
 		// LastCrawlAt 是 spider91 上次成功爬取的 unix 秒（来自 credentials.last_crawl_at）。
 		// 其它 kind 留 0；前端用它显示"上次抓取: N 小时前"。
-		LastCrawlAt                 int64            `json:"lastCrawlAt,omitempty"`
-		ThumbnailGenerationStatus   GenerationStatus `json:"thumbnailGenerationStatus"`
-		PreviewGenerationStatus     GenerationStatus `json:"previewGenerationStatus"`
-		HLSGenerationStatus         GenerationStatus `json:"hlsGenerationStatus"`
-		FingerprintGenerationStatus GenerationStatus `json:"fingerprintGenerationStatus"`
-		ThumbnailReadyCount         int              `json:"thumbnailReadyCount"`
-		ThumbnailPendingCount       int              `json:"thumbnailPendingCount"`
-		ThumbnailFailedCount        int              `json:"thumbnailFailedCount"`
-		TeaserReadyCount            int              `json:"teaserReadyCount"`
-		TeaserPendingCount          int              `json:"teaserPendingCount"`
-		TeaserFailedCount           int              `json:"teaserFailedCount"`
-		TeaserSkippedCount          int              `json:"teaserSkippedCount"`
-		FingerprintReadyCount       int              `json:"fingerprintReadyCount"`
-		FingerprintPendingCount     int              `json:"fingerprintPendingCount"`
-		FingerprintFailedCount      int              `json:"fingerprintFailedCount"`
+		LastCrawlAt                   int64                  `json:"lastCrawlAt,omitempty"`
+		ThumbnailGenerationStatus     GenerationStatus       `json:"thumbnailGenerationStatus"`
+		PreviewGenerationStatus       GenerationStatus       `json:"previewGenerationStatus"`
+		HLSGenerationStatus           GenerationStatus       `json:"hlsGenerationStatus"`
+		FingerprintGenerationStatus   GenerationStatus       `json:"fingerprintGenerationStatus"`
+		ThumbnailReadyCount           int                    `json:"thumbnailReadyCount"`
+		ThumbnailPendingCount         int                    `json:"thumbnailPendingCount"`
+		ThumbnailFailedCount          int                    `json:"thumbnailFailedCount"`
+		ThumbnailDurationPendingCount int                    `json:"thumbnailDurationPendingCount"`
+		TeaserReadyCount              int                    `json:"teaserReadyCount"`
+		TeaserPendingCount            int                    `json:"teaserPendingCount"`
+		TeaserFailedCount             int                    `json:"teaserFailedCount"`
+		TeaserSkippedCount            int                    `json:"teaserSkippedCount"`
+		FingerprintReadyCount         int                    `json:"fingerprintReadyCount"`
+		FingerprintPendingCount       int                    `json:"fingerprintPendingCount"`
+		FingerprintFailedCount        int                    `json:"fingerprintFailedCount"`
+		Spider91Sources               []spider91SourceConfig `json:"spider91Sources,omitempty"`
+		Spider91TargetNew             int                    `json:"spider91TargetNew,omitempty"`
 	}
 	list := make([]out, 0, len(drives))
 	for _, d := range drives {
@@ -464,6 +568,8 @@ func (a *AdminServer) handleListDrives(w http.ResponseWriter, r *http.Request) {
 		hasCred = userCredKeys > 0 || d.Kind == "spider91"
 
 		var lastCrawlAt int64
+		var spider91Sources []spider91SourceConfig
+		var spider91TargetNew int
 		if d.Credentials != nil {
 			if raw, ok := d.Credentials["last_crawl_at"]; ok && raw != "" {
 				if v, err := strconv.ParseInt(raw, 10, 64); err == nil {
@@ -471,32 +577,39 @@ func (a *AdminServer) handleListDrives(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 		}
+		if d.Kind == "spider91" {
+			spider91Sources = spider91SourcesFromCredentials(d.Credentials)
+			spider91TargetNew = spider91SourcesTargetNew(spider91Sources)
+		}
 
 		list = append(list, out{
 			ID: d.ID, Kind: d.Kind, Name: d.Name,
 			RootID: d.RootID, ScanRootID: d.ScanRootID,
 			Status: d.Status, LastError: d.LastError,
-			HasCredential:               hasCred,
-			TeaserEnabled:               d.TeaserEnabled,
-			SkipDirIDs:                  append([]string{}, d.SkipDirIDs...),
-			ScanDirIDs:                  append([]string{}, d.ScanDirIDs...),
-			MinScanFileSizeBytes:        d.MinScanFileSizeBytes,
-			SkipFileNameKeywords:        append([]string{}, d.SkipFileNameKeywords...),
-			LastCrawlAt:                 lastCrawlAt,
-			ThumbnailGenerationStatus:   generation.Thumbnail,
-			PreviewGenerationStatus:     generation.Preview,
-			HLSGenerationStatus:         generation.HLS,
-			FingerprintGenerationStatus: generation.Fingerprint,
-			ThumbnailReadyCount:         thumbCounts.Ready,
-			ThumbnailPendingCount:       thumbCounts.Pending,
-			ThumbnailFailedCount:        thumbCounts.Failed,
-			TeaserReadyCount:            counts.Ready,
-			TeaserPendingCount:          counts.Pending,
-			TeaserFailedCount:           counts.Failed,
-			TeaserSkippedCount:          counts.Skipped,
-			FingerprintReadyCount:       fingerprintCount.Ready,
-			FingerprintPendingCount:     fingerprintCount.Pending,
-			FingerprintFailedCount:      fingerprintCount.Failed,
+			HasCredential:                 hasCred,
+			TeaserEnabled:                 d.TeaserEnabled,
+			SkipDirIDs:                    append([]string{}, d.SkipDirIDs...),
+			ScanDirIDs:                    append([]string{}, d.ScanDirIDs...),
+			MinScanFileSizeBytes:          d.MinScanFileSizeBytes,
+			SkipFileNameKeywords:          append([]string{}, d.SkipFileNameKeywords...),
+			LastCrawlAt:                   lastCrawlAt,
+			ThumbnailGenerationStatus:     generation.Thumbnail,
+			PreviewGenerationStatus:       generation.Preview,
+			HLSGenerationStatus:           generation.HLS,
+			FingerprintGenerationStatus:   generation.Fingerprint,
+			ThumbnailReadyCount:           thumbCounts.Ready,
+			ThumbnailPendingCount:         thumbCounts.Pending,
+			ThumbnailFailedCount:          thumbCounts.Failed,
+			ThumbnailDurationPendingCount: thumbCounts.DurationPending,
+			TeaserReadyCount:              counts.Ready,
+			TeaserPendingCount:            counts.Pending,
+			TeaserFailedCount:             counts.Failed,
+			TeaserSkippedCount:            counts.Skipped,
+			FingerprintReadyCount:         fingerprintCount.Ready,
+			FingerprintPendingCount:       fingerprintCount.Pending,
+			FingerprintFailedCount:        fingerprintCount.Failed,
+			Spider91Sources:               spider91Sources,
+			Spider91TargetNew:             spider91TargetNew,
 		})
 	}
 	writeJSON(w, http.StatusOK, list)
@@ -643,14 +756,89 @@ func (a *AdminServer) handleRescan(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusAccepted, map[string]any{"ok": true})
 }
 
+type setSpider91SourcesReq struct {
+	Sources []spider91SourceConfig `json:"sources"`
+}
+
+func (a *AdminServer) handleSetSpider91Sources(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	if id == "" {
+		http.Error(w, "id is required", http.StatusBadRequest)
+		return
+	}
+	var body setSpider91SourcesReq
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	sources, err := cleanSpider91Sources(body.Sources)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	d, err := a.Catalog.GetDrive(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			http.Error(w, "drive not found", http.StatusNotFound)
+			return
+		}
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	if d.Kind != "spider91" {
+		http.Error(w, "drive is not spider91", http.StatusBadRequest)
+		return
+	}
+	if d.Credentials == nil {
+		d.Credentials = map[string]string{}
+	}
+	raw, err := json.Marshal(sources)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	targetNew := spider91SourcesTargetNew(sources)
+	d.Credentials[spider91ListSourcesCredentialKey] = string(raw)
+	d.Credentials["target_new"] = strconv.Itoa(targetNew)
+	if err := a.Catalog.UpsertDrive(r.Context(), d); err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":        true,
+		"sources":   sources,
+		"targetNew": targetNew,
+	})
+}
+
 // handleRunNightlyJob 触发一次完整的凌晨流水线（不论当前时间，不论今日是否已跑）。
 // 立即返回 202；进度通过 backend 日志和下次 GET /admin/api/drives 的状态变化观察。
 // 流水线已在跑时 Runner 最多排队一个后续触发；如果已有待触发请求，新的点击会被忽略。
 func (a *AdminServer) handleRunNightlyJob(w http.ResponseWriter, r *http.Request) {
+	accepted := false
 	if a.OnRunNightlyJob != nil {
-		a.OnRunNightlyJob()
+		accepted = a.OnRunNightlyJob()
 	}
-	writeJSON(w, http.StatusAccepted, map[string]any{"ok": true})
+	writeJSON(w, http.StatusAccepted, map[string]any{
+		"ok":       true,
+		"accepted": accepted,
+		"status":   a.nightlyJobStatus(),
+	})
+}
+
+func (a *AdminServer) handleNightlyJobStatus(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, a.nightlyJobStatus())
+}
+
+func (a *AdminServer) nightlyJobStatus() NightlyJobStatus {
+	if a.GetNightlyJobStatus == nil {
+		return NightlyJobStatus{State: "idle"}
+	}
+	status := a.GetNightlyJobStatus()
+	if strings.TrimSpace(status.State) == "" {
+		status.State = "idle"
+	}
+	return status
 }
 
 // handleRunSpider91Migration 只把已下载到本地的 spider91 视频迁移到上传目标。
@@ -1216,6 +1404,14 @@ func (a *AdminServer) handleRegenFailedThumbnails(w http.ResponseWriter, r *http
 	writeJSON(w, http.StatusAccepted, map[string]any{"ok": true})
 }
 
+func (a *AdminServer) handleRegenFailedFingerprints(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	if a.OnRegenFailedFingerprints != nil {
+		a.OnRegenFailedFingerprints(id)
+	}
+	writeJSON(w, http.StatusAccepted, map[string]any{"ok": true})
+}
+
 // ---------- Settings ----------
 
 // settingsDTO 是 GET/PUT /admin/api/settings 的入参/出参。
@@ -1226,6 +1422,7 @@ func (a *AdminServer) handleRegenFailedThumbnails(w http.ResponseWriter, r *http
 type settingsDTO struct {
 	Theme                 string `json:"theme"`
 	Spider91UploadDriveID string `json:"spider91UploadDriveId"`
+	ImportUploadDriveID   string `json:"importUploadDriveId"`
 }
 
 func (a *AdminServer) handleGetSettings(w http.ResponseWriter, r *http.Request) {
@@ -1239,9 +1436,14 @@ func (a *AdminServer) handleGetSettings(w http.ResponseWriter, r *http.Request) 
 	if a.GetSpider91UploadDriveID != nil {
 		spider91UploadID = a.GetSpider91UploadDriveID()
 	}
+	importUploadID := ""
+	if a.GetImportUploadDriveID != nil {
+		importUploadID = a.GetImportUploadDriveID()
+	}
 	writeJSON(w, http.StatusOK, settingsDTO{
 		Theme:                 theme,
 		Spider91UploadDriveID: spider91UploadID,
+		ImportUploadDriveID:   importUploadID,
 	})
 }
 
@@ -1280,6 +1482,18 @@ func (a *AdminServer) handlePutSettings(w http.ResponseWriter, r *http.Request) 
 		}
 	}
 
+	if v, ok := raw["importUploadDriveId"]; ok && a.SetImportUploadDriveID != nil {
+		var driveID string
+		if err := json.Unmarshal(v, &driveID); err != nil {
+			writeErr(w, http.StatusBadRequest, err)
+			return
+		}
+		if err := a.SetImportUploadDriveID(driveID); err != nil {
+			writeErr(w, http.StatusBadRequest, err)
+			return
+		}
+	}
+
 	// 回显当前值
 	resp := settingsDTO{}
 	if a.GetTheme != nil {
@@ -1287,6 +1501,9 @@ func (a *AdminServer) handlePutSettings(w http.ResponseWriter, r *http.Request) 
 	}
 	if a.GetSpider91UploadDriveID != nil {
 		resp.Spider91UploadDriveID = a.GetSpider91UploadDriveID()
+	}
+	if a.GetImportUploadDriveID != nil {
+		resp.ImportUploadDriveID = a.GetImportUploadDriveID()
 	}
 	writeJSON(w, http.StatusOK, resp)
 }

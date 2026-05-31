@@ -109,3 +109,171 @@ func TestRandomVideosExcluding(t *testing.T) {
 		t.Fatalf("limit 0 should return nil, got %v", got4)
 	}
 }
+
+func TestRandomVideosForPreferredVideoChoosesLeastPopulatedTag(t *testing.T) {
+	ctx := context.Background()
+	cat, err := Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() { _ = cat.Close() })
+
+	now := time.Now()
+	for _, v := range []*Video{
+		{ID: "current", DriveID: "drive", FileID: "f-current", Title: "current", Tags: []string{"common", "rare"}, PublishedAt: now, CreatedAt: now, UpdatedAt: now},
+		{ID: "common-1", DriveID: "drive", FileID: "f-common-1", Title: "common 1", Tags: []string{"common"}, PublishedAt: now, CreatedAt: now, UpdatedAt: now},
+		{ID: "common-2", DriveID: "drive", FileID: "f-common-2", Title: "common 2", Tags: []string{"common"}, PublishedAt: now, CreatedAt: now, UpdatedAt: now},
+		{ID: "rare-1", DriveID: "drive", FileID: "f-rare-1", Title: "rare 1", Tags: []string{"rare"}, PublishedAt: now, CreatedAt: now, UpdatedAt: now},
+	} {
+		if err := cat.UpsertVideo(ctx, v); err != nil {
+			t.Fatalf("seed %s: %v", v.ID, err)
+		}
+	}
+
+	tag, err := cat.LeastPopulatedVisibleUniqueTag(ctx, []string{"common", "rare"})
+	if err != nil {
+		t.Fatalf("least populated tag: %v", err)
+	}
+	if tag != "rare" {
+		t.Fatalf("least populated tag = %q, want rare", tag)
+	}
+
+	got, err := cat.RandomVideosForPreferredVideoExcluding(ctx, "current", []string{"current"}, 1)
+	if err != nil {
+		t.Fatalf("random preferred: %v", err)
+	}
+	if len(got) != 1 || got[0].ID != "rare-1" {
+		t.Fatalf("preferred result = %#v, want rare-1", videoIDs(got))
+	}
+
+	got, err = cat.RandomVideosForPreferredVideoExcluding(ctx, "current", nil, 1)
+	if err != nil {
+		t.Fatalf("random preferred without explicit exclude: %v", err)
+	}
+	if len(got) != 1 || got[0].ID == "current" {
+		t.Fatalf("preferred result without explicit exclude = %#v, should not return current", videoIDs(got))
+	}
+}
+
+func TestRandomVideosForPreferredVideoFallsBackToFillBatch(t *testing.T) {
+	ctx := context.Background()
+	cat, err := Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() { _ = cat.Close() })
+
+	now := time.Now()
+	for _, v := range []*Video{
+		{ID: "current", DriveID: "drive", FileID: "f-current", Title: "current", Tags: []string{"common", "rare"}, PublishedAt: now, CreatedAt: now, UpdatedAt: now},
+		{ID: "common-1", DriveID: "drive", FileID: "f-common-1", Title: "common 1", Tags: []string{"common"}, PublishedAt: now, CreatedAt: now, UpdatedAt: now},
+		{ID: "common-2", DriveID: "drive", FileID: "f-common-2", Title: "common 2", Tags: []string{"common"}, PublishedAt: now, CreatedAt: now, UpdatedAt: now},
+		{ID: "rare-1", DriveID: "drive", FileID: "f-rare-1", Title: "rare 1", Tags: []string{"rare"}, PublishedAt: now, CreatedAt: now, UpdatedAt: now},
+		{ID: "hidden-rare", DriveID: "drive", FileID: "f-hidden-rare", Title: "hidden rare", Tags: []string{"rare"}, PublishedAt: now, CreatedAt: now, UpdatedAt: now},
+	} {
+		if err := cat.UpsertVideo(ctx, v); err != nil {
+			t.Fatalf("seed %s: %v", v.ID, err)
+		}
+	}
+	if err := cat.HideVideo(ctx, "hidden-rare"); err != nil {
+		t.Fatalf("hide hidden-rare: %v", err)
+	}
+
+	got, err := cat.RandomVideosForPreferredVideoExcluding(ctx, "current", []string{"current"}, 3)
+	if err != nil {
+		t.Fatalf("random preferred: %v", err)
+	}
+	ids := videoIDs(got)
+	if len(ids) != 3 {
+		t.Fatalf("result ids = %#v, want 3 items", ids)
+	}
+	for _, excluded := range []string{"current", "hidden-rare"} {
+		if hasVideoID(ids, excluded) {
+			t.Fatalf("result ids = %#v, should not include %s", ids, excluded)
+		}
+	}
+	if !hasVideoID(ids, "rare-1") {
+		t.Fatalf("result ids = %#v, want rare-1 from least populated tag", ids)
+	}
+	if len(uniqueVideoIDs(ids)) != len(ids) {
+		t.Fatalf("result ids = %#v, want no duplicates", ids)
+	}
+}
+
+func TestRandomVideosForPreferredVideoFallbacksWhenPreferenceUnavailable(t *testing.T) {
+	ctx := context.Background()
+	cat, err := Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() { _ = cat.Close() })
+
+	now := time.Now()
+	for _, v := range []*Video{
+		{ID: "untagged", DriveID: "drive", FileID: "f-untagged", Title: "untagged", PublishedAt: now, CreatedAt: now, UpdatedAt: now},
+		{ID: "visible-1", DriveID: "drive", FileID: "f-visible-1", Title: "visible 1", PublishedAt: now, CreatedAt: now, UpdatedAt: now},
+		{ID: "visible-2", DriveID: "drive", FileID: "f-visible-2", Title: "visible 2", PublishedAt: now, CreatedAt: now, UpdatedAt: now},
+	} {
+		if err := cat.UpsertVideo(ctx, v); err != nil {
+			t.Fatalf("seed %s: %v", v.ID, err)
+		}
+	}
+
+	got, err := cat.RandomVideosForPreferredVideoExcluding(ctx, "missing", []string{"untagged"}, 2)
+	if err != nil {
+		t.Fatalf("random missing preferred: %v", err)
+	}
+	if !sameVideoIDSet(videoIDs(got), []string{"visible-1", "visible-2"}) {
+		t.Fatalf("missing preferred ids = %#v, want visible fallback videos", videoIDs(got))
+	}
+
+	got, err = cat.RandomVideosForPreferredVideoExcluding(ctx, "untagged", []string{"untagged"}, 2)
+	if err != nil {
+		t.Fatalf("random untagged preferred: %v", err)
+	}
+	if !sameVideoIDSet(videoIDs(got), []string{"visible-1", "visible-2"}) {
+		t.Fatalf("untagged preferred ids = %#v, want visible fallback videos", videoIDs(got))
+	}
+}
+
+func videoIDs(videos []*Video) []string {
+	ids := make([]string, 0, len(videos))
+	for _, v := range videos {
+		ids = append(ids, v.ID)
+	}
+	return ids
+}
+
+func hasVideoID(ids []string, want string) bool {
+	for _, id := range ids {
+		if id == want {
+			return true
+		}
+	}
+	return false
+}
+
+func uniqueVideoIDs(ids []string) map[string]struct{} {
+	seen := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		seen[id] = struct{}{}
+	}
+	return seen
+}
+
+func sameVideoIDSet(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	seen := make(map[string]int, len(a))
+	for _, value := range a {
+		seen[value]++
+	}
+	for _, value := range b {
+		if seen[value] == 0 {
+			return false
+		}
+		seen[value]--
+	}
+	return true
+}

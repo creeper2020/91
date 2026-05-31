@@ -34,7 +34,7 @@ import (
 	"github.com/video-site/backend/internal/drives/spider91"
 )
 
-// uploadTarget 是 migrator 调用目标 drive 的最小接口。任何一种"接收 spider91 上传"的
+// UploadTarget 是 migrator 调用目标 drive 的最小接口。任何一种"接收 spider91 上传"的
 // 网盘都要实现它；当前 PikPak、115 和 Google Drive 各自通过适配器满足。
 //
 // 这一层抽象把"迁移调用方"和"具体盘的 SDK 协议"解耦：
@@ -43,7 +43,7 @@ import (
 //   - Google Drive 走 resumable upload + md5Checksum（googledrive.UploadResult）
 //
 // 各 driver 返回值都被归一成本地的 UploadResult，并在 catalog 改写阶段统一处理。
-type uploadTarget interface {
+type UploadTarget interface {
 	ID() string
 	Kind() string
 	RootID() string
@@ -51,7 +51,7 @@ type uploadTarget interface {
 	Rename(ctx context.Context, fileID, newName string) error
 }
 
-// UploadResult 是 uploadTarget.UploadAndReportHash 的归一返回。
+// UploadResult 是 UploadTarget.UploadAndReportHash 的归一返回。
 //
 // FileID  目标盘上的新文件 ID；
 // Hash    GCID（PikPak）、SHA1 HEX 大写（115）或 MD5（Google Drive），写入 catalog.content_hash 用于跨盘去重；
@@ -62,9 +62,9 @@ type UploadResult struct {
 	Size   int64
 }
 
-// pikpakAdapter / p115Adapter / googleDriveAdapter 把具体 driver 包装成 uploadTarget。
+// pikpakAdapter / p115Adapter / googleDriveAdapter 把具体 driver 包装成 UploadTarget。
 //
-// 之所以不让 driver 直接实现 uploadTarget：
+// 之所以不让 driver 直接实现 UploadTarget：
 //
 //  1. 各 driver 的 UploadAndReportXxx 返回的是各自包内的 UploadResult 类型，
 //     直接共用同名同签名方法会引入循环依赖；
@@ -123,9 +123,9 @@ func (a *googleDriveAdapter) Rename(ctx context.Context, fileID, newName string)
 	return a.d.Rename(ctx, fileID, newName)
 }
 
-// adaptUploadTarget 把通用 drive 包装成 uploadTarget。
-// 不支持的盘 kind 返回 error；调用方静默跳过。
-func adaptUploadTarget(d drives.Drive) (uploadTarget, error) {
+// AdaptUploadTarget 把通用 drive 包装成可上传并回报 hash 的目标。
+// 供 spider91 迁移和普通本地上传默认迁移共用。
+func AdaptUploadTarget(d drives.Drive) (UploadTarget, error) {
 	switch v := d.(type) {
 	case *pikpak.Driver:
 		return &pikpakAdapter{d: v}, nil
@@ -133,7 +133,7 @@ func adaptUploadTarget(d drives.Drive) (uploadTarget, error) {
 		return &p115Adapter{d: v}, nil
 	case *googledrive.Driver:
 		return &googleDriveAdapter{d: v}, nil
-	case uploadTarget:
+	case UploadTarget:
 		// 测试或自定义实现可以直接传入；优先使用具体类型分支以拿到适配器。
 		return v, nil
 	default:
@@ -362,9 +362,9 @@ func (m *Migrator) targetKindForLog() string {
 	return d.Kind()
 }
 
-// resolveTarget 返回 (target drive ID, target uploadTarget, err)。
+// resolveTarget 返回 (target drive ID, target UploadTarget, err)。
 // 没设置、drive 找不到，或 drive 类型不支持上传时返回 err（调用方静默跳过）。
-func (m *Migrator) resolveTarget() (string, uploadTarget, error) {
+func (m *Migrator) resolveTarget() (string, UploadTarget, error) {
 	if m.cfg.GetTargetDriveID == nil {
 		return "", nil, errors.New("no target getter")
 	}
@@ -376,7 +376,7 @@ func (m *Migrator) resolveTarget() (string, uploadTarget, error) {
 	if !ok {
 		return "", nil, fmt.Errorf("target drive %q not in registry", id)
 	}
-	t, err := adaptUploadTarget(d)
+	t, err := AdaptUploadTarget(d)
 	if err != nil {
 		return "", nil, err
 	}
@@ -408,7 +408,7 @@ func (m *Migrator) spider91Drives() []*spider91.Driver {
 //   - 已经迁移过但本地还有残留 → 仅删本地（兜底）
 //
 // KeepLatestN < 0 时不保护任何本地文件，全部尝试迁移（旧行为，主要给测试用）。
-func (m *Migrator) migrateDrive(ctx context.Context, src *spider91.Driver, targetDriveID string, pp uploadTarget) (int, error) {
+func (m *Migrator) migrateDrive(ctx context.Context, src *spider91.Driver, targetDriveID string, pp UploadTarget) (int, error) {
 	keepN := m.cfg.KeepLatestN
 	if keepN < 0 {
 		keepN = 0
@@ -509,7 +509,7 @@ func (m *Migrator) migrateDrive(ctx context.Context, src *spider91.Driver, targe
 // migrateOne 把单条 spider91 视频上传到目标盘并改写 catalog。
 // 返回 (true, nil) 表示真的迁了一条；(false, nil) 表示跳过（本地文件已不在等）；
 // (false, err) 表示真出错。
-func (m *Migrator) migrateOne(ctx context.Context, v *catalog.Video, src *spider91.Driver, targetDriveID string, pp uploadTarget) (bool, error) {
+func (m *Migrator) migrateOne(ctx context.Context, v *catalog.Video, src *spider91.Driver, targetDriveID string, pp UploadTarget) (bool, error) {
 	path, err := src.VideoPath(v.FileID)
 	if err != nil {
 		return false, fmt.Errorf("resolve local path: %w", err)
@@ -668,7 +668,7 @@ func (m *Migrator) cleanupOldLocalVideos(ctx context.Context, src *spider91.Driv
 // 幂等：已经是期望格式的视频不会触发任何调用。
 //
 // 返回成功改名的条数。
-func (m *Migrator) backfillFileNames(ctx context.Context, targetDriveID string, pp uploadTarget) (int, error) {
+func (m *Migrator) backfillFileNames(ctx context.Context, targetDriveID string, pp UploadTarget) (int, error) {
 	videos, err := m.cfg.Catalog.ListVideosByDriveID(ctx, targetDriveID, 10000)
 	if err != nil {
 		return 0, fmt.Errorf("list videos: %w", err)

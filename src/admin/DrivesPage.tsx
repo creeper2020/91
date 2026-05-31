@@ -8,12 +8,14 @@ import {
   Filter,
   FolderTree,
   HardDrive,
+  Link2,
   PlayCircle,
   Plus,
   Power,
   PowerOff,
   RefreshCw,
   RotateCcw,
+  Save,
   Search,
   Trash2,
 } from "lucide-react";
@@ -34,6 +36,30 @@ const kindLabel: Record<string, string> = {
 };
 
 type Kind = api.AdminDrive["kind"];
+
+const defaultSpider91Sources: api.Spider91SourceConfig[] = [
+  { url: "https://www.91porn.com/v.php?category=top&viewtype=basic", targetNew: 15 },
+  { url: "https://91porn.com/v.php?category=mf&viewtype=basic", targetNew: 50 },
+];
+
+const idleNightlyStatus: api.NightlyJobStatus = {
+  state: "idle",
+  running: false,
+  queued: false,
+};
+
+function nightlyButtonText(status: api.NightlyJobStatus, triggering: boolean) {
+  if (triggering) return "触发中...";
+  if (status.running) return "扫描中";
+  if (status.queued) return "已排队";
+  return "扫描所有网盘";
+}
+
+function nightlyButtonTitle(status: api.NightlyJobStatus) {
+  if (status.running) return "扫描所有网盘任务正在运行，不能重复触发。";
+  if (status.queued) return "扫描所有网盘任务已排队，不能重复触发。";
+  return "立即扫描所有网盘。耗时较长，期间不要重复触发。";
+}
 
 type FormState = {
   /**
@@ -76,14 +102,18 @@ export function DrivesPage() {
   const [form, setForm] = useState<FormState>(emptyForm);
   const [saving, setSaving] = useState(false);
   const [regenFailedId, setRegenFailedId] = useState("");
-  // 与 regenFailedId 并列：失败封面重新入队按钮的 disable 状态。两套独立按钮 →
-  // 两个 state 互不阻塞，避免操作 teaser 时锁住封面那条按钮（反之亦然）。
+  // 失败资源重试按钮各自维护禁用状态，避免操作 teaser 时锁住封面/指纹按钮。
   const [regenFailedThumbId, setRegenFailedThumbId] = useState("");
+  const [regenFailedFingerprintId, setRegenFailedFingerprintId] = useState("");
   // togglingTeaserId 在请求未返回前禁用按钮，避免连点导致两次切换互相覆盖。
   const [togglingTeaserId, setTogglingTeaserId] = useState("");
   const [migratingSpider91, setMigratingSpider91] = useState(false);
+  const [scanningAll, setScanningAll] = useState(false);
+  const [nightlyStatus, setNightlyStatus] = useState<api.NightlyJobStatus>(idleNightlyStatus);
   const [selectedDriveId, setSelectedDriveId] = useState<string | null>(null);
+  const [savingImportTarget, setSavingImportTarget] = useState(false);
   const { show } = useToast();
+  const nightlyBusy = scanningAll || nightlyStatus.running || nightlyStatus.queued;
 
   // 当前系统中可作为 spider91 上传目标的 drive 列表（pikpak ∪ p115 ∪ googledrive）。
   // 用户保存 spider91 drive 时从这里挑一个；空表示本地保存不上传。
@@ -95,14 +125,16 @@ export function DrivesPage() {
   async function refresh() {
     setLoading(true);
     try {
-      const [data, storageData, settingsData] = await Promise.all([
+      const [data, storageData, settingsData, jobStatus] = await Promise.all([
         api.listDrives(),
         api.getDriveStorage(),
         api.getSettings().catch(() => null),
+        api.getNightlyJobStatus().catch(() => idleNightlyStatus),
       ]);
       setList(data ?? []);
       setStorage(storageData);
       if (settingsData) setSettings(settingsData);
+      setNightlyStatus(jobStatus ?? idleNightlyStatus);
     } catch (e) {
       show(e instanceof Error ? e.message : "加载失败", "error");
     } finally {
@@ -112,8 +144,12 @@ export function DrivesPage() {
 
   async function refreshDriveList() {
     try {
-      const data = await api.listDrives();
+      const [data, jobStatus] = await Promise.all([
+        api.listDrives(),
+        api.getNightlyJobStatus().catch(() => null),
+      ]);
       setList(data ?? []);
+      if (jobStatus) setNightlyStatus(jobStatus);
     } catch {
       // 保持当前页面状态，下一次轮询或手动操作再刷新。
     }
@@ -210,6 +246,19 @@ export function DrivesPage() {
     }
   }
 
+  async function handleImportUploadTargetChange(driveID: string) {
+    setSavingImportTarget(true);
+    try {
+      const updated = await api.updateSettings({ importUploadDriveId: driveID });
+      setSettings(updated);
+      show("默认上传网盘已更新", "success");
+    } catch (e) {
+      show(e instanceof Error ? e.message : "默认上传网盘保存失败", "error");
+    } finally {
+      setSavingImportTarget(false);
+    }
+  }
+
   async function handleDelete(d: api.AdminDrive) {
     if (!window.confirm(`确定删除 ${d.name || d.id}？\n这会移除盘配置，但不会删除其中的视频元数据。`)) return;
     try {
@@ -234,17 +283,24 @@ export function DrivesPage() {
     }
   }
 
-  /**
-   * 立即触发完整凌晨流水线（Phase1 扫所有云盘 → Phase2 spider91 爬虫 →
-   * Phase3 spider91 → 云盘迁移）。后端立即返回 202；进度看 backend 日志。
-   * 如果当前已有流水线在跑，后端最多保留一个待触发请求，当前轮结束后再跑一轮。
-   */
   async function handleRunNightly() {
+    if (nightlyBusy) {
+      show("扫描所有网盘任务已在运行或排队", "info");
+      return;
+    }
+    setScanningAll(true);
     try {
-      await api.runNightlyJob();
-      show("已触发扫描所有网盘，耗时较长，可在 backend 日志观察进度", "success");
+      const resp = await api.runNightlyJob();
+      setNightlyStatus(resp.status ?? idleNightlyStatus);
+      if (resp.accepted) {
+        show("已触发扫描所有网盘，耗时较长，可在后台状态里观察进度", "success");
+      } else {
+        show("扫描所有网盘任务已在运行或排队", "info");
+      }
     } catch (e) {
       show(e instanceof Error ? e.message : "触发失败", "error");
+    } finally {
+      setScanningAll(false);
     }
   }
 
@@ -284,6 +340,19 @@ export function DrivesPage() {
       show(e instanceof Error ? e.message : "触发失败", "error");
     } finally {
       setRegenFailedThumbId("");
+    }
+  }
+
+  async function handleRegenFailedFingerprints(d: api.AdminDrive) {
+    setRegenFailedFingerprintId(d.id);
+    try {
+      await api.regenFailedFingerprints(d.id);
+      show("已触发失败指纹重新生成", "success");
+      refresh();
+    } catch (e) {
+      show(e instanceof Error ? e.message : "触发失败", "error");
+    } finally {
+      setRegenFailedFingerprintId("");
     }
   }
 
@@ -466,6 +535,25 @@ export function DrivesPage() {
                 />
               </>
             )}
+            {d.kind === "spider91" && (
+              <Spider91SourcesPanel
+                drive={d}
+                onSaved={(saved) => {
+                  setList((prev) =>
+                    prev.map((item) =>
+                      item.id === saved.id
+                        ? {
+                            ...item,
+                            spider91Sources: saved.sources,
+                            spider91TargetNew: saved.targetNew,
+                          }
+                        : item
+                    )
+                  );
+                  refreshDriveList();
+                }}
+              />
+            )}
           </div>
 
           {/* 右栏：Teaser / 封面 与 缓存占用 */}
@@ -510,6 +598,14 @@ export function DrivesPage() {
                 >
                   <RotateCcw size={13} />
                   <span>重试失败封面</span>
+                </button>
+                <button
+                  className="admin-btn"
+                  disabled={(d.fingerprintFailedCount ?? 0) <= 0 || regenFailedFingerprintId === d.id}
+                  onClick={() => handleRegenFailedFingerprints(d)}
+                >
+                  <RotateCcw size={13} />
+                  <span>重试失败指纹</span>
                 </button>
               </div>
             </div>
@@ -581,9 +677,10 @@ export function DrivesPage() {
             type="button"
             className="admin-btn"
             onClick={handleRunNightly}
-            title="立即扫描所有网盘。耗时较长，期间不要重复触发。"
+            disabled={nightlyBusy}
+            title={nightlyButtonTitle(nightlyStatus)}
           >
-            <PlayCircle size={14} /> 扫描所有网盘
+            <PlayCircle size={14} /> {nightlyButtonText(nightlyStatus, scanningAll)}
           </button>
           <button className="admin-btn is-primary" onClick={openCreate}>
             <Plus size={14} /> 新建网盘
@@ -592,6 +689,13 @@ export function DrivesPage() {
       </header>
 
       {storage && <StorageSummary storage={storage} />}
+
+      <DefaultUploadTargetCard
+        value={settings?.importUploadDriveId ?? ""}
+        uploadTargets={uploadTargets}
+        saving={savingImportTarget}
+        onChange={handleImportUploadTargetChange}
+      />
 
       {loading ? (
         <div className="admin-empty">加载中...</div>
@@ -702,6 +806,40 @@ function StorageSummary({ storage }: { storage: api.AdminDriveStorage }) {
   );
 }
 
+function DefaultUploadTargetCard({
+  value,
+  uploadTargets,
+  saving,
+  onChange,
+}: {
+  value: string;
+  uploadTargets: api.AdminDrive[];
+  saving: boolean;
+  onChange: (driveID: string) => void;
+}) {
+  return (
+    <section className="admin-card">
+      <div className="admin-card__title">
+        <CloudUpload size={16} /> 默认上传网盘
+      </div>
+      <div className="admin-form__row">
+        <label>本地上传和链接导入</label>
+        <select value={value} disabled={saving} onChange={(e) => onChange(e.target.value)}>
+          <option value="">只保存到本机</option>
+          {uploadTargets.map((d) => (
+            <option key={d.id} value={d.id}>
+              {kindLabel[d.kind] ?? d.kind} · {d.name || d.id}
+            </option>
+          ))}
+        </select>
+        <div className="admin-form__help">
+          选择 115 网盘、PikPak 或 Google Drive 后，上传页的文件上传、链接导入和 TG 导入会先本地入库，再自动上传到该网盘根目录；封面和预览任务仍按本地入库流程生成。
+        </div>
+      </div>
+    </section>
+  );
+}
+
 function GenerationPipeline({ drive }: { drive: api.AdminDrive }) {
   return (
     <div className="admin-generation-pipeline">
@@ -712,6 +850,7 @@ function GenerationPipeline({ drive }: { drive: api.AdminDrive }) {
         ready={drive.thumbnailReadyCount}
         pending={drive.thumbnailPendingCount}
         failed={drive.thumbnailFailedCount}
+        durationPending={drive.thumbnailDurationPendingCount}
       />
       <GenerationPipelineLane
         title="Teaser"
@@ -742,6 +881,7 @@ function GenerationPipelineLane({
   pending,
   failed,
   skipped,
+  durationPending,
 }: {
   title: string;
   statusLabel: string;
@@ -750,6 +890,7 @@ function GenerationPipelineLane({
   pending?: number;
   failed?: number;
   skipped?: number;
+  durationPending?: number;
 }) {
   const segments = [
     { key: "ready", label: "就绪", value: ready ?? 0 },
@@ -787,6 +928,7 @@ function GenerationPipelineLane({
         pending={pending}
         failed={failed}
         skipped={skipped}
+        durationPending={durationPending}
       />
     </section>
   );
@@ -797,11 +939,13 @@ function GenerationCounts({
   pending,
   failed,
   skipped,
+  durationPending,
 }: {
   ready?: number;
   pending?: number;
   failed?: number;
   skipped?: number;
+  durationPending?: number;
 }) {
   return (
     <div className="admin-generation-counts">
@@ -814,6 +958,11 @@ function GenerationCounts({
       {skipped !== undefined && (
         <span className="admin-drive-teaser__metric is-skipped">
           跳过 {skipped ?? 0}
+        </span>
+      )}
+      {durationPending !== undefined && durationPending > 0 && (
+        <span className="admin-drive-teaser__metric is-pending">
+          待探时长 {durationPending}
         </span>
       )}
       <span className="admin-drive-teaser__metric is-failed">
@@ -1287,6 +1436,185 @@ function parseKeywordInput(input: string): string[] {
     out.push(value);
   }
   return out;
+}
+
+type Spider91SourcesPanelProps = {
+  drive: api.AdminDrive;
+  onSaved: (saved: {
+    id: string;
+    sources: api.Spider91SourceConfig[];
+    targetNew: number;
+  }) => void;
+};
+
+type Spider91SourceDraft = {
+  key: string;
+  url: string;
+  targetNew: string;
+};
+
+function spider91DraftsFromDrive(drive: api.AdminDrive): Spider91SourceDraft[] {
+  const sources = drive.spider91Sources?.length ? drive.spider91Sources : defaultSpider91Sources;
+  return sources.map((source, index) => ({
+    key: `${drive.id}:${index}:${source.url}`,
+    url: source.url,
+    targetNew: String(source.targetNew),
+  }));
+}
+
+function Spider91SourcesPanel({ drive, onSaved }: Spider91SourcesPanelProps) {
+  const { show } = useToast();
+  const sourceSnapshot = JSON.stringify(drive.spider91Sources?.length ? drive.spider91Sources : defaultSpider91Sources);
+  const [rows, setRows] = useState<Spider91SourceDraft[]>(() => spider91DraftsFromDrive(drive));
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    setRows(spider91DraftsFromDrive(drive));
+  }, [drive.id, sourceSnapshot]);
+
+  function updateRow(index: number, patch: Partial<Spider91SourceDraft>) {
+    setRows((prev) =>
+      prev.map((row, i) => (i === index ? { ...row, ...patch } : row))
+    );
+  }
+
+  function addRow() {
+    setRows((prev) => [
+      ...prev,
+      { key: `new:${Date.now()}`, url: "", targetNew: "15" },
+    ]);
+  }
+
+  function removeRow(index: number) {
+    setRows((prev) => prev.filter((_, i) => i !== index));
+  }
+
+  function buildPayload(): api.Spider91SourceConfig[] | null {
+    const payload: api.Spider91SourceConfig[] = [];
+    for (const row of rows) {
+      const urlText = row.url.trim();
+      const count = Number(row.targetNew);
+      if (!urlText) {
+        show("列表链接不能为空", "error");
+        return null;
+      }
+      let parsed: URL;
+      try {
+        parsed = new URL(urlText);
+      } catch {
+        show("列表链接格式不正确", "error");
+        return null;
+      }
+      if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+        show("列表链接必须是 http 或 https", "error");
+        return null;
+      }
+      if (!Number.isInteger(count) || count <= 0 || count > 500) {
+        show("每个范围的新增数必须是 1 到 500 的整数", "error");
+        return null;
+      }
+      payload.push({ url: parsed.toString(), targetNew: count });
+    }
+    if (payload.length === 0) {
+      show("至少保留一个抓取范围", "error");
+      return null;
+    }
+    return payload;
+  }
+
+  async function handleSave() {
+    const payload = buildPayload();
+    if (!payload) return;
+    setSaving(true);
+    try {
+      const resp = await api.setSpider91Sources(drive.id, payload);
+      setRows(
+        resp.sources.map((source, index) => ({
+          key: `${drive.id}:${index}:${source.url}`,
+          url: source.url,
+          targetNew: String(source.targetNew),
+        }))
+      );
+      onSaved({ id: drive.id, sources: resp.sources, targetNew: resp.targetNew });
+      show(`抓取范围已保存，本轮目标 ${resp.targetNew} 个新视频`, "success");
+    } catch (e) {
+      show(e instanceof Error ? e.message : "保存失败", "error");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  const total = rows.reduce((sum, row) => {
+    const n = Number(row.targetNew);
+    return Number.isFinite(n) && n > 0 ? sum + Math.floor(n) : sum;
+  }, 0);
+
+  return (
+    <div className="admin-detail-card">
+      <header className="admin-detail-card__title">
+        <div className="admin-detail-card__title-left">
+          <Link2 size={16} />
+          <span>抓取范围与数量</span>
+        </div>
+        <div className="admin-detail-actions-inline">
+          <button
+            type="button"
+            className="admin-btn"
+            onClick={addRow}
+            style={{ padding: "4px 10px", fontSize: "12px", height: "auto" }}
+          >
+            <Plus size={13} /> 添加
+          </button>
+          <button
+            type="button"
+            className="admin-btn is-primary"
+            onClick={handleSave}
+            disabled={saving}
+            style={{ padding: "4px 10px", fontSize: "12px", height: "auto" }}
+          >
+            <Save size={13} /> {saving ? "保存中..." : `保存 (${total})`}
+          </button>
+        </div>
+      </header>
+
+      <div className="admin-spider91-sources">
+        {rows.map((row, index) => (
+          <div className="admin-spider91-source-row" key={row.key}>
+            <div className="admin-form__row">
+              <label>列表链接</label>
+              <input
+                type="url"
+                value={row.url}
+                onChange={(e) => updateRow(index, { url: e.target.value })}
+                placeholder="https://91porn.com/v.php?category=mf&viewtype=basic"
+              />
+            </div>
+            <div className="admin-form__row">
+              <label>新增数</label>
+              <input
+                type="number"
+                min="1"
+                max="500"
+                step="1"
+                value={row.targetNew}
+                onChange={(e) => updateRow(index, { targetNew: e.target.value })}
+              />
+            </div>
+            <button
+              type="button"
+              className="admin-btn is-danger admin-spider91-source-row__delete"
+              onClick={() => removeRow(index)}
+              disabled={rows.length <= 1}
+              title="删除"
+              aria-label="删除抓取范围"
+            >
+              <Trash2 size={14} />
+            </button>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
 }
 
 type ScanSizeFilterPanelProps = {

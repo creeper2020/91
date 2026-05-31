@@ -27,7 +27,8 @@ const DefaultAuthor = "91porn"
 const DefaultTag = "91porn"
 
 // DefaultTargetNew 是凌晨任务默认的"凑够这么多新视频"目标数。
-const DefaultTargetNew = 15
+// 默认列表范围是 top=15 + mf=50，总目标为 65。
+const DefaultTargetNew = 65
 
 // 视频下载、列表页请求的 UA 沿用爬虫脚本里那一套，避免触发 Cloudflare 风控。
 const downloadUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
@@ -142,8 +143,8 @@ type spiderVideoEntry struct {
 //  4. 全部消费完 + 子进程退出 → 返回 CrawlResult。teaser 不在此处入队，
 //     由调用方 (App.runSpider91Crawl) 在 RunOnce 后统一调 enqueueDriveGeneration。
 //
-// targetNew <= 0 会被规范化成 spider91DefaultTargetNew（15）。
-func (c *Crawler) RunOnce(ctx context.Context, targetNew int) (*CrawlResult, error) {
+// targetNew <= 0 会被规范化成 DefaultTargetNew（65）。
+func (c *Crawler) RunOnce(ctx context.Context, targetNew int, listSourcesJSON ...string) (*CrawlResult, error) {
 	c.runMu.Lock()
 	defer c.runMu.Unlock()
 
@@ -161,6 +162,10 @@ func (c *Crawler) RunOnce(ctx context.Context, targetNew int) (*CrawlResult, err
 	}
 	if targetNew <= 0 {
 		targetNew = DefaultTargetNew
+	}
+	sourceConfigJSON := ""
+	if len(listSourcesJSON) > 0 {
+		sourceConfigJSON = strings.TrimSpace(listSourcesJSON[0])
 	}
 
 	if err := c.cfg.Driver.Init(ctx); err != nil {
@@ -202,7 +207,7 @@ func (c *Crawler) RunOnce(ctx context.Context, targetNew int) (*CrawlResult, err
 	// 这样把 "Python 等所有视频解析完 + Go 顺序下载 N 个" 重叠成 "Python 翻页找下一个的同时
 	// Go 在下载当前一个"，缩短总耗时；更重要的是把每条直链 e= 过期时间窗用满 ——
 	// 不会因为 Go 在下前面 7 个时让后面 8 个的签名超时。
-	cmd, stdout, err := c.startSpiderTargetNew(ctx, targetNew, seenPath, outputPath)
+	cmd, stdout, err := c.startSpiderTargetNew(ctx, targetNew, seenPath, outputPath, sourceConfigJSON)
 	if err != nil {
 		return result, fmt.Errorf("spider91 crawler: spider start: %w", err)
 	}
@@ -307,7 +312,7 @@ func (c *Crawler) writeSeenViewkeys(ctx context.Context, path string) (int, erro
 // 由本函数转发到 backend log，不影响 stdout 的 JSONL 协议。
 //
 // 使用方负责调 cmd.Wait()，并 close stdout reader。
-func (c *Crawler) startSpiderTargetNew(ctx context.Context, targetNew int, seenPath, outputPath string) (*exec.Cmd, io.ReadCloser, error) {
+func (c *Crawler) startSpiderTargetNew(ctx context.Context, targetNew int, seenPath, outputPath, listSourcesJSON string) (*exec.Cmd, io.ReadCloser, error) {
 	args := []string{
 		c.cfg.ScriptPath,
 		"--target-new", fmt.Sprintf("%d", targetNew),
@@ -316,6 +321,9 @@ func (c *Crawler) startSpiderTargetNew(ctx context.Context, targetNew int, seenP
 		"--no-resume",
 		"--quiet",
 		"--stream-output",
+	}
+	if strings.TrimSpace(listSourcesJSON) != "" {
+		args = append(args, "--list-sources-json", listSourcesJSON)
 	}
 	// 子进程的 ctx 走外层 ctx 即可，不再额外加 SpiderTimeout —— 流式模式下
 	// 单个视频的下载在 Go 端做超时控制（DownloadTimeout）；爬虫脚本主要时间在
@@ -333,8 +341,12 @@ func (c *Crawler) startSpiderTargetNew(ctx context.Context, targetNew int, seenP
 		_ = stdout.Close()
 		return nil, nil, fmt.Errorf("stderr pipe: %w", err)
 	}
-	log.Printf("[spider91] drive=%s exec %s --target-new=%d --seen=%s --output=%s",
-		c.cfg.Driver.ID(), c.cfg.ScriptPath, targetNew, seenPath, outputPath)
+	sourceMode := "default"
+	if strings.TrimSpace(listSourcesJSON) != "" {
+		sourceMode = "configured"
+	}
+	log.Printf("[spider91] drive=%s exec %s --target-new=%d --sources=%s --seen=%s --output=%s",
+		c.cfg.Driver.ID(), c.cfg.ScriptPath, targetNew, sourceMode, seenPath, outputPath)
 	if err := cmd.Start(); err != nil {
 		_ = stdout.Close()
 		_ = stderr.Close()

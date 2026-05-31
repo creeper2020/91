@@ -3,7 +3,9 @@
 """
 91porn 视频爬虫脚本
 ===================
-爬取 https://www.91porn.com/v.php?category=top&viewtype=basic 下的所有视频信息：
+爬取以下列表的视频信息：
+  - https://www.91porn.com/v.php?category=top&viewtype=basic
+  - https://www.91porn.com/v.php?category=mf&viewtype=basic
   - 视频名称
   - 封面图直链
   - 视频直链 (MP4)
@@ -18,8 +20,8 @@
     # 只爬指定页（单页模式，手动调试用）
     python spider_91porn.py --page 1 --output /tmp/spider91_page1.json
 
-    # 凑够 N 个新视频模式（backend 凌晨任务用）
-    python spider_91porn.py --target-new 15 --seen-viewkeys-file /tmp/seen.txt --output /tmp/new.json
+    # 凑够 N 个新视频模式（backend 定时任务用；默认 top=15, mf=50）
+    python spider_91porn.py --target-new 65 --seen-viewkeys-file /tmp/seen.txt --output /tmp/new.json
 
 CLI 参数:
     --page N                  只爬第 N 页，配合 --output 用于手动调试
@@ -70,7 +72,7 @@ import json
 import os
 import sys
 import html
-from urllib.parse import urljoin, unquote, urlparse
+from urllib.parse import urljoin, unquote, urlparse, urlencode, parse_qsl
 from datetime import datetime
 
 try:
@@ -82,10 +84,10 @@ except ImportError:
 
 # ===================== 配置区域 =====================
 BASE_URL = "https://www.91porn.com/v.php"
-LIST_PARAMS = {
-    "category": "top",
-    "viewtype": "basic"
-}
+LIST_SOURCES = [
+    {"category": "top", "viewtype": "basic", "target_new": 15},
+    {"category": "mf", "viewtype": "basic", "target_new": 50},
+]
 
 # 请求头 (模拟真实浏览器)
 HEADERS = {
@@ -128,6 +130,91 @@ MAX_EMPTY_PAGES = 2       # 连续空页数达到此值时停止爬取
 # ===================================================
 
 
+def normalize_list_sources(sources: list = None) -> list:
+    normalized = []
+    for source in sources or LIST_SOURCES:
+        params = dict(source or {})
+        raw_url = str(params.get("url") or "").strip()
+        category = str(params.get("category") or "").strip()
+        viewtype = str(params.get("viewtype") or "").strip()
+        if raw_url:
+            query = dict(parse_qsl(urlparse(raw_url).query, keep_blank_values=True))
+            category = category or str(query.get("category") or "custom").strip()
+            viewtype = viewtype or str(query.get("viewtype") or "basic").strip()
+        else:
+            category = category or "top"
+            viewtype = viewtype or "basic"
+        item = {
+            "category": category,
+            "viewtype": viewtype,
+        }
+        if raw_url:
+            item["url"] = raw_url
+        target_new = params.get("target_new")
+        if target_new is None:
+            target_new = params.get("targetNew")
+        if target_new is not None:
+            try:
+                target_int = int(target_new)
+                if target_int > 0:
+                    item["target_new"] = target_int
+            except (TypeError, ValueError):
+                pass
+        normalized.append(item)
+    return normalized or normalize_list_sources(LIST_SOURCES)
+
+
+def list_source_label(source: dict) -> str:
+    category = str(source.get("category") or "").strip()
+    viewtype = str(source.get("viewtype") or "").strip()
+    if category or viewtype:
+        return f"{category or 'custom'}/{viewtype or 'basic'}"
+    raw_url = str(source.get("url") or "").strip()
+    if raw_url:
+        parsed = urlparse(raw_url)
+        return f"{parsed.netloc}{parsed.path}" if parsed.netloc else raw_url
+    return "top/basic"
+
+
+def build_list_url(source: dict, page_num: int = 1) -> str:
+    raw_url = str(source.get("url") or "").strip()
+    if raw_url:
+        parsed = urlparse(raw_url)
+        query = [
+            (key, value)
+            for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+            if key.lower() != "page"
+        ]
+        if page_num > 1:
+            query.append(("page", str(page_num)))
+        return parsed._replace(query=urlencode(query)).geturl()
+    query = {
+        "category": source.get("category", "top"),
+        "viewtype": source.get("viewtype", "basic"),
+    }
+    if page_num > 1:
+        query["page"] = str(page_num)
+    return f"{BASE_URL}?{urlencode(query)}"
+
+
+def parse_list_sources_json(raw: str) -> list:
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"不是合法 JSON: {e}") from e
+    if isinstance(data, dict):
+        data = data.get("sources")
+    if not isinstance(data, list):
+        raise ValueError("必须是数组，或包含 sources 数组的对象")
+    sources = normalize_list_sources(data)
+    if not sources:
+        raise ValueError("列表范围不能为空")
+    return sources
+
+
 class Porn91Spider:
     def __init__(
         self,
@@ -140,6 +227,7 @@ class Porn91Spider:
         target_new: int = None,
         seen_viewkeys: list = None,
         stream_output: bool = False,
+        list_sources: list = None,
     ):
         """
         构造函数。所有参数都有默认值，等同于使用脚本顶部的全局配置。
@@ -175,6 +263,7 @@ class Porn91Spider:
         # （配合 backend Go 端 bufio.Scanner 实时消费，下载一个就开始下一个）。
         # 开启后所有 log 都走 stderr。
         self.stream_output = bool(stream_output)
+        self.list_sources = normalize_list_sources(list_sources)
 
         # 添加重试适配器
         try:
@@ -500,84 +589,148 @@ class Porn91Spider:
         self.log(f"配置: 列表页延时 {MIN_PAGE_DELAY}-{MAX_PAGE_DELAY}s, 详情页延时 {MIN_DETAIL_DELAY}-{MAX_DETAIL_DELAY}s")
         self.log(f"配置: 最大重试 {MAX_RETRIES} 次, 连续空页上限 {self.max_empty_pages}")
         self.log(f"配置: 起始页 {self.start_page}, 最大爬取页数 {self.max_pages if self.max_pages else '不限'}")
+        source_configs = []
+        for source in self.list_sources:
+            quota = source.get("target_new")
+            quota_text = f", 目标 {quota}" if self.target_new is not None and quota else ""
+            source_configs.append(f"{list_source_label(source)}({build_list_url(source, 1)}{quota_text})")
+        self.log(f"配置: 列表范围 {', '.join(source_configs)}")
         if self.target_new:
-            self.log(f"配置: 目标新增视频数 {self.target_new}")
+            self.log(f"配置: 全局新增视频上限 {self.target_new}")
         self.log(f"配置: 输出文件 {os.path.abspath(self.output_file)}")
         if self.skip_viewkeys:
             self.log(f"配置: 已跳过 {len(self.skip_viewkeys)} 个已知 viewkey")
         self.log("")
 
-        page_num = self.start_page
-        consecutive_empty = 0
+        source_states = []
+        for source in self.list_sources:
+            per_source_target = None
+            if self.target_new is not None:
+                per_source_target = source.get("target_new")
+                if per_source_target is None or len(self.list_sources) == 1:
+                    per_source_target = self.target_new
+            source_states.append({
+                "source": source,
+                "page": self.start_page,
+                "empty": 0,
+                "processed": 0,
+                "target": per_source_target,
+                "done": False,
+            })
+
         crawled_in_session = 0
 
         while True:
             if self.max_pages is not None and crawled_in_session >= self.max_pages:
                 self.log(f"达到配置的页数上限 {self.max_pages}，停止")
                 break
-            if consecutive_empty >= self.max_empty_pages:
-                self.log(f"连续 {self.max_empty_pages} 页无结果，已达到末尾")
-                break
             if self.target_new is not None and self.processed_videos >= self.target_new:
-                self.log(f"已累计 {self.processed_videos} 个新视频，达到目标 {self.target_new}，停止")
+                self.log(f"已累计 {self.processed_videos} 个新视频，达到全局上限 {self.target_new}，停止")
                 break
 
-            if page_num == 1:
-                page_url = f"{BASE_URL}?category=top&viewtype=basic"
-            else:
-                page_url = f"{BASE_URL}?category=top&viewtype=basic&page={page_num}"
+            active_states = [state for state in source_states if not state["done"]]
+            if not active_states:
+                self.log("所有列表都达到目标或连续无结果，停止")
+                break
 
-            if crawled_in_session > 0:
-                self.log("")
-                self.random_sleep(MIN_PAGE_DELAY, MAX_PAGE_DELAY)
+            made_request = False
+            stop_loop = False
+            for state in active_states:
+                source = state["source"]
+                label = list_source_label(source)
+                target = state.get("target")
 
-            self.log(f"[页 {page_num}] 请求: {page_url}")
-            page_html = self.fetch_page(page_url, f"列表页 第{page_num}页")
+                if self.max_pages is not None and crawled_in_session >= self.max_pages:
+                    self.log(f"达到配置的页数上限 {self.max_pages}，停止")
+                    stop_loop = True
+                    break
+                if self.target_new is not None and self.processed_videos >= self.target_new:
+                    self.log(f"已累计 {self.processed_videos} 个新视频，达到全局上限 {self.target_new}，停止")
+                    stop_loop = True
+                    break
+                if target is not None and state["processed"] >= target:
+                    self.log(f"[{label}] 已累计 {state['processed']} 个新视频，达到目标 {target}")
+                    state["done"] = True
+                    continue
+                if state["empty"] >= self.max_empty_pages:
+                    self.log(f"[{label}] 连续 {self.max_empty_pages} 页无结果，已达到末尾")
+                    state["done"] = True
+                    continue
 
-            if not page_html:
-                self.log(f"[页 {page_num}] 获取失败，跳过")
-                consecutive_empty += 1
-                page_num += 1
+                page_num = state["page"]
+                page_url = build_list_url(source, page_num)
+
+                if crawled_in_session > 0:
+                    self.log("")
+                    self.random_sleep(MIN_PAGE_DELAY, MAX_PAGE_DELAY)
+
+                self.log(f"[{label} 页 {page_num}] 请求: {page_url}")
+                page_html = self.fetch_page(page_url, f"列表页 {label} 第{page_num}页")
+                made_request = True
                 crawled_in_session += 1
-                continue
+                state["page"] += 1
 
-            page_videos = self.parse_list_page(page_html)
+                if not page_html:
+                    self.log(f"[{label} 页 {page_num}] 获取失败，跳过")
+                    state["empty"] += 1
+                    continue
 
-            # 判断页面是否真的没有视频（而非全部已处理）
-            if not page_videos:
-                self.log(f"[页 {page_num}] 页面无视频，可能已到末尾")
-                consecutive_empty += 1
-                page_num += 1
-                crawled_in_session += 1
-                continue
+                page_videos = self.parse_list_page(page_html)
 
-            consecutive_empty = 0
+                # 判断页面是否真的没有视频（而非全部已处理）
+                if not page_videos:
+                    self.log(f"[{label} 页 {page_num}] 页面无视频，可能已到末尾")
+                    state["empty"] += 1
+                    continue
 
-            # 过滤已处理的 viewkey，只保留新视频
-            new_videos = [v for v in page_videos if v['viewkey'] not in self.skip_viewkeys]
-            skipped_on_page = len(page_videos) - len(new_videos)
+                state["empty"] = 0
 
-            if skipped_on_page > 0:
-                self.log(f"[页 {page_num}] 发现 {len(page_videos)} 个链接, 其中 {skipped_on_page} 个已处理, {len(new_videos)} 个新视频")
-            else:
-                self.log(f"[页 {page_num}] 发现 {len(new_videos)} 个视频")
+                # 过滤已处理的 viewkey/source_id，只保留新视频
+                new_videos = [
+                    v for v in page_videos
+                    if v['viewkey'] not in self.skip_viewkeys
+                    and (not v.get("source_id") or v.get("source_id") not in self.skip_viewkeys)
+                ]
+                for video in new_videos:
+                    video["list_category"] = source.get("category", "")
+                    video["list_viewtype"] = source.get("viewtype", "")
 
-            if new_videos:
-                self._process_video_list(new_videos, referer=page_url)
-            self.pages_crawled += 1
-            page_num += 1
-            crawled_in_session += 1
+                skipped_on_page = len(page_videos) - len(new_videos)
+
+                if skipped_on_page > 0:
+                    self.log(
+                        f"[{label} 页 {page_num}] 发现 {len(page_videos)} 个链接, "
+                        f"其中 {skipped_on_page} 个已处理, {len(new_videos)} 个新视频"
+                    )
+                else:
+                    self.log(f"[{label} 页 {page_num}] 发现 {len(new_videos)} 个视频")
+
+                if new_videos:
+                    self._process_video_list(new_videos, referer=page_url, source_state=state)
+                self.pages_crawled += 1
+
+            if stop_loop:
+                break
+            if not made_request and all(state["done"] for state in source_states):
+                self.log("所有列表都达到目标或连续无结果，停止")
+                break
 
         self._save_results()
         self._print_summary()
 
-    def _process_video_list(self, videos: list, referer: str = ""):
+    def _process_video_list(self, videos: list, referer: str = "", source_state: dict = None):
         """
         处理一批视频列表，逐个获取详情页
         """
         for idx, video in enumerate(videos, 1):
             # target_new 模式下，凑够后立即停止，不再请求详情页
             if self.target_new is not None and self.processed_videos >= self.target_new:
+                return
+            if (
+                source_state is not None
+                and source_state.get("target") is not None
+                and source_state.get("processed", 0) >= source_state["target"]
+            ):
                 return
             # 跳过已处理的 viewkey (断点续爬)
             if video['viewkey'] in self.skip_viewkeys:
@@ -635,6 +788,8 @@ class Porn91Spider:
                 if video.get("source_id"):
                     self.skip_viewkeys.add(video["source_id"])
                 self.processed_videos += 1
+                if source_state is not None:
+                    source_state["processed"] = source_state.get("processed", 0) + 1
                 self.log(f"  [OK] 成功提取视频直链")
                 # 流式：立刻把这条 entry 交给 Go 端开始下载，不等本批余下视频
                 self.emit_stream_video(video)
@@ -649,9 +804,11 @@ class Porn91Spider:
         """
         保存结果到JSON文件
         """
+        source_urls = [build_list_url(source, 1) for source in self.list_sources]
         output_data = {
             "crawl_time": datetime.now().isoformat(),
-            "source_url": BASE_URL,
+            "source_url": source_urls[0] if source_urls else BASE_URL,
+            "source_urls": source_urls,
             "pages_crawled": self.pages_crawled,
             "total_videos": len(self.results),
             "successful": self.processed_videos,
@@ -700,7 +857,7 @@ def print_help():
     91porn 视频爬虫 v1.0
 ================================================
 
-本脚本将爬取 91porn "本月最热" 分类下的所有视频信息：
+    本脚本将爬取 91porn top/basic 和 mf/basic 分类下的视频信息：
   - 视频名称
   - 封面图直链
   - 视频直链 (MP4)
@@ -711,8 +868,9 @@ def print_help():
 使用方法:
     python spider_91porn.py
 
-配置说明 (编辑脚本内 "配置区域"):
-    MIN_PAGE_DELAY / MAX_PAGE_DELAY : 列表页请求间隔 (默认 3-6 秒)
+	配置说明 (编辑脚本内 "配置区域"):
+	    LIST_SOURCES : 列表范围和每轮目标数 (默认 top=15, mf=50)
+	    MIN_PAGE_DELAY / MAX_PAGE_DELAY : 列表页请求间隔 (默认 3-6 秒)
     MIN_DETAIL_DELAY / MAX_DETAIL_DELAY : 详情页请求间隔 (默认 2-5 秒)
     MAX_PAGES : 限制最大爬取页数 (None=不限, 如 5=只爬前5页)
     OUTPUT_FILE : 输出文件名 (默认 91porn_videos.json)
@@ -755,6 +913,8 @@ def main():
     parser.add_argument("--stream-output", action="store_true",
                         help="流式模式：每解析一条视频直链就立即把它作为一行 JSON 写到 stdout 并 flush；"
                              "日志改走 stderr。配合 backend 边读边下载使用。")
+    parser.add_argument("--list-sources-json", type=str, default=None,
+                        help="JSON 列表范围配置，例如 [{\"url\":\"https://91porn.com/v.php?category=mf&viewtype=basic\",\"targetNew\":50}]")
 
     args, _ = parser.parse_known_args()
 
@@ -779,6 +939,14 @@ def main():
         except Exception as e:
             print(f"警告: 读取 --seen-viewkeys-file 失败: {e}")
 
+    list_sources = None
+    if args.list_sources_json:
+        try:
+            list_sources = parse_list_sources_json(args.list_sources_json)
+        except ValueError as e:
+            print(f"错误: --list-sources-json {e}", file=sys.stderr)
+            sys.exit(2)
+
     # 决定运行模式
     if args.target_new is not None:
         # 凑够 N 个新视频模式：从 page 1 起翻页，直到累计 target_new 个新视频
@@ -791,6 +959,7 @@ def main():
             target_new=args.target_new,
             seen_viewkeys=seen_viewkeys,
             stream_output=args.stream_output,
+            list_sources=list_sources,
         )
     elif args.page is not None:
         # 单页模式（保留作手动调试用）：start_page=N, max_pages=1
@@ -804,6 +973,7 @@ def main():
             quiet=args.quiet,
             seen_viewkeys=seen_viewkeys,
             stream_output=args.stream_output,
+            list_sources=list_sources,
         )
     else:
         # 全量模式（向后兼容）：从 page 1 起爬到末尾
@@ -813,6 +983,7 @@ def main():
             quiet=args.quiet,
             seen_viewkeys=seen_viewkeys,
             stream_output=args.stream_output,
+            list_sources=list_sources,
         )
 
     try:

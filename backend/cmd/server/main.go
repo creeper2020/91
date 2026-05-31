@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -42,6 +43,8 @@ import (
 )
 
 func main() {
+	loadEnvFiles(".env.import", ".env", "../.env.import", "../.env")
+
 	cfgPath := "./config.yaml"
 	if v := os.Getenv("VIDEO_CONFIG"); v != "" {
 		cfgPath = v
@@ -73,6 +76,7 @@ func main() {
 		hlsWorkers:         make(map[string]*preview.HLSWorker),
 		fingerprintWorkers: make(map[string]*fingerprint.Worker),
 		spider91Crawlers:   make(map[string]*spider91.Crawler),
+		importUploadSem:    make(chan struct{}, 1),
 	}
 	app.proxy = proxy.New(app.registry)
 	app.spider91Migrator = spider91migrate.New(spider91migrate.Config{
@@ -88,6 +92,7 @@ func main() {
 
 	app.loadTheme(ctx)
 	app.loadSpider91UploadDriveID(ctx)
+	app.loadImportUploadDriveID(ctx)
 	if err := app.attachLocalUpload(ctx); err != nil {
 		log.Printf("[local-upload] attach failed: %v", err)
 	}
@@ -124,15 +129,24 @@ func main() {
 	}
 
 	apiServer := &api.Server{
-		Catalog:   cat,
-		Proxy:     app.proxy,
-		LocalDir:  cfg.Storage.LocalPreviewDir,
-		UploadDir: app.localUploadDir(),
+		Catalog:             cat,
+		Proxy:               app.proxy,
+		LocalDir:            cfg.Storage.LocalPreviewDir,
+		UploadDir:           app.localUploadDir(),
+		ExternalImportToken: externalImportToken(),
 		OnVideoUploaded: func(v *catalog.Video) {
 			app.enqueueUploadedVideo(ctx, v)
+			app.scheduleDefaultImportUpload(ctx, v)
 		},
 		GetTheme: func() string { return app.Theme() },
 	}
+	importManager := api.NewImportManager(apiServer, api.ImportManagerConfig{
+		PythonPath: app.defaultImportPythonPath(),
+		ScriptPath: app.defaultImportDownloaderPath(cfgPath),
+		TempDir:    filepath.Join(filepath.Dir(app.localUploadDir()), "imports"),
+	})
+	apiServer.Importer = importManager
+	importManager.Start(ctx)
 
 	adminServer := &api.AdminServer{
 		Catalog:         cat,
@@ -196,6 +210,9 @@ func main() {
 		OnRegenFailedThumbnails: func(driveID string) {
 			go app.regenFailedThumbnails(ctx, driveID)
 		},
+		OnRegenFailedFingerprints: func(driveID string) {
+			go app.regenFailedFingerprints(ctx, driveID)
+		},
 		GetDriveGenerationStatuses: func() map[string]api.DriveGenerationStatuses {
 			return app.driveGenerationStatuses()
 		},
@@ -219,10 +236,18 @@ func main() {
 		SetSpider91UploadDriveID: func(id string) error {
 			return app.SetSpider91UploadDriveID(ctx, id)
 		},
-		OnRunNightlyJob: func() {
+		GetImportUploadDriveID: func() string { return app.ImportUploadDriveID() },
+		SetImportUploadDriveID: func(id string) error {
+			return app.SetImportUploadDriveID(ctx, id)
+		},
+		OnRunNightlyJob: func() bool {
 			if app.nightlyRunner != nil {
-				app.nightlyRunner.TriggerNow()
+				return app.nightlyRunner.TriggerNow()
 			}
+			return false
+		},
+		GetNightlyJobStatus: func() api.NightlyJobStatus {
+			return app.nightlyJobStatus()
 		},
 		OnRunSpider91Migration: func() error {
 			if app.Spider91UploadDriveID() == "" {
@@ -315,6 +340,10 @@ type App struct {
 	// 显式指定的 spider91 上传目标 drive ID。
 	// 空字符串表示本地保存不上传，不再自动挑选上传目标 drive。
 	spider91UploadDriveID string
+	// 本地上传/链接导入完成后默认上传到的网盘 drive ID。空字符串表示只留本地。
+	importUploadDriveID string
+	// 串行化本地上传后的云端搬运，避免多个大文件同时抢带宽。
+	importUploadSem chan struct{}
 
 	// spider91Migrator 周期把 spider91 视频上传到目标 drive。
 	spider91Migrator *spider91migrate.Migrator
@@ -459,6 +488,53 @@ func (a *App) loadSpider91UploadDriveID(ctx context.Context) {
 	a.mu.Unlock()
 }
 
+// ImportUploadDriveID 返回本地上传/链接导入默认上传目标 drive ID。
+// 空字符串表示只入本地库；只有支持上传的大盘才会被接受。
+func (a *App) ImportUploadDriveID() string {
+	a.mu.Lock()
+	explicit := a.importUploadDriveID
+	a.mu.Unlock()
+	if explicit == "" {
+		return ""
+	}
+	if d, ok := a.registry.Get(explicit); ok && isImportUploadKind(d.Kind()) {
+		return explicit
+	}
+	return ""
+}
+
+func (a *App) SetImportUploadDriveID(ctx context.Context, driveID string) error {
+	driveID = strings.TrimSpace(driveID)
+	if driveID != "" {
+		d, ok := a.registry.Get(driveID)
+		if !ok {
+			return fmt.Errorf("drive %q not found", driveID)
+		}
+		if !isImportUploadKind(d.Kind()) {
+			return fmt.Errorf("drive %q kind=%s, only pikpak, p115 or googledrive can be default upload target", driveID, d.Kind())
+		}
+	}
+	a.mu.Lock()
+	a.importUploadDriveID = driveID
+	a.mu.Unlock()
+	return a.cat.SetSetting(ctx, "imports.upload_drive_id", driveID)
+}
+
+func isImportUploadKind(kind string) bool {
+	return kind == "pikpak" || kind == "p115" || kind == "googledrive"
+}
+
+func (a *App) loadImportUploadDriveID(ctx context.Context) {
+	v, err := a.cat.GetSetting(ctx, "imports.upload_drive_id", "")
+	if err != nil {
+		log.Printf("[imports] load upload drive setting: %v", err)
+		return
+	}
+	a.mu.Lock()
+	a.importUploadDriveID = strings.TrimSpace(v)
+	a.mu.Unlock()
+}
+
 func (a *App) driveGenerationStatuses() map[string]api.DriveGenerationStatuses {
 	a.mu.Lock()
 	previewWorkers := make(map[string]*preview.Worker, len(a.workers))
@@ -551,6 +627,27 @@ func generationStatusFromFingerprint(status fingerprint.TaskStatus) api.Generati
 		out.CooldownUntil = status.CooldownUntil.Format(time.RFC3339)
 	}
 	return out
+}
+
+func (a *App) nightlyJobStatus() api.NightlyJobStatus {
+	if a == nil || a.nightlyRunner == nil {
+		return api.NightlyJobStatus{State: "idle"}
+	}
+	status := a.nightlyRunner.Status()
+	return api.NightlyJobStatus{
+		State:          status.State,
+		Running:        status.Running,
+		Queued:         status.Queued,
+		StartedAt:      formatOptionalRFC3339(status.StartedAt),
+		LastFinishedAt: formatOptionalRFC3339(status.LastFinishedAt),
+	}
+}
+
+func formatOptionalRFC3339(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	return t.Format(time.RFC3339)
 }
 
 func (a *App) attachDrive(ctx context.Context, d *catalog.Drive) error {
@@ -729,6 +826,127 @@ func (a *App) attachLocalUpload(ctx context.Context) error {
 
 func (a *App) localUploadDir() string {
 	return filepath.Join(filepath.Dir(a.cfg.Storage.LocalPreviewDir), "uploads")
+}
+
+func (a *App) defaultImportDownloaderPath(cfgPath string) string {
+	if v := strings.TrimSpace(os.Getenv("VIDEO_IMPORT_DOWNLOADER")); v != "" {
+		return v
+	}
+	candidates := []string{
+		filepath.Join(filepath.Dir(cfgPath), "scripts", "import_downloader.py"),
+		filepath.Join(filepath.Dir(filepath.Dir(a.cfg.Storage.LocalPreviewDir)), "scripts", "import_downloader.py"),
+		filepath.Join("..", "scripts", "import_downloader.py"),
+		filepath.Join("scripts", "import_downloader.py"),
+	}
+	for _, p := range candidates {
+		abs, err := filepath.Abs(p)
+		if err != nil {
+			continue
+		}
+		if _, err := os.Stat(abs); err == nil {
+			return abs
+		}
+	}
+	if len(candidates) > 0 {
+		abs, err := filepath.Abs(candidates[len(candidates)-1])
+		if err == nil {
+			return abs
+		}
+	}
+	return ""
+}
+
+func (a *App) defaultImportPythonPath() string {
+	if v := strings.TrimSpace(os.Getenv("VIDEO_IMPORT_PYTHON")); v != "" {
+		return v
+	}
+	candidate := filepath.Join(filepath.Dir(filepath.Dir(a.cfg.Storage.LocalPreviewDir)), ".venv-import", "bin", "python")
+	if _, err := os.Stat(candidate); err == nil {
+		return candidate
+	}
+	return "python3"
+}
+
+func externalImportToken() string {
+	for _, key := range []string{"VIDEO_IMPORT_TOKEN", "IMPORT_API_TOKEN", "SYNC_TOKEN"} {
+		if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+func loadEnvFiles(paths ...string) {
+	seen := make(map[string]struct{})
+	if exe, err := os.Executable(); err == nil {
+		dir := filepath.Dir(exe)
+		paths = append(paths, filepath.Join(dir, ".env.import"), filepath.Join(dir, ".env"))
+	}
+	for _, p := range paths {
+		if p == "" {
+			continue
+		}
+		abs, err := filepath.Abs(p)
+		if err != nil {
+			continue
+		}
+		if _, ok := seen[abs]; ok {
+			continue
+		}
+		seen[abs] = struct{}{}
+		loadEnvFile(abs)
+	}
+}
+
+func loadEnvFile(file string) {
+	raw, err := os.ReadFile(file)
+	if err != nil {
+		return
+	}
+	for _, line := range strings.Split(string(raw), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		line = strings.TrimPrefix(line, "export ")
+		key, value, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		key = strings.TrimSpace(key)
+		if !validEnvName(key) {
+			continue
+		}
+		if _, exists := os.LookupEnv(key); exists {
+			continue
+		}
+		value = strings.TrimSpace(value)
+		if unquoted, err := strconv.Unquote(value); err == nil {
+			value = unquoted
+		} else if len(value) >= 2 {
+			quote := value[0]
+			if (quote == '\'' || quote == '"') && value[len(value)-1] == quote {
+				value = value[1 : len(value)-1]
+			}
+		}
+		_ = os.Setenv(key, value)
+	}
+}
+
+func validEnvName(name string) bool {
+	if name == "" {
+		return false
+	}
+	for i, r := range name {
+		if r == '_' || ('A' <= r && r <= 'Z') || ('a' <= r && r <= 'z') {
+			continue
+		}
+		if i > 0 && '0' <= r && r <= '9' {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 func fingerprintConfigForDrive(drv drives.Drive) fingerprint.Config {
@@ -1495,6 +1713,118 @@ func localPathWithin(root, path string) (string, bool) {
 	return pathAbs, true
 }
 
+func (a *App) scheduleDefaultImportUpload(ctx context.Context, v *catalog.Video) {
+	if v == nil || v.DriveID != localupload.DriveID {
+		return
+	}
+	if a.ImportUploadDriveID() == "" {
+		return
+	}
+	go func() {
+		select {
+		case a.importUploadSem <- struct{}{}:
+			defer func() { <-a.importUploadSem }()
+		case <-ctx.Done():
+			return
+		}
+		uploadCtx, cancel := context.WithTimeout(ctx, 12*time.Hour)
+		defer cancel()
+		if err := a.waitLocalUploadQueuesIdle(uploadCtx); err != nil {
+			log.Printf("[imports] wait local processing before default upload %s failed: %v", v.ID, err)
+			return
+		}
+		if err := a.uploadLocalVideoToDefaultDrive(uploadCtx, v); err != nil {
+			log.Printf("[imports] upload local video %s to default drive failed: %v", v.ID, err)
+		}
+	}()
+}
+
+func (a *App) waitLocalUploadQueuesIdle(ctx context.Context) error {
+	a.mu.Lock()
+	thumbWorker := a.thumbWorkers[localupload.DriveID]
+	previewWorker := a.workers[localupload.DriveID]
+	fingerprintWorker := a.fingerprintWorkers[localupload.DriveID]
+	a.mu.Unlock()
+
+	if thumbWorker != nil {
+		if err := thumbWorker.WaitIdle(ctx); err != nil {
+			return err
+		}
+	}
+	if previewWorker != nil {
+		if err := previewWorker.WaitIdle(ctx); err != nil {
+			return err
+		}
+	}
+	if fingerprintWorker != nil {
+		if err := fingerprintWorker.WaitIdle(ctx); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (a *App) uploadLocalVideoToDefaultDrive(ctx context.Context, v *catalog.Video) error {
+	if v == nil || v.DriveID != localupload.DriveID {
+		return nil
+	}
+	targetID := a.ImportUploadDriveID()
+	if targetID == "" {
+		return nil
+	}
+	target, ok := a.registry.Get(targetID)
+	if !ok {
+		return fmt.Errorf("default upload drive %q not found", targetID)
+	}
+	if !isImportUploadKind(target.Kind()) {
+		return fmt.Errorf("default upload drive %q kind=%s is not supported", targetID, target.Kind())
+	}
+
+	localDir := a.localUploadDir()
+	localPath, ok := localPathWithin(localDir, filepath.Join(localDir, v.FileID))
+	if !ok {
+		return fmt.Errorf("invalid local file id %q", v.FileID)
+	}
+	f, err := os.Open(localPath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	if info.Size() <= 0 {
+		return errors.New("local video is empty")
+	}
+	name := strings.TrimSpace(v.FileName)
+	if name == "" {
+		name = filepath.Base(v.FileID)
+	}
+
+	log.Printf("[imports] uploading local video %s to drive=%s name=%q size=%d", v.ID, targetID, name, info.Size())
+	uploader, err := spider91migrate.AdaptUploadTarget(target)
+	if err != nil {
+		return err
+	}
+	res, err := uploader.UploadAndReportHash(ctx, uploader.RootID(), name, f, info.Size())
+	if err != nil {
+		return err
+	}
+	if err := a.cat.MigrateVideoToDrive(ctx, v.ID, targetID, res.FileID, res.Hash); err != nil {
+		return err
+	}
+	if err := os.Remove(localPath); err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			log.Printf("[imports] remove migrated local file %s failed: %v", localPath, err)
+		}
+	} else {
+		log.Printf("[imports] removed migrated local file %s", localPath)
+	}
+	log.Printf("[imports] migrated video %s to drive=%s fileID=%s", v.ID, targetID, res.FileID)
+	return nil
+}
+
 func (a *App) enqueueUploadedVideo(ctx context.Context, v *catalog.Video) {
 	if v == nil {
 		return
@@ -1641,8 +1971,9 @@ func (a *App) regenFailedThumbnails(ctx context.Context, driveID string) {
 		// 来判断是否真的要再生）。但既然之前是 failed 说明 url 没写过，所以这里
 		// 把 url 一并清空更稳。
 		if err := a.cat.UpdateVideoMeta(ctx, v.ID, catalog.VideoMetaPatch{
-			ThumbnailURL:    "",
-			ThumbnailStatus: "pending",
+			ThumbnailURL:           "",
+			ThumbnailStatus:        "pending",
+			ResetThumbnailFailures: true,
 		}); err != nil {
 			log.Printf("[thumb] reset failed video %s drive=%s: %v", v.ID, driveID, err)
 			continue
@@ -1655,6 +1986,42 @@ func (a *App) regenFailedThumbnails(ctx context.Context, driveID string) {
 		queued++
 	}
 	log.Printf("[thumb] enqueued failed thumbnails for regen drive=%s queued=%d", driveID, queued)
+}
+
+func (a *App) regenFailedFingerprints(ctx context.Context, driveID string) {
+	items, err := a.cat.ListVideosByFingerprintStatus(ctx, driveID, "failed", 0)
+	if err != nil {
+		log.Printf("[fingerprint] list failed videos for regen drive=%s: %v", driveID, err)
+		return
+	}
+	a.mu.Lock()
+	fingerprintWorker := a.fingerprintWorkers[driveID]
+	a.mu.Unlock()
+	if fingerprintWorker == nil {
+		log.Printf("[fingerprint] regen failed drive=%s skipped: fingerprint worker not found", driveID)
+		return
+	}
+	log.Printf("[fingerprint] enqueue failed videos for regen drive=%s count=%d", driveID, len(items))
+	queued := 0
+	for _, v := range items {
+		if err := ctx.Err(); err != nil {
+			log.Printf("[fingerprint] enqueue failed canceled drive=%s queued=%d: %v", driveID, queued, err)
+			return
+		}
+		if err := a.cat.UpdateVideoFingerprint(ctx, v.ID, "", "pending", ""); err != nil {
+			log.Printf("[fingerprint] reset failed video %s drive=%s: %v", v.ID, driveID, err)
+			continue
+		}
+		v.SampledSHA256 = ""
+		v.FingerprintStatus = "pending"
+		v.FingerprintError = ""
+		if !fingerprintWorker.EnqueueBlocking(ctx, v) {
+			log.Printf("[fingerprint] enqueue failed canceled drive=%s queued=%d", driveID, queued)
+			return
+		}
+		queued++
+	}
+	log.Printf("[fingerprint] enqueued failed videos for regen drive=%s queued=%d", driveID, queued)
 }
 
 // listScanTargetIDs 返回 nightly Phase 1 应扫描的所有 drive ID
@@ -1807,12 +2174,16 @@ func (a *App) runSpider91Crawl(ctx context.Context, driveID string) {
 		return
 	}
 	targetNew := spider91IntCred(d, "target_new", spider91.DefaultTargetNew)
+	listSourcesJSON := spider91StringCred(d, "list_sources_json")
+	if sourcesTarget := spider91TargetNewFromSourcesJSON(listSourcesJSON); sourcesTarget > 0 {
+		targetNew = sourcesTarget
+	}
 	if targetNew <= 0 {
 		targetNew = spider91.DefaultTargetNew
 	}
 
-	log.Printf("[spider91] drive=%s start crawl target_new=%d", driveID, targetNew)
-	res, runErr := c.RunOnce(ctx, targetNew)
+	log.Printf("[spider91] drive=%s start crawl target_new=%d sources_configured=%t", driveID, targetNew, strings.TrimSpace(listSourcesJSON) != "")
+	res, runErr := c.RunOnce(ctx, targetNew, listSourcesJSON)
 	if runErr != nil {
 		log.Printf("[spider91] drive=%s crawl failed: %v", driveID, runErr)
 	} else if res != nil {
@@ -1865,6 +2236,38 @@ func spider91IntCred(d *catalog.Drive, key string, def int) int {
 		return def
 	}
 	return v
+}
+
+func spider91StringCred(d *catalog.Drive, key string) string {
+	if d == nil || d.Credentials == nil {
+		return ""
+	}
+	return strings.TrimSpace(d.Credentials[key])
+}
+
+func spider91TargetNewFromSourcesJSON(raw string) int {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return 0
+	}
+	var sources []struct {
+		TargetNew      int `json:"targetNew"`
+		TargetNewSnake int `json:"target_new"`
+	}
+	if err := json.Unmarshal([]byte(raw), &sources); err != nil {
+		return 0
+	}
+	total := 0
+	for _, source := range sources {
+		n := source.TargetNew
+		if n <= 0 {
+			n = source.TargetNewSnake
+		}
+		if n > 0 {
+			total += n
+		}
+	}
+	return total
 }
 
 // ---------- middleware ----------
@@ -1935,20 +2338,32 @@ func corsMiddleware(allowedOrigins []string) func(http.Handler) http.Handler {
 }
 
 func mountFrontend(r chi.Router) {
-	dir := strings.TrimSpace(os.Getenv("VIDEO_FRONTEND_DIR"))
-	if dir == "" {
-		dir = "./dist"
-	}
-	info, err := os.Stat(dir)
-	if err != nil || !info.IsDir() {
-		return
-	}
-	indexPath := filepath.Join(dir, "index.html")
-	if st, err := os.Stat(indexPath); err != nil || st.IsDir() {
+	dir, ok := resolveFrontendDir()
+	if !ok {
 		return
 	}
 	log.Printf("serving frontend from %s", dir)
 	r.NotFound(frontendHandler(dir))
+}
+
+func resolveFrontendDir() (string, bool) {
+	candidates := []string{}
+	if env := strings.TrimSpace(os.Getenv("VIDEO_FRONTEND_DIR")); env != "" {
+		candidates = append(candidates, env)
+	} else {
+		candidates = append(candidates, "./dist", "../dist")
+	}
+	for _, dir := range candidates {
+		info, err := os.Stat(dir)
+		if err != nil || !info.IsDir() {
+			continue
+		}
+		indexPath := filepath.Join(dir, "index.html")
+		if st, err := os.Stat(indexPath); err == nil && !st.IsDir() {
+			return dir, true
+		}
+	}
+	return "", false
 }
 
 func frontendHandler(dir string) http.HandlerFunc {

@@ -149,6 +149,27 @@ func (w *Worker) Status() TaskStatus {
 	return status
 }
 
+func (w *Worker) WaitIdle(ctx context.Context) error {
+	if w == nil {
+		return nil
+	}
+	if w.queue.lengthExcluding("") == 0 {
+		return nil
+	}
+	ticker := time.NewTicker(200 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+			if w.queue.lengthExcluding("") == 0 {
+				return nil
+			}
+		}
+	}
+}
+
 func (w *Worker) processQueued(ctx context.Context, v *catalog.Video) {
 	defer w.queue.release(v.ID)
 	if w.Catalog == nil || w.Drive == nil || v == nil || v.ID == "" {

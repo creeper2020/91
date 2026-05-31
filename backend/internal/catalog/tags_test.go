@@ -125,6 +125,51 @@ func TestDeleteTagRemovesAssociationsAndKeepsSystemTags(t *testing.T) {
 	mustFindTag(t, cat, ctx, "系统标签")
 }
 
+func TestDeleteTagSuppressesAutomaticCollectionRecreation(t *testing.T) {
+	ctx := context.Background()
+	cat, err := Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() { _ = cat.Close() })
+
+	now := time.Now()
+	for _, id := range []string{"video-1", "video-2"} {
+		if err := cat.UpsertVideo(ctx, &Video{
+			ID:          id,
+			DriveID:     "drive",
+			FileID:      id,
+			Title:       id,
+			Category:    "Better Call Saul S02",
+			PublishedAt: now,
+			CreatedAt:   now,
+			UpdatedAt:   now,
+		}); err != nil {
+			t.Fatalf("seed %s: %v", id, err)
+		}
+	}
+
+	if label, ok, err := cat.EnsureCollectionTag(ctx, "Better Call Saul S02"); err != nil {
+		t.Fatalf("ensure collection tag: %v", err)
+	} else if !ok || label != "Better Call Saul S02" {
+		t.Fatalf("ensure collection tag label=%q ok=%v, want created", label, ok)
+	}
+	tag := mustFindTag(t, cat, ctx, "Better Call Saul S02")
+	if _, err := cat.DeleteTag(ctx, tag.ID); err != nil {
+		t.Fatalf("delete collection tag: %v", err)
+	}
+
+	if label, ok, err := cat.EnsureCollectionTag(ctx, "Better Call Saul S02"); err != nil {
+		t.Fatalf("ensure deleted collection tag: %v", err)
+	} else if ok || label != "" {
+		t.Fatalf("deleted collection tag was recreated label=%q ok=%v", label, ok)
+	}
+	if _, err := cat.CreateTagAndClassify(ctx, "Better Call Saul S02", nil, "user"); err != nil {
+		t.Fatalf("user recreate deleted tag: %v", err)
+	}
+	mustFindTag(t, cat, ctx, "Better Call Saul S02")
+}
+
 func TestOpenClassifiesSystemTagsForExistingVideos(t *testing.T) {
 	path := t.TempDir() + "/catalog.db"
 	db, err := sql.Open("sqlite", path)

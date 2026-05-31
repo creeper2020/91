@@ -45,7 +45,7 @@ func (r *fakeRegistry) All() []drives.Drive {
 	return out
 }
 
-// fakePikPak 实现 drives.Drive + uploadTarget 接口（直接返回本包的 UploadResult，
+// fakePikPak 实现 drives.Drive + UploadTarget 接口（直接返回本包的 UploadResult，
 // 跳过 pikpakAdapter；这样测试不依赖真实 PikPak driver 的内部状态机）。
 type fakePikPak struct {
 	id          string
@@ -110,11 +110,11 @@ func (d *fakePikPak) UploadAndReportHash(ctx context.Context, parentID, name str
 
 // 编译期断言：fakePikPak 同时满足两个接口。
 var _ drives.Drive = (*fakePikPak)(nil)
-var _ uploadTarget = (*fakePikPak)(nil)
+var _ UploadTarget = (*fakePikPak)(nil)
 
 // fakeP115 与 fakePikPak 等价，但 Kind 是 "p115"，用于验证 migrator 也能把视频
 // 正确地路由到 115 目标盘（走 p115Adapter 的实际逻辑则需要真实 driver；
-// 这里通过 adaptUploadTarget 的 uploadTarget 短路分支让 fakeP115 直接成为 target）。
+// 这里通过 AdaptUploadTarget 的 UploadTarget 短路分支让 fakeP115 直接成为 target）。
 type fakeP115 struct {
 	*fakePikPak
 }
@@ -126,7 +126,7 @@ func newFakeP115(id, rootID string) *fakeP115 {
 func (d *fakeP115) Kind() string { return "p115" }
 
 var _ drives.Drive = (*fakeP115)(nil)
-var _ uploadTarget = (*fakeP115)(nil)
+var _ UploadTarget = (*fakeP115)(nil)
 
 func TestAdaptUploadTargetAcceptsGoogleDrive(t *testing.T) {
 	d := googledrive.New(googledrive.Config{
@@ -135,7 +135,7 @@ func TestAdaptUploadTargetAcceptsGoogleDrive(t *testing.T) {
 		AccessToken:  "access-token",
 		RefreshToken: "refresh-token",
 	})
-	target, err := adaptUploadTarget(d)
+	target, err := AdaptUploadTarget(d)
 	if err != nil {
 		t.Fatalf("adapt googledrive: %v", err)
 	}
@@ -862,8 +862,8 @@ func TestNonCaptchaErrorDoesNotTriggerCooldown(t *testing.T) {
 // migrator 也能正确把 spider91 视频上传过去并改写 catalog。
 //
 // 这条路径与 PikPak 的核心区别：
-//   - 适配器走 p115Adapter 而不是 pikpakAdapter（这里通过 fakeP115 实现 uploadTarget
-//     直接短路 adaptUploadTarget 的 case *p115.Driver 分支，
+//   - 适配器走 p115Adapter 而不是 pikpakAdapter（这里通过 fakeP115 实现 UploadTarget
+//     直接短路 AdaptUploadTarget 的 case *p115.Driver 分支，
 //     避免依赖真实 SDK 客户端）
 //   - 上传错误不会被 pikpak.IsCaptchaError 识别，不应触发冷却
 //   - catalog 写入逻辑（drive_id / file_id / content_hash / file_name）与 PikPak 完全一致

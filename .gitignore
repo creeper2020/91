@@ -3,6 +3,9 @@ dist
 .vite
 *.log
 .DS_Store
+.env
+.env.*
+!.env.example
 .vscode/
 .idea/
 

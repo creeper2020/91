@@ -75,6 +75,11 @@ export function checkUpdate() {
 
 // ---------- Drives ----------
 
+export type Spider91SourceConfig = {
+  url: string;
+  targetNew: number;
+};
+
 export type AdminDrive = {
   id: string;
   kind: "quark" | "p115" | "pikpak" | "wopan" | "onedrive" | "googledrive" | "spider91";
@@ -101,6 +106,8 @@ export type AdminDrive = {
   skipFileNameKeywords: string[];
   // spider91 上次成功爬取时间（unix 秒）；其它 kind 留空。
   lastCrawlAt?: number;
+  spider91Sources?: Spider91SourceConfig[];
+  spider91TargetNew?: number;
   thumbnailGenerationStatus?: DriveGenerationStatus;
   previewGenerationStatus?: DriveGenerationStatus;
   hlsGenerationStatus?: DriveGenerationStatus;
@@ -108,6 +115,7 @@ export type AdminDrive = {
   thumbnailReadyCount: number;
   thumbnailPendingCount: number;
   thumbnailFailedCount: number;
+  thumbnailDurationPendingCount: number;
   teaserReadyCount: number;
   teaserPendingCount: number;
   teaserFailedCount: number;
@@ -183,6 +191,16 @@ export function rescan(id: string) {
   return request<{ ok: boolean }>(
     `/drives/${encodeURIComponent(id)}/rescan`,
     { method: "POST" }
+  );
+}
+
+export function setSpider91Sources(id: string, sources: Spider91SourceConfig[]) {
+  return request<{ ok: boolean; sources: Spider91SourceConfig[]; targetNew: number }>(
+    `/drives/${encodeURIComponent(id)}/spider91-sources`,
+    {
+      method: "POST",
+      body: JSON.stringify({ sources }),
+    }
   );
 }
 
@@ -326,6 +344,13 @@ export function regenFailedThumbnails(id: string) {
   );
 }
 
+export function regenFailedFingerprints(id: string) {
+  return request<{ ok: boolean }>(
+    `/drives/${encodeURIComponent(id)}/fingerprints/failed/regenerate`,
+    { method: "POST" }
+  );
+}
+
 // ---------- Videos ----------
 
 export type AdminVideo = {
@@ -465,6 +490,12 @@ export type Settings = {
    * - 非空：显式指定。后端会校验 drive 存在且 kind ∈ {pikpak, p115, googledrive}。
    */
   spider91UploadDriveId: string;
+  /**
+   * 本地上传/链接导入完成后的默认上传目标 drive ID。
+   * - 空字符串：只保存在服务器本地。
+   * - 非空：后端上传到 pikpak / p115 / googledrive 并迁移 catalog。
+   */
+  importUploadDriveId: string;
 };
 
 export function getSettings() {
@@ -487,14 +518,29 @@ export function updateSettings(body: Partial<Settings>) {
 
 // ---------- Jobs ----------
 
+export type NightlyJobStatus = {
+  state: string;
+  running: boolean;
+  queued: boolean;
+  startedAt?: string;
+  lastFinishedAt?: string;
+};
+
+export function getNightlyJobStatus() {
+  return request<NightlyJobStatus>("/jobs/nightly/status");
+}
+
 /**
  * 立即触发一次完整的凌晨流水线（Phase1 扫盘 + Phase2 91 爬虫 + Phase3 迁移），
- * 不论当前时间或今日是否已跑。立即返回 202；进度通过 backend 日志观察。
+ * 不论当前时间或今日是否已跑。立即返回 202；进度通过状态接口观察。
  *
- * 流水线已在跑时后端最多保留一个待触发请求；已有待触发请求时，新的点击会被忽略。
+ * accepted=false 表示已有运行中或排队中的扫描，后端没有再叠加新任务。
  */
 export function runNightlyJob() {
-  return request<{ ok: boolean }>("/jobs/nightly/run", { method: "POST" });
+  return request<{ ok: boolean; accepted: boolean; status: NightlyJobStatus }>(
+    "/jobs/nightly/run",
+    { method: "POST" }
+  );
 }
 
 /**

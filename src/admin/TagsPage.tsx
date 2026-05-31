@@ -1,7 +1,11 @@
 import { useEffect, useMemo, useState } from "react";
-import { Film, Plus, RefreshCw, Search, Tags, Trash2 } from "lucide-react";
+import { CheckSquare, Film, Plus, RefreshCw, Search, Tags, Trash2 } from "lucide-react";
 import * as api from "./api";
 import { useToast } from "./ToastContext";
+
+const DESKTOP_TAGS_PAGE_SIZE = 25;
+const MOBILE_TAGS_PAGE_SIZE = 8;
+const TAGS_MOBILE_QUERY = "(max-width: 640px)";
 
 export function TagsPage() {
   const [tags, setTags] = useState<api.AdminTag[]>([]);
@@ -12,6 +16,11 @@ export function TagsPage() {
   const [deletingId, setDeletingId] = useState<number | null>(null);
   const [searchQuery, setSearchQuery] = useState("");
   const [filterSource, setFilterSource] = useState<string>("all");
+  const [selectMode, setSelectMode] = useState(false);
+  const [selected, setSelected] = useState<Set<number>>(new Set());
+  const [bulkDeleting, setBulkDeleting] = useState(false);
+  const pageSize = useTagsPageSize();
+  const [page, setPage] = useState(1);
   const { show } = useToast();
 
   async function refresh() {
@@ -47,18 +56,59 @@ export function TagsPage() {
   }
 
   async function handleDelete(tag: api.AdminTag) {
-    if (tag.source === "system" || deletingId !== null) return;
-    const confirmed = window.confirm(`删除标签「${tag.label}」？已关联视频会同步移除这个标签。`);
-    if (!confirmed) return;
+    if (tag.source === "system") return;
+    if (!window.confirm(`确定删除标签「${tag.label}」吗？此操作会从所有视频上移除该标签。`)) {
+      return;
+    }
     setDeletingId(tag.id);
     try {
       const r = await api.deleteTag(tag.id);
-      show(`已删除标签，影响 ${r.removedVideos} 个视频`, "success");
+      show(`已删除标签，并从 ${r.removedVideos} 个视频移除`, "success");
       await refresh();
     } catch (e) {
       show(e instanceof Error ? e.message : "删除标签失败", "error");
     } finally {
       setDeletingId(null);
+    }
+  }
+
+  function toggleSelectMode() {
+    setSelectMode((m) => !m);
+    setSelected(new Set());
+  }
+
+  function toggleSelect(id: number) {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      next.has(id) ? next.delete(id) : next.add(id);
+      return next;
+    });
+  }
+
+  async function handleBulkDelete() {
+    const ids = [...selected];
+    if (ids.length === 0) return;
+    if (!window.confirm(`确定删除选中的 ${ids.length} 个标签吗？此操作会从所有视频上移除这些标签。`)) {
+      return;
+    }
+    setBulkDeleting(true);
+    try {
+      let ok = 0;
+      for (const id of ids) {
+        try {
+          await api.deleteTag(id);
+          ok += 1;
+        } catch {
+          // 继续删除其余标签，最后统一提示失败数量。
+        }
+      }
+      const failed = ids.length - ok;
+      show(failed ? `已删除 ${ok} 个，${failed} 个失败` : `已删除 ${ok} 个标签`, failed ? "error" : "success");
+      setSelected(new Set());
+      setSelectMode(false);
+      await refresh();
+    } finally {
+      setBulkDeleting(false);
     }
   }
 
@@ -98,6 +148,41 @@ export function TagsPage() {
       return matchesSearch && matchesSource;
     });
   }, [tags, searchQuery, filterSource]);
+
+  const totalPages = Math.max(1, Math.ceil(filteredTags.length / pageSize));
+  const currentPage = Math.min(page, totalPages);
+  const pageStartIndex = (currentPage - 1) * pageSize;
+  const pageEndIndex = pageStartIndex + pageSize;
+  const pagedTags = useMemo(
+    () => filteredTags.slice(pageStartIndex, pageEndIndex),
+    [filteredTags, pageStartIndex, pageEndIndex]
+  );
+  const pageStart = filteredTags.length === 0 ? 0 : pageStartIndex + 1;
+  const pageEnd = Math.min(filteredTags.length, pageEndIndex);
+
+  useEffect(() => {
+    setPage(1);
+  }, [searchQuery, filterSource, pageSize]);
+
+  useEffect(() => {
+    setPage((p) => Math.min(Math.max(1, p), totalPages));
+  }, [totalPages]);
+
+  const deletablePageTags = useMemo(
+    () => pagedTags.filter((t) => t.source !== "system"),
+    [pagedTags]
+  );
+  const allSelected =
+    deletablePageTags.length > 0 && deletablePageTags.every((t) => selected.has(t.id));
+
+  function toggleSelectAll() {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (allSelected) deletablePageTags.forEach((t) => next.delete(t.id));
+      else deletablePageTags.forEach((t) => next.add(t.id));
+      return next;
+    });
+  }
 
   return (
     <section>
@@ -212,8 +297,51 @@ export function TagsPage() {
               >
                 合集 ({stats.collectionCount})
               </button>
+              {stats.legacyCount > 0 && (
+                <button
+                  type="button"
+                  className={`admin-tags-filter-tab ${filterSource === "legacy" ? "is-active" : ""}`}
+                  onClick={() => setFilterSource("legacy")}
+                >
+                  旧数据 ({stats.legacyCount})
+                </button>
+              )}
             </div>
+
+            <button
+              type="button"
+              className={`admin-btn ${selectMode ? "is-primary" : ""}`}
+              onClick={toggleSelectMode}
+            >
+              <CheckSquare size={13} /> {selectMode ? "退出批量" : "批量删除"}
+            </button>
           </div>
+
+          {selectMode && (
+            <div className="admin-tags-bulkbar">
+              <label className="admin-check">
+                <input type="checkbox" checked={allSelected} onChange={toggleSelectAll} />
+                <span>全选本页 ({deletablePageTags.length})</span>
+              </label>
+              <span className="admin-tags-bulkbar__count">已选 {selected.size} 个</span>
+              <button
+                type="button"
+                className="admin-btn"
+                onClick={() => setSelected(new Set())}
+                disabled={selected.size === 0}
+              >
+                清空
+              </button>
+              <button
+                type="button"
+                className="admin-btn is-danger"
+                onClick={handleBulkDelete}
+                disabled={selected.size === 0 || bulkDeleting}
+              >
+                <Trash2 size={13} /> {bulkDeleting ? "删除中..." : `删除选中 (${selected.size})`}
+              </button>
+            </div>
+          )}
 
           {loading ? (
             <div className="admin-empty">加载中...</div>
@@ -222,55 +350,135 @@ export function TagsPage() {
               没有找到匹配的标签。
             </div>
           ) : (
-            <div className="admin-tags-grid">
-              {filteredTags.map((tag) => (
-                <div key={tag.id} className="admin-tag-card">
-                  <div className="admin-tag-card__head">
-                    <span className="admin-tag-card__title">{tag.label}</span>
-                    <span className="admin-tag-card__source-badge" data-source={tag.source}>
-                      {sourceLabel(tag.source)}
-                    </span>
-                  </div>
-
-                  {tag.aliases && tag.aliases.length > 0 && (
-                    <div className="admin-tag-card__aliases">
-                      {tag.aliases.map((alias) => (
-                        <span key={alias} className="admin-tag-card__alias-pill">
-                          {alias}
+            <>
+              <div className="admin-tags-grid">
+                {pagedTags.map((tag) => {
+                  const selectable = selectMode && tag.source !== "system";
+                  const isSelected = selected.has(tag.id);
+                  return (
+                    <div
+                      key={tag.id}
+                      className={`admin-tag-card${selectable ? " is-selectable" : ""}${
+                        selectable && isSelected ? " is-selected" : ""
+                      }`}
+                      onClick={selectable ? () => toggleSelect(tag.id) : undefined}
+                    >
+                      <div className="admin-tag-card__head">
+                        {selectable && (
+                          <input
+                            type="checkbox"
+                            className="admin-tag-card__check"
+                            checked={isSelected}
+                            readOnly
+                          />
+                        )}
+                        <span className="admin-tag-card__title">{tag.label}</span>
+                        <span className="admin-tag-card__source-badge" data-source={tag.source}>
+                          {sourceLabel(tag.source)}
                         </span>
-                      ))}
-                    </div>
-                  )}
+                      </div>
 
-                  <div className="admin-tag-card__footer">
-                    <span>ID: {tag.id}</span>
-                    <span className="admin-tag-card__footer-actions">
-                      <span className="admin-tag-card__count">
-                        <Film size={11} />
-                        <strong>{tag.count} 视频</strong>
-                      </span>
-                      {tag.source !== "system" && (
-                        <button
-                          type="button"
-                          className="admin-tag-card__delete"
-                          onClick={() => handleDelete(tag)}
-                          disabled={deletingId !== null}
-                          title="删除标签"
-                        >
-                          <Trash2 size={10} />
-                          {deletingId === tag.id ? "删除中" : "删除"}
-                        </button>
+                      {tag.aliases && tag.aliases.length > 0 && (
+                        <div className="admin-tag-card__aliases">
+                          {tag.aliases.map((alias) => (
+                            <span key={alias} className="admin-tag-card__alias-pill">
+                              {alias}
+                            </span>
+                          ))}
+                        </div>
                       )}
-                    </span>
-                  </div>
+
+                      <div className="admin-tag-card__footer">
+                        <span className="admin-tag-card__count">
+                          <Film size={13} />
+                          <strong>{tag.count}</strong> 视频
+                        </span>
+                        <div className="admin-tag-card__footer-actions">
+                          <span className="admin-tag-card__id">#{tag.id}</span>
+                          {!selectMode && tag.source !== "system" && (
+                            <button
+                              type="button"
+                              className="admin-tag-card__delete"
+                              onClick={() => handleDelete(tag)}
+                              disabled={deletingId === tag.id}
+                              aria-label={`删除标签 ${tag.label}`}
+                            >
+                              <Trash2 size={11} />
+                              <span>{deletingId === tag.id ? "删除中" : "删除"}</span>
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+
+              {totalPages > 1 && (
+                <div className="admin-table-pagination admin-tags-pagination">
+                  <button
+                    type="button"
+                    className="admin-btn"
+                    onClick={() => setPage(1)}
+                    disabled={currentPage <= 1}
+                  >
+                    首页
+                  </button>
+                  <button
+                    type="button"
+                    className="admin-btn"
+                    onClick={() => setPage((p) => Math.max(1, p - 1))}
+                    disabled={currentPage <= 1}
+                  >
+                    上一页
+                  </button>
+                  <span className="admin-table-pagination__info">
+                    第 {currentPage} / {totalPages} 页，显示 {pageStart}-{pageEnd} / {filteredTags.length}，每页 {pageSize} 个
+                  </span>
+                  <button
+                    type="button"
+                    className="admin-btn"
+                    onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
+                    disabled={currentPage >= totalPages}
+                  >
+                    下一页
+                  </button>
+                  <button
+                    type="button"
+                    className="admin-btn"
+                    onClick={() => setPage(totalPages)}
+                    disabled={currentPage >= totalPages}
+                  >
+                    末页
+                  </button>
                 </div>
-              ))}
-            </div>
+              )}
+            </>
           )}
         </div>
       </div>
     </section>
   );
+}
+
+function useTagsPageSize() {
+  const [pageSize, setPageSize] = useState(() =>
+    window.matchMedia(TAGS_MOBILE_QUERY).matches
+      ? MOBILE_TAGS_PAGE_SIZE
+      : DESKTOP_TAGS_PAGE_SIZE
+  );
+
+  useEffect(() => {
+    const media = window.matchMedia(TAGS_MOBILE_QUERY);
+    const update = () => {
+      setPageSize(media.matches ? MOBILE_TAGS_PAGE_SIZE : DESKTOP_TAGS_PAGE_SIZE);
+    };
+    update();
+    media.addEventListener("change", update);
+    return () => media.removeEventListener("change", update);
+  }, []);
+
+  return pageSize;
 }
 
 function splitList(s: string): string[] {

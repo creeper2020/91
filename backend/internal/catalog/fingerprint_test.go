@@ -76,6 +76,50 @@ func TestListVideosDeduplicatesBySampledSHA256(t *testing.T) {
 	}
 }
 
+func TestListVideosByFingerprintStatusOnlyReturnsRetryableVideos(t *testing.T) {
+	ctx := context.Background()
+	cat, err := Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cat.Close(); err != nil {
+			t.Fatalf("close catalog: %v", err)
+		}
+	})
+
+	now := time.Now()
+	videos := []*Video{
+		{ID: "target-failed", DriveID: "drive-a", FileID: "file-a", FileName: "failed-a.mp4", Title: "Failed", Size: 100, PublishedAt: now, CreatedAt: now, UpdatedAt: now},
+		{ID: "target-pending", DriveID: "drive-a", FileID: "file-b", FileName: "pending.mp4", Title: "Pending", Size: 101, PublishedAt: now, CreatedAt: now, UpdatedAt: now},
+		{ID: "target-ready", DriveID: "drive-a", FileID: "file-c", FileName: "ready.mp4", Title: "Ready", Size: 102, PublishedAt: now, CreatedAt: now, UpdatedAt: now},
+		{ID: "target-hidden", DriveID: "drive-a", FileID: "file-d", FileName: "hidden.mp4", Title: "Hidden", Size: 103, Hidden: true, PublishedAt: now, CreatedAt: now, UpdatedAt: now},
+		{ID: "target-zero", DriveID: "drive-a", FileID: "file-e", FileName: "zero.mp4", Title: "Zero", PublishedAt: now, CreatedAt: now, UpdatedAt: now},
+		{ID: "other-failed", DriveID: "drive-b", FileID: "file-f", FileName: "failed-b.mp4", Title: "Other", Size: 104, PublishedAt: now, CreatedAt: now, UpdatedAt: now},
+	}
+	for _, v := range videos {
+		if err := cat.UpsertVideo(ctx, v); err != nil {
+			t.Fatalf("upsert %s: %v", v.ID, err)
+		}
+	}
+	for _, id := range []string{"target-failed", "target-hidden", "target-zero", "other-failed"} {
+		if err := cat.UpdateVideoFingerprint(ctx, id, "", "failed", "boom"); err != nil {
+			t.Fatalf("mark failed %s: %v", id, err)
+		}
+	}
+	if err := cat.UpdateVideoFingerprint(ctx, "target-ready", "abc123", "ready", ""); err != nil {
+		t.Fatalf("mark ready: %v", err)
+	}
+
+	items, err := cat.ListVideosByFingerprintStatus(ctx, "drive-a", "failed", 0)
+	if err != nil {
+		t.Fatalf("list failed fingerprints: %v", err)
+	}
+	if len(items) != 1 || items[0].ID != "target-failed" {
+		t.Fatalf("items = %#v, want only target-failed", items)
+	}
+}
+
 func TestDuplicateAssetCleanupCandidates(t *testing.T) {
 	ctx := context.Background()
 	cat, err := Open(t.TempDir() + "/catalog.db")

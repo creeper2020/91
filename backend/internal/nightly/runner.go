@@ -96,11 +96,24 @@ type Config struct {
 	Now func() time.Time
 }
 
+type Status struct {
+	State          string
+	Running        bool
+	Queued         bool
+	StartedAt      time.Time
+	LastFinishedAt time.Time
+}
+
 // Runner drives the nightly pipeline.
 type Runner struct {
-	cfg     Config
-	trigger chan struct{} // buffered(1); manual "run now"
-	runMu   sync.Mutex    // prevents overlapping pipeline runs
+	cfg            Config
+	trigger        chan struct{} // buffered(1); manual "run now"
+	runMu          sync.Mutex    // prevents overlapping pipeline runs
+	stateMu        sync.Mutex
+	running        bool
+	queued         bool
+	startedAt      time.Time
+	lastFinishedAt time.Time
 }
 
 // New constructs a Runner. cfg is shallow-copied; defaults are applied.
@@ -138,14 +151,46 @@ func (r *Runner) Run(ctx context.Context) {
 	}
 }
 
-// TriggerNow asks the running loop to fire a pipeline ASAP. The trigger channel
-// is buffered(1): if a pipeline is already in progress, one follow-up run may
-// remain pending and will start after the current run finishes. Additional
-// clicks while that follow-up is pending are ignored.
-func (r *Runner) TriggerNow() {
+// TriggerNow asks the running loop to fire a pipeline ASAP. It returns false
+// when a run is already active or a manual trigger is already queued.
+func (r *Runner) TriggerNow() bool {
+	r.stateMu.Lock()
+	if r.running || r.queued {
+		r.stateMu.Unlock()
+		return false
+	}
+	r.queued = true
+	r.stateMu.Unlock()
+
 	select {
 	case r.trigger <- struct{}{}:
+		return true
 	default:
+		r.stateMu.Lock()
+		r.queued = false
+		r.stateMu.Unlock()
+		return false
+	}
+}
+
+func (r *Runner) Status() Status {
+	r.stateMu.Lock()
+	defer r.stateMu.Unlock()
+	state := "idle"
+	switch {
+	case r.running && r.queued:
+		state = "running_queued"
+	case r.running:
+		state = "running"
+	case r.queued:
+		state = "queued"
+	}
+	return Status{
+		State:          state,
+		Running:        r.running,
+		Queued:         r.queued,
+		StartedAt:      r.startedAt,
+		LastFinishedAt: r.lastFinishedAt,
 	}
 }
 
@@ -181,11 +226,18 @@ func shouldRun(now time.Time, lastRunDate string) bool {
 func (r *Runner) runPipelineLocked(ctx context.Context, manual bool) {
 	if !r.runMu.TryLock() {
 		log.Printf("[nightly] another pipeline is already running, skipping this trigger")
+		r.stateMu.Lock()
+		r.queued = false
+		r.stateMu.Unlock()
 		return
 	}
-	defer r.runMu.Unlock()
 
 	started := r.cfg.Now()
+	r.markStarted(started)
+	defer func() {
+		r.markFinished(r.cfg.Now())
+		r.runMu.Unlock()
+	}()
 
 	mode := "scheduled"
 	if manual {
@@ -205,6 +257,22 @@ func (r *Runner) runPipelineLocked(ctx context.Context, manual bool) {
 	if err := r.cfg.Settings.SetSetting(ctx, settingLastRunDate, dateStr); err != nil {
 		log.Printf("[nightly] persist last_run_date: %v", err)
 	}
+}
+
+func (r *Runner) markStarted(started time.Time) {
+	r.stateMu.Lock()
+	r.running = true
+	r.queued = false
+	r.startedAt = started
+	r.stateMu.Unlock()
+}
+
+func (r *Runner) markFinished(finished time.Time) {
+	r.stateMu.Lock()
+	r.running = false
+	r.startedAt = time.Time{}
+	r.lastFinishedAt = finished
+	r.stateMu.Unlock()
 }
 
 // runPipeline executes the three phases. It returns when the pipeline finishes

@@ -429,6 +429,95 @@ func TestRegenFailedPreviewsQueuesOnlyFailedAndSkippedVideosForDrive(t *testing.
 	}
 }
 
+func TestRegenFailedFingerprintsQueuesOnlyFailedVideosForDrive(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cat.Close(); err != nil {
+			t.Fatalf("close catalog: %v", err)
+		}
+	})
+
+	sample := []byte("0123456789abcdef")
+	samplePath := filepath.Join(t.TempDir(), "sample.mp4")
+	if err := os.WriteFile(samplePath, sample, 0o644); err != nil {
+		t.Fatalf("write sample: %v", err)
+	}
+	now := time.Now()
+	for _, v := range []*catalog.Video{
+		{ID: "target-failed", DriveID: "drive-id", FileID: samplePath, FileName: "target-failed.mp4", Title: "Target Failed", Size: int64(len(sample))},
+		{ID: "target-pending", DriveID: "drive-id", FileID: samplePath, FileName: "target-pending.mp4", Title: "Target Pending", Size: int64(len(sample)) + 1},
+		{ID: "target-ready", DriveID: "drive-id", FileID: samplePath, FileName: "target-ready.mp4", Title: "Target Ready", Size: int64(len(sample))},
+		{ID: "other-failed", DriveID: "other-drive", FileID: samplePath, FileName: "other-failed.mp4", Title: "Other Failed", Size: int64(len(sample))},
+	} {
+		v.PublishedAt = now
+		v.CreatedAt = now
+		v.UpdatedAt = now
+		if err := cat.UpsertVideo(ctx, v); err != nil {
+			t.Fatalf("seed video %s: %v", v.ID, err)
+		}
+	}
+	for _, id := range []string{"target-failed", "other-failed"} {
+		if err := cat.UpdateVideoFingerprint(ctx, id, "", "failed", "boom"); err != nil {
+			t.Fatalf("mark failed %s: %v", id, err)
+		}
+	}
+	if err := cat.UpdateVideoFingerprint(ctx, "target-ready", "abc123", "ready", ""); err != nil {
+		t.Fatalf("mark ready: %v", err)
+	}
+
+	app := &App{
+		cat:                cat,
+		fingerprintWorkers: make(map[string]*fingerprint.Worker),
+	}
+	worker := fingerprint.NewWorker(cat, &serverFingerprintFileDrive{id: "drive-id"}, fingerprint.Config{})
+	go worker.Run(ctx)
+	app.mu.Lock()
+	app.fingerprintWorkers["drive-id"] = worker
+	app.mu.Unlock()
+
+	app.regenFailedFingerprints(ctx, "drive-id")
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		got, err := cat.GetVideo(ctx, "target-failed")
+		if err != nil {
+			t.Fatalf("get target failed: %v", err)
+		}
+		if got.FingerprintStatus == "ready" && got.SampledSHA256 != "" {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	target, err := cat.GetVideo(ctx, "target-failed")
+	if err != nil {
+		t.Fatalf("get regenerated target: %v", err)
+	}
+	if target.FingerprintStatus != "ready" || target.SampledSHA256 == "" {
+		t.Fatalf("target fingerprint status=%q sampled=%q, want ready with hash", target.FingerprintStatus, target.SampledSHA256)
+	}
+	pending, err := cat.GetVideo(ctx, "target-pending")
+	if err != nil {
+		t.Fatalf("get pending target: %v", err)
+	}
+	if pending.FingerprintStatus != "pending" || pending.SampledSHA256 != "" {
+		t.Fatalf("pending fingerprint changed: status=%q sampled=%q", pending.FingerprintStatus, pending.SampledSHA256)
+	}
+	other, err := cat.GetVideo(ctx, "other-failed")
+	if err != nil {
+		t.Fatalf("get other failed: %v", err)
+	}
+	if other.FingerprintStatus != "failed" {
+		t.Fatalf("other drive fingerprint status = %q, want failed", other.FingerprintStatus)
+	}
+}
+
 func TestEnqueueUploadedVideoQueuesLocalGenerationByDefault(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -898,6 +987,17 @@ type serverLocalUploadFakeDrive struct {
 }
 
 func (d *serverLocalUploadFakeDrive) ID() string { return "local-upload" }
+
+type serverFingerprintFileDrive struct {
+	serverFakeDrive
+	id string
+}
+
+func (d *serverFingerprintFileDrive) ID() string { return d.id }
+
+func (d *serverFingerprintFileDrive) StreamURL(_ context.Context, fileID string) (*drives.StreamLink, error) {
+	return &drives.StreamLink{URL: fileID}, nil
+}
 
 // seedDriveWithTeaser 在 catalog 里 upsert 一个测试用的 drive 行，把 TeaserEnabled
 // 设为 enabled。teaser 入队判断现在按 per-drive 而不是全局 setting，所以涉及到
