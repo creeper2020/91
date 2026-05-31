@@ -2,9 +2,11 @@ package proxy
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -149,28 +151,125 @@ func TestServeStreamPikPakSetsRedirectHeaders(t *testing.T) {
 	}
 }
 
-func TestServeStreamRedirectsOneDrive(t *testing.T) {
+func TestServeStreamProxiesOneDrive(t *testing.T) {
+	var gotRange string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotRange = r.Header.Get("Range")
+		w.Header().Set("Content-Type", "video/mp4")
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write([]byte("media"))
+	}))
+	defer upstream.Close()
+
 	reg := NewRegistry()
 	drv := &proxyFakeSimpleDrive{
 		kind: "onedrive",
-		url:  "https://public.onedrive.example/video.mp4",
+		url:  upstream.URL + "/video.mp4",
 	}
 	reg.Set("onedrive", drv)
 
 	p := New(reg)
+	var logs []string
+	p.Logf = func(format string, args ...any) {
+		logs = append(logs, fmt.Sprintf(format, args...))
+	}
 	req := httptest.NewRequest(http.MethodGet, "/p/stream/onedrive/file-1", nil)
+	req.Header.Set("Range", "bytes=0-3")
 	rr := httptest.NewRecorder()
 
 	p.ServeStream(rr, req, "onedrive", "file-1")
 
-	if rr.Code != http.StatusFound {
-		t.Fatalf("status = %d, want %d", rr.Code, http.StatusFound)
+	if rr.Code != http.StatusPartialContent {
+		t.Fatalf("status = %d, want %d", rr.Code, http.StatusPartialContent)
 	}
-	if got := rr.Header().Get("Location"); got != "https://public.onedrive.example/video.mp4" {
-		t.Fatalf("Location = %q", got)
+	if gotRange != "bytes=0-3" {
+		t.Fatalf("upstream Range = %q, want bytes=0-3", gotRange)
+	}
+	if got := rr.Header().Get("Location"); got != "" {
+		t.Fatalf("Location = %q, want no redirect", got)
+	}
+	if got := rr.Header().Get("X-Playback-Diagnostic-Id"); got == "" {
+		t.Fatalf("X-Playback-Diagnostic-Id is empty")
+	}
+	if got := rr.Header().Get("X-Playback-Mode"); got != "proxy" {
+		t.Fatalf("X-Playback-Mode = %q, want proxy", got)
+	}
+	if got := rr.Body.String(); got != "media" {
+		t.Fatalf("body = %q, want media", got)
 	}
 	if drv.calls != 1 {
 		t.Fatalf("link calls = %d, want 1", drv.calls)
+	}
+	if len(logs) != 1 {
+		t.Fatalf("diagnostic logs = %d, want 1: %#v", len(logs), logs)
+	}
+	for _, want := range []string{
+		"[playback]",
+		"mode=proxy",
+		"drive_kind=onedrive",
+		"status=206",
+		`range="bytes=0-3"`,
+		"bytes=5",
+	} {
+		if !strings.Contains(logs[0], want) {
+			t.Fatalf("diagnostic log %q missing %q", logs[0], want)
+		}
+	}
+	for _, private := range []string{"file-1", upstream.URL, "/video.mp4"} {
+		if strings.Contains(logs[0], private) {
+			t.Fatalf("diagnostic log exposed private value %q in %q", private, logs[0])
+		}
+	}
+}
+
+func TestServeStreamProxiesGoogleDriveAuthorizationHeader(t *testing.T) {
+	var gotAuth string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "video/mp4")
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write([]byte("media"))
+	}))
+	defer upstream.Close()
+
+	reg := NewRegistry()
+	drv := &proxyFakeSimpleDrive{
+		kind: "googledrive",
+		url:  upstream.URL + "/files/file-1?alt=media",
+		headers: http.Header{
+			"Authorization": {"Bearer secret-token"},
+		},
+	}
+	reg.Set("gdrive", drv)
+
+	p := New(reg)
+	req := httptest.NewRequest(http.MethodGet, "/p/stream/gdrive/file-1", nil)
+	req.Header.Set("Range", "bytes=0-3")
+	rr := httptest.NewRecorder()
+
+	p.ServeStream(rr, req, "gdrive", "file-1")
+
+	if rr.Code != http.StatusPartialContent {
+		t.Fatalf("status = %d, want %d", rr.Code, http.StatusPartialContent)
+	}
+	if gotAuth != "Bearer secret-token" {
+		t.Fatalf("upstream Authorization = %q, want bearer token", gotAuth)
+	}
+	if got := rr.Header().Get("Location"); got != "" {
+		t.Fatalf("Location = %q, want no redirect", got)
+	}
+	if got := rr.Body.String(); got != "media" {
+		t.Fatalf("body = %q, want media", got)
+	}
+}
+
+func TestSafeErrorTextRedactsURLs(t *testing.T) {
+	text := safeErrorText(fmt.Errorf(`Get "https://secret.example/path/video.mp4?token=abc": dial failed`))
+	if strings.Contains(text, "secret.example") || strings.Contains(text, "token=abc") {
+		t.Fatalf("safe error leaked URL details: %q", text)
+	}
+	if !strings.Contains(text, "[redacted-url]") {
+		t.Fatalf("safe error = %q, want redacted URL marker", text)
 	}
 }
 
@@ -219,9 +318,10 @@ func (d *proxyFakePikPakDrive) EnsureDir(context.Context, string) (string, error
 func (d *proxyFakePikPakDrive) RootID() string { return "0" }
 
 type proxyFakeSimpleDrive struct {
-	kind  string
-	url   string
-	calls int
+	kind    string
+	url     string
+	headers http.Header
+	calls   int
 }
 
 func (d *proxyFakeSimpleDrive) Kind() string { return d.kind }
@@ -237,9 +337,13 @@ func (d *proxyFakeSimpleDrive) Stat(context.Context, string) (*drives.Entry, err
 }
 func (d *proxyFakeSimpleDrive) StreamURL(context.Context, string) (*drives.StreamLink, error) {
 	d.calls++
+	headers := d.headers
+	if headers == nil {
+		headers = http.Header{}
+	}
 	return &drives.StreamLink{
 		URL:     d.url,
-		Headers: http.Header{},
+		Headers: headers,
 		Expires: time.Now().Add(10 * time.Minute),
 	}, nil
 }

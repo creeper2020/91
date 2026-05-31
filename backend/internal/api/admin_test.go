@@ -265,6 +265,7 @@ func TestHandleUpsertDrivePreservesExistingMinScanFileSizeWhenOmitted(t *testing
 	if err := cat.UpsertDrive(ctx, &catalog.Drive{
 		ID: "p115-main", Kind: "p115", Name: "115", RootID: "0", Status: "ok",
 		MinScanFileSizeBytes: 150 * 1024 * 1024,
+		ScanDirIDs:           []string{"keep-dir"},
 	}); err != nil {
 		t.Fatalf("seed drive: %v", err)
 	}
@@ -290,6 +291,9 @@ func TestHandleUpsertDrivePreservesExistingMinScanFileSizeWhenOmitted(t *testing
 	}
 	if got.MinScanFileSizeBytes != 150*1024*1024 {
 		t.Fatalf("min scan size = %d, want 150MiB", got.MinScanFileSizeBytes)
+	}
+	if len(got.ScanDirIDs) != 1 || got.ScanDirIDs[0] != "keep-dir" {
+		t.Fatalf("scan dir ids = %#v, want preserved scan dirs", got.ScanDirIDs)
 	}
 }
 
@@ -354,7 +358,13 @@ func TestHandleSetDriveScanFilter(t *testing.T) {
 			t.Fatalf("close catalog: %v", err)
 		}
 	})
-	if err := cat.UpsertDrive(ctx, &catalog.Drive{ID: "p115-main", Kind: "p115", Name: "115", RootID: "0"}); err != nil {
+	if err := cat.UpsertDrive(ctx, &catalog.Drive{
+		ID:         "p115-main",
+		Kind:       "p115",
+		Name:       "115",
+		RootID:     "0",
+		SkipDirIDs: []string{"legacy-skip"},
+	}); err != nil {
 		t.Fatalf("seed drive: %v", err)
 	}
 
@@ -388,6 +398,53 @@ func TestHandleSetDriveScanFilter(t *testing.T) {
 	}
 	if body.MinFileSizeBytes != 104857600 || len(body.SkipFileNameKeywords) != 2 {
 		t.Fatalf("response = %#v, want filter values", body)
+	}
+}
+
+func TestHandleSetDriveScanDirs(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cat.Close(); err != nil {
+			t.Fatalf("close catalog: %v", err)
+		}
+	})
+	if err := cat.UpsertDrive(ctx, &catalog.Drive{ID: "p115-main", Kind: "p115", Name: "115", RootID: "0"}); err != nil {
+		t.Fatalf("seed drive: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/admin/api/drives/p115-main/scan-dirs", strings.NewReader(`{"dirIds":[" dir-a ","dir-b","dir-a",""]}`))
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add("id", "p115-main")
+	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+	rr := httptest.NewRecorder()
+
+	(&AdminServer{Catalog: cat}).handleSetDriveScanDirs(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	got, err := cat.GetDrive(ctx, "p115-main")
+	if err != nil {
+		t.Fatalf("get drive: %v", err)
+	}
+	if len(got.ScanDirIDs) != 2 || got.ScanDirIDs[0] != "dir-a" || got.ScanDirIDs[1] != "dir-b" {
+		t.Fatalf("scan dir ids = %#v, want cleaned scan dirs", got.ScanDirIDs)
+	}
+	if len(got.SkipDirIDs) != 0 {
+		t.Fatalf("legacy skip dir ids = %#v, want cleared when saving scan dirs", got.SkipDirIDs)
+	}
+	var body struct {
+		ScanDirIDs []string `json:"scanDirIds"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(body.ScanDirIDs) != 2 || body.ScanDirIDs[0] != "dir-a" || body.ScanDirIDs[1] != "dir-b" {
+		t.Fatalf("response = %#v, want scan dir ids", body)
 	}
 }
 
@@ -463,6 +520,7 @@ func TestHandleListDrivesIncludesTeaserCounts(t *testing.T) {
 		{ID: "od-ready-1", DriveID: "OneDrive", FileID: "od-file-1", Title: "OD Ready 1", ThumbnailURL: "/p/thumb/od-ready-1", PreviewStatus: "ready", PublishedAt: now, CreatedAt: now, UpdatedAt: now},
 		{ID: "od-ready-2", DriveID: "OneDrive", FileID: "od-file-2", Title: "OD Ready 2", PreviewStatus: "ready", PublishedAt: now, CreatedAt: now, UpdatedAt: now},
 		{ID: "od-pending", DriveID: "OneDrive", FileID: "od-file-3", Title: "OD Pending", PreviewStatus: "pending", PublishedAt: now, CreatedAt: now, UpdatedAt: now},
+		{ID: "od-skipped", DriveID: "OneDrive", FileID: "od-file-4", Title: "OD Skipped", PreviewStatus: "skipped", PublishedAt: now, CreatedAt: now, UpdatedAt: now},
 		{ID: "pp-pending", DriveID: "PikPak", FileID: "pp-file-1", Title: "PP Pending", PreviewStatus: "pending", PublishedAt: now, CreatedAt: now, UpdatedAt: now},
 		{ID: "pp-failed", DriveID: "PikPak", FileID: "pp-file-2", Title: "PP Failed", ThumbnailURL: "/p/thumb/pp-failed", PreviewStatus: "failed", PublishedAt: now, CreatedAt: now, UpdatedAt: now},
 	}
@@ -502,6 +560,7 @@ func TestHandleListDrivesIncludesTeaserCounts(t *testing.T) {
 		TeaserReadyCount          int              `json:"teaserReadyCount"`
 		TeaserPendingCount        int              `json:"teaserPendingCount"`
 		TeaserFailedCount         int              `json:"teaserFailedCount"`
+		TeaserSkippedCount        int              `json:"teaserSkippedCount"`
 	}
 	if err := json.NewDecoder(rr.Body).Decode(&got); err != nil {
 		t.Fatalf("decode: %v", err)
@@ -510,6 +569,7 @@ func TestHandleListDrivesIncludesTeaserCounts(t *testing.T) {
 		TeaserReady      int
 		TeaserPending    int
 		TeaserFailed     int
+		TeaserSkipped    int
 		ThumbnailReady   int
 		ThumbnailPending int
 		ThumbnailFailed  int
@@ -521,6 +581,7 @@ func TestHandleListDrivesIncludesTeaserCounts(t *testing.T) {
 			TeaserReady      int
 			TeaserPending    int
 			TeaserFailed     int
+			TeaserSkipped    int
 			ThumbnailReady   int
 			ThumbnailPending int
 			ThumbnailFailed  int
@@ -530,6 +591,7 @@ func TestHandleListDrivesIncludesTeaserCounts(t *testing.T) {
 			TeaserReady:      d.TeaserReadyCount,
 			TeaserPending:    d.TeaserPendingCount,
 			TeaserFailed:     d.TeaserFailedCount,
+			TeaserSkipped:    d.TeaserSkippedCount,
 			ThumbnailReady:   d.ThumbnailReadyCount,
 			ThumbnailPending: d.ThumbnailPendingCount,
 			ThumbnailFailed:  d.ThumbnailFailedCount,
@@ -537,11 +599,11 @@ func TestHandleListDrivesIncludesTeaserCounts(t *testing.T) {
 			Preview:          d.PreviewGenerationStatus,
 		}
 	}
-	if byID["OneDrive"].TeaserReady != 2 || byID["OneDrive"].TeaserPending != 1 || byID["OneDrive"].TeaserFailed != 0 {
-		t.Fatalf("OneDrive counts = %#v, want ready=2 pending=1 failed=0", byID["OneDrive"])
+	if byID["OneDrive"].TeaserReady != 2 || byID["OneDrive"].TeaserPending != 1 || byID["OneDrive"].TeaserFailed != 0 || byID["OneDrive"].TeaserSkipped != 1 {
+		t.Fatalf("OneDrive counts = %#v, want ready=2 pending=1 failed=0 skipped=1", byID["OneDrive"])
 	}
-	if byID["OneDrive"].ThumbnailReady != 1 || byID["OneDrive"].ThumbnailPending != 1 || byID["OneDrive"].ThumbnailFailed != 1 {
-		t.Fatalf("OneDrive thumbnail counts = %#v, want ready=1 pending=1 failed=1", byID["OneDrive"])
+	if byID["OneDrive"].ThumbnailReady != 1 || byID["OneDrive"].ThumbnailPending != 2 || byID["OneDrive"].ThumbnailFailed != 1 {
+		t.Fatalf("OneDrive thumbnail counts = %#v, want ready=1 pending=2 failed=1", byID["OneDrive"])
 	}
 	if byID["OneDrive"].Thumbnail.State != "cooling" || byID["OneDrive"].Preview.State != "generating" {
 		t.Fatalf("OneDrive generation statuses = %#v, want thumbnail cooling and preview generating", byID["OneDrive"])
@@ -781,6 +843,69 @@ func TestHandleAdminListVideosFiltersByDriveID(t *testing.T) {
 	}
 }
 
+func TestHandleAdminListVideosFiltersByKeywordAndTag(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cat.Close(); err != nil {
+			t.Fatalf("close catalog: %v", err)
+		}
+	})
+
+	if _, err := cat.CreateTagAndClassify(ctx, "精选", nil, "user"); err != nil {
+		t.Fatalf("seed tag: %v", err)
+	}
+	now := time.Now()
+	for _, v := range []*catalog.Video{
+		{
+			ID:          "match-video",
+			DriveID:     "OneDrive",
+			FileID:      "match-file",
+			Title:       "alpha title",
+			PublishedAt: now,
+			CreatedAt:   now,
+			UpdatedAt:   now,
+		},
+		{
+			ID:          "tag-only-video",
+			DriveID:     "OneDrive",
+			FileID:      "tag-only-file",
+			Title:       "beta title",
+			PublishedAt: now.Add(-time.Hour),
+			CreatedAt:   now,
+			UpdatedAt:   now,
+		},
+	} {
+		if err := cat.UpsertVideo(ctx, v); err != nil {
+			t.Fatalf("seed video %s: %v", v.ID, err)
+		}
+		if err := cat.SetManualVideoTags(ctx, v.ID, []string{"精选"}); err != nil {
+			t.Fatalf("seed tags for %s: %v", v.ID, err)
+		}
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/admin/api/videos?keyword=alpha&tag=%E7%B2%BE%E9%80%89", nil)
+	rr := httptest.NewRecorder()
+	(&AdminServer{Catalog: cat}).handleAdminListVideos(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	var got struct {
+		Items []catalog.Video `json:"items"`
+		Total int             `json:"total"`
+	}
+	if err := json.NewDecoder(rr.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.Total != 1 || len(got.Items) != 1 || got.Items[0].ID != "match-video" {
+		t.Fatalf("response = total:%d items:%#v, want only match-video", got.Total, got.Items)
+	}
+}
+
 func TestHandleAdminListVideosPaginates(t *testing.T) {
 	ctx := context.Background()
 	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
@@ -833,6 +958,83 @@ func TestHandleAdminListVideosPaginates(t *testing.T) {
 	}
 }
 
+func TestHandleBulkVideoTagsAddsRemovesAndReplaces(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cat.Close(); err != nil {
+			t.Fatalf("close catalog: %v", err)
+		}
+	})
+
+	for _, label := range []string{"整理", "精选"} {
+		if _, err := cat.CreateTagAndClassify(ctx, label, nil, "user"); err != nil {
+			t.Fatalf("seed tag %s: %v", label, err)
+		}
+	}
+	now := time.Now()
+	for _, id := range []string{"video-a", "video-b"} {
+		if err := cat.UpsertVideo(ctx, &catalog.Video{
+			ID:          id,
+			DriveID:     "OneDrive",
+			FileID:      id + "-file",
+			Title:       id,
+			PublishedAt: now,
+			CreatedAt:   now,
+			UpdatedAt:   now,
+		}); err != nil {
+			t.Fatalf("seed video %s: %v", id, err)
+		}
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/admin/api/videos/bulk-tags", strings.NewReader(`{"videoIds":["video-a","video-b"],"tags":["整理"],"mode":"add"}`))
+	rr := httptest.NewRecorder()
+	(&AdminServer{Catalog: cat}).handleBulkVideoTags(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("add status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	for _, id := range []string{"video-a", "video-b"} {
+		video, err := cat.GetVideo(ctx, id)
+		if err != nil {
+			t.Fatalf("get video %s: %v", id, err)
+		}
+		if !hasTag(video.Tags, "整理") {
+			t.Fatalf("%s tags = %#v, want 整理", id, video.Tags)
+		}
+	}
+
+	req = httptest.NewRequest(http.MethodPost, "/admin/api/videos/bulk-tags", strings.NewReader(`{"videoIds":["video-a"],"tags":["整理"],"mode":"remove"}`))
+	rr = httptest.NewRecorder()
+	(&AdminServer{Catalog: cat}).handleBulkVideoTags(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("remove status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	videoA, err := cat.GetVideo(ctx, "video-a")
+	if err != nil {
+		t.Fatalf("get video-a: %v", err)
+	}
+	if hasTag(videoA.Tags, "整理") {
+		t.Fatalf("video-a tags = %#v, want 整理 removed", videoA.Tags)
+	}
+
+	req = httptest.NewRequest(http.MethodPost, "/admin/api/videos/bulk-tags", strings.NewReader(`{"videoIds":["video-b"],"tags":["精选"],"mode":"replace"}`))
+	rr = httptest.NewRecorder()
+	(&AdminServer{Catalog: cat}).handleBulkVideoTags(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("replace status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	videoB, err := cat.GetVideo(ctx, "video-b")
+	if err != nil {
+		t.Fatalf("get video-b: %v", err)
+	}
+	if len(videoB.Tags) != 1 || videoB.Tags[0] != "精选" {
+		t.Fatalf("video-b tags = %#v, want only 精选", videoB.Tags)
+	}
+}
+
 func TestHandleRegenAllPreviewsInvokesHook(t *testing.T) {
 	called := false
 	server := &AdminServer{
@@ -874,4 +1076,13 @@ func TestHandleRegenFailedPreviewsInvokesHookWithDriveID(t *testing.T) {
 	if calledWith != "PikPak" {
 		t.Fatalf("hook called with %q, want PikPak", calledWith)
 	}
+}
+
+func hasTag(tags []string, want string) bool {
+	for _, tag := range tags {
+		if tag == want {
+			return true
+		}
+	}
+	return false
 }

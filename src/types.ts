@@ -46,6 +46,7 @@ export type CommentItem = {
 
 export type VideoDetail = VideoItem & {
   videoSrc: string;
+  hlsSrc?: string;
   poster: string;
   description: string;
   embedUrl: string;

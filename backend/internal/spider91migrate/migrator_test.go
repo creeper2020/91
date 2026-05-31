@@ -14,6 +14,7 @@ import (
 
 	"github.com/video-site/backend/internal/catalog"
 	"github.com/video-site/backend/internal/drives"
+	"github.com/video-site/backend/internal/drives/googledrive"
 	"github.com/video-site/backend/internal/drives/pikpak"
 	"github.com/video-site/backend/internal/drives/spider91"
 )
@@ -126,6 +127,22 @@ func (d *fakeP115) Kind() string { return "p115" }
 
 var _ drives.Drive = (*fakeP115)(nil)
 var _ uploadTarget = (*fakeP115)(nil)
+
+func TestAdaptUploadTargetAcceptsGoogleDrive(t *testing.T) {
+	d := googledrive.New(googledrive.Config{
+		ID:           "google-target",
+		RootID:       "google-root-id",
+		AccessToken:  "access-token",
+		RefreshToken: "refresh-token",
+	})
+	target, err := adaptUploadTarget(d)
+	if err != nil {
+		t.Fatalf("adapt googledrive: %v", err)
+	}
+	if target.Kind() != googledrive.Kind || target.RootID() != "google-root-id" {
+		t.Fatalf("target kind/root = %s/%s", target.Kind(), target.RootID())
+	}
+}
 
 // TestBackfillFileNamesRenamesOnlyMismatchedSpider91Videos 验证回填逻辑：
 //

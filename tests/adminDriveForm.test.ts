@@ -27,7 +27,7 @@ test("onedrive drive form only exposes required default-app fields", () => {
   );
 
   const match =
-    /function credentialFields[\s\S]*?case "onedrive":\s*return \[([\s\S]*?)\];\s*case "spider91":/.exec(
+    /function credentialFields[\s\S]*?case "onedrive":\s*return \[([\s\S]*?)\];\s*case "/.exec(
       drivesPageSource
     );
   assert.ok(match, "onedrive credential field block should be present");
@@ -39,4 +39,23 @@ test("onedrive drive form only exposes required default-app fields", () => {
   assert.doesNotMatch(fields, /key: "region"/);
   assert.doesNotMatch(fields, /key: "is_sharepoint"/);
   assert.doesNotMatch(fields, /key: "site_id"/);
+});
+
+test("googledrive drive form exposes oauth refresh credentials", () => {
+  assert.match(drivesPageSource, /<option value="googledrive">Google Drive<\/option>/);
+  assert.match(drivesPageSource, /form\.kind === "onedrive" \|\| form\.kind === "googledrive"/);
+
+  const match =
+    /function credentialFields[\s\S]*?case "googledrive":\s*return \[([\s\S]*?)\];\s*case "spider91":/.exec(
+      drivesPageSource
+    );
+  assert.ok(match, "googledrive credential field block should be present");
+  const fields = match[1];
+
+  assert.match(fields, /key: "client_id"/);
+  assert.match(fields, /key: "client_secret"/);
+  assert.match(fields, /key: "refresh_token"/);
+  assert.match(fields, /key: "access_token"/);
+  assert.match(fields, /key: "token_url"/);
+  assert.match(fields, /key: "api_base_url"/);
 });

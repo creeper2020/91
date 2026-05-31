@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Edit, RefreshCw, Search } from "lucide-react";
+import { Edit, PlaySquare, RefreshCw, Search } from "lucide-react";
 import * as api from "./api";
 import { useToast } from "./ToastContext";
 import { Modal } from "./Modal";
@@ -10,19 +10,25 @@ export function VideosPage() {
   const [list, setList] = useState<api.AdminVideo[]>([]);
   const [drives, setDrives] = useState<api.AdminDrive[]>([]);
   const [loading, setLoading] = useState(true);
+  const [keywordInput, setKeywordInput] = useState("");
   const [keyword, setKeyword] = useState("");
+  const [tagFilter, setTagFilter] = useState("");
   const [driveId, setDriveId] = useState("");
   const [page, setPage] = useState(1);
   const [total, setTotal] = useState(0);
   const [editing, setEditing] = useState<api.AdminVideo | null>(null);
   const [availableTags, setAvailableTags] = useState<api.AdminTag[]>([]);
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set());
+  const [bulkTag, setBulkTag] = useState("");
+  const [bulkMode, setBulkMode] = useState<api.BulkVideoTagMode>("add");
+  const [bulkSaving, setBulkSaving] = useState(false);
   const { show } = useToast();
 
   async function refresh() {
     setLoading(true);
     try {
       const [r, tagList, driveList] = await Promise.all([
-        api.listVideos({ driveId, page, size: PAGE_SIZE }),
+        api.listVideos({ driveId, keyword, tag: tagFilter, page, size: PAGE_SIZE }),
         api.listTags(),
         api.listDrives(),
       ]);
@@ -39,29 +45,100 @@ export function VideosPage() {
 
   useEffect(() => {
     refresh();
-  }, [driveId, page]);
+  }, [driveId, keyword, page, tagFilter]);
 
   const driveNameMap = new Map(
     drives.map((d) => [d.id, d.name || d.id])
   );
 
-  const filtered = keyword.trim()
-    ? list.filter((v) => {
-        const k = keyword.toLowerCase();
-        return (
-          v.title.toLowerCase().includes(k) ||
-          (v.author ?? "").toLowerCase().includes(k)
-        );
-      })
-    : list;
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
   const pageStart = total === 0 ? 0 : (page - 1) * PAGE_SIZE + 1;
   const pageEnd = Math.min(total, page * PAGE_SIZE);
+  const hasActiveFilter = Boolean(driveId || keyword || tagFilter);
+  const selectedCount = selectedIds.size;
+  const allVisibleSelected = list.length > 0 && list.every((v) => selectedIds.has(v.id));
+
+  function resetSelection() {
+    setSelectedIds(new Set());
+  }
+
+  function handleSearchSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    setKeyword(keywordInput.trim());
+    setPage(1);
+    resetSelection();
+  }
+
+  function toggleSelected(id: string) {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) {
+        next.delete(id);
+      } else {
+        next.add(id);
+      }
+      return next;
+    });
+  }
+
+  function toggleVisibleSelection(checked: boolean) {
+    if (!checked) {
+      resetSelection();
+      return;
+    }
+    setSelectedIds(new Set(list.map((v) => v.id)));
+  }
+
+  async function handleBulkApply() {
+    const ids = Array.from(selectedIds);
+    if (ids.length === 0 || !bulkTag) return;
+    setBulkSaving(true);
+    try {
+      const result = await api.bulkUpdateVideoTags(ids, [bulkTag], bulkMode);
+      show(`已整理 ${result.updated ?? ids.length} 个视频`, "success");
+      resetSelection();
+      await refresh();
+    } catch (e) {
+      show(e instanceof Error ? e.message : "批量整理失败", "error");
+    } finally {
+      setBulkSaving(false);
+    }
+  }
 
   async function handleRegen(v: api.AdminVideo) {
     try {
       await api.regenPreview(v.id);
       show("已触发 teaser 重生", "success");
+      setList((items) =>
+        items.map((item) =>
+          item.id === v.id ? { ...item, previewStatus: "pending" } : item
+        )
+      );
+      setEditing((current) =>
+        current?.id === v.id ? { ...current, previewStatus: "pending" } : current
+      );
+    } catch (e) {
+      show(e instanceof Error ? e.message : "触发失败", "error");
+    }
+  }
+
+  async function handleGenerateHls(v: api.AdminVideo) {
+    try {
+      await api.generateHls(v.id);
+      show("已加入 HLS 转封装队列", "success");
+      setList((items) =>
+        items.map((item) =>
+          item.id === v.id
+            ? { ...item, hlsStatus: "generating", hlsError: "" }
+            : item
+        )
+      );
+      setEditing((current) =>
+        current?.id === v.id
+          ? { ...current, hlsStatus: "generating", hlsError: "" }
+          : current
+      );
+      await refresh();
     } catch (e) {
       show(e instanceof Error ? e.message : "触发失败", "error");
     }
@@ -78,24 +155,47 @@ export function VideosPage() {
             onChange={(e) => {
               setDriveId(e.target.value);
               setPage(1);
+              resetSelection();
             }}
           >
             <option value="">全部网盘</option>
             {drives.map((d) => (
               <option key={d.id} value={d.id}>
                 {d.name || d.id}（已生成 {d.teaserReadyCount ?? 0}，待生成{" "}
-                {d.teaserPendingCount ?? 0}）
+                {d.teaserPendingCount ?? 0}，跳过 {d.teaserSkippedCount ?? 0}）
               </option>
             ))}
           </select>
-          <div className="admin-videos-filter__search">
+          <select
+            className="admin-videos-filter__select"
+            value={tagFilter}
+            onChange={(e) => {
+              setTagFilter(e.target.value);
+              setPage(1);
+              resetSelection();
+            }}
+          >
+            <option value="">全部标签</option>
+            {availableTags.map((tag) => (
+              <option key={tag.id} value={tag.label}>
+                {tag.label}（{tag.count}）
+              </option>
+            ))}
+          </select>
+          <form className="admin-videos-filter__search" onSubmit={handleSearchSubmit}>
             <Search size={14} className="admin-videos-filter__search-icon" />
             <input
-              value={keyword}
-              onChange={(e) => setKeyword(e.target.value)}
+              value={keywordInput}
+              onChange={(e) => {
+                const value = e.target.value;
+                setKeywordInput(value);
+                setKeyword(value.trim());
+                setPage(1);
+                resetSelection();
+              }}
               placeholder="搜索标题 / 作者"
             />
-          </div>
+          </form>
           <button className="admin-btn" onClick={refresh}>
             <RefreshCw size={13} /> 刷新
           </button>
@@ -123,6 +223,11 @@ export function VideosPage() {
               <span className="admin-drive-teaser__metric is-pending">
                 待生成 {d.teaserPendingCount ?? 0}
               </span>
+              {(d.teaserSkippedCount ?? 0) > 0 && (
+                <span className="admin-drive-teaser__metric is-skipped">
+                  跳过 {d.teaserSkippedCount}
+                </span>
+              )}
               {(d.teaserFailedCount ?? 0) > 0 && (
                 <span className="admin-drive-teaser__metric is-failed">
                   失败 {d.teaserFailedCount}
@@ -143,29 +248,89 @@ export function VideosPage() {
 
       {loading ? (
         <div className="admin-empty">加载中...</div>
-      ) : filtered.length === 0 ? (
+      ) : list.length === 0 ? (
         <div className="admin-card admin-empty">
-          {driveId
+          {hasActiveFilter
+            ? "没有符合筛选条件的视频。"
+            : driveId
             ? "这个网盘下还没有可显示的视频。可以在「网盘管理」里触发重扫。"
             : "还没有视频。先在「网盘管理」里配置好盘并触发扫描。"}
         </div>
       ) : (
         <>
+          <div className="admin-bulk-toolbar">
+            <label className="admin-bulk-toolbar__select-all">
+              <input
+                type="checkbox"
+                checked={allVisibleSelected}
+                onChange={(e) => toggleVisibleSelection(e.target.checked)}
+              />
+              <span>本页全选</span>
+            </label>
+            <span className="admin-bulk-toolbar__count">已选 {selectedCount}</span>
+            <select
+              className="admin-videos-filter__select"
+              value={bulkMode}
+              onChange={(e) => setBulkMode(e.target.value as api.BulkVideoTagMode)}
+            >
+              <option value="add">添加标签</option>
+              <option value="remove">移除标签</option>
+              <option value="replace">覆盖标签</option>
+            </select>
+            <select
+              className="admin-videos-filter__select"
+              value={bulkTag}
+              onChange={(e) => setBulkTag(e.target.value)}
+            >
+              <option value="">选择标签</option>
+              {availableTags.map((tag) => (
+                <option key={tag.id} value={tag.label}>
+                  {tag.label}
+                </option>
+              ))}
+            </select>
+            <button
+              className="admin-btn is-primary"
+              onClick={handleBulkApply}
+              disabled={selectedCount === 0 || !bulkTag || bulkSaving}
+            >
+              {bulkSaving ? "整理中..." : "应用"}
+            </button>
+            <button className="admin-btn" onClick={resetSelection} disabled={selectedCount === 0}>
+              清空选择
+            </button>
+          </div>
           <table className="admin-table">
             <thead>
               <tr>
+                <th className="admin-table-checkbox">
+                  <input
+                    type="checkbox"
+                    aria-label="选择本页视频"
+                    checked={allVisibleSelected}
+                    onChange={(e) => toggleVisibleSelection(e.target.checked)}
+                  />
+                </th>
                 <th>标题</th>
                 <th>作者</th>
                 <th>标签</th>
                 <th>时长</th>
-                <th>Teaser</th>
+                <th>媒体处理</th>
                 <th>来源</th>
                 <th className="is-actions">操作</th>
               </tr>
             </thead>
             <tbody>
-              {filtered.map((v) => (
+              {list.map((v) => (
                 <tr key={v.id}>
+                  <td data-label="选择" className="admin-table-checkbox">
+                    <input
+                      type="checkbox"
+                      aria-label={`选择 ${v.title}`}
+                      checked={selectedIds.has(v.id)}
+                      onChange={() => toggleSelected(v.id)}
+                    />
+                  </td>
                   <td data-label="标题">
                     <div className="admin-video-title">{v.title}</div>
                     {fileMeta(v) && (
@@ -185,8 +350,12 @@ export function VideosPage() {
                     </div>
                   </td>
                   <td data-label="时长">{formatDur(v.durationSeconds)}</td>
-                  <td data-label="Teaser">
-                    <PreviewStatus s={v.previewStatus} />
+                  <td data-label="媒体处理">
+                    <MediaPipelineActions
+                      video={v}
+                      onRegen={handleRegen}
+                      onGenerateHls={handleGenerateHls}
+                    />
                   </td>
                   <td data-label="来源" className="admin-mono-cell">
                     {driveNameMap.get(v.driveId) ?? v.driveId}
@@ -194,9 +363,6 @@ export function VideosPage() {
                   <td className="is-actions" data-label="操作">
                     <button className="admin-btn" onClick={() => setEditing(v)}>
                       <Edit size={13} /> 编辑
-                    </button>{" "}
-                    <button className="admin-btn" onClick={() => handleRegen(v)}>
-                      <RefreshCw size={13} /> 重生 teaser
                     </button>
                   </td>
                 </tr>
@@ -206,14 +372,20 @@ export function VideosPage() {
           <div className="admin-table-pagination">
             <button
               className="admin-btn"
-              onClick={() => setPage(1)}
+              onClick={() => {
+                setPage(1);
+                resetSelection();
+              }}
               disabled={page <= 1}
             >
               首页
             </button>
             <button
               className="admin-btn"
-              onClick={() => setPage((p) => Math.max(1, p - 1))}
+              onClick={() => {
+                setPage((p) => Math.max(1, p - 1));
+                resetSelection();
+              }}
               disabled={page <= 1}
             >
               上一页
@@ -223,14 +395,20 @@ export function VideosPage() {
             </span>
             <button
               className="admin-btn"
-              onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
+              onClick={() => {
+                setPage((p) => Math.min(totalPages, p + 1));
+                resetSelection();
+              }}
               disabled={page >= totalPages}
             >
               下一页
             </button>
             <button
               className="admin-btn"
-              onClick={() => setPage(totalPages)}
+              onClick={() => {
+                setPage(totalPages);
+                resetSelection();
+              }}
               disabled={page >= totalPages}
             >
               末页
@@ -243,6 +421,8 @@ export function VideosPage() {
         <EditVideoModal
           video={editing}
           availableTags={availableTags}
+          onRegen={handleRegen}
+          onGenerateHls={handleGenerateHls}
           onClose={() => setEditing(null)}
           onSaved={() => {
             setEditing(null);
@@ -261,6 +441,58 @@ function PreviewStatus({ s }: { s: string }) {
   return <span className="admin-status is-pending">待生成</span>;
 }
 
+function HlsStatus({ s, error }: { s: string; error?: string }) {
+  if (s === "ready") return <span className="admin-status is-ok">就绪</span>;
+  if (s === "generating") return <span className="admin-status is-pending">生成中</span>;
+  if (s === "failed") {
+    return (
+      <span className="admin-status is-error" title={error || "HLS 生成失败"}>
+        失败
+      </span>
+    );
+  }
+  return <span className="admin-status is-pending">未生成</span>;
+}
+
+function MediaPipelineActions({
+  video,
+  onRegen,
+  onGenerateHls,
+}: {
+  video: api.AdminVideo;
+  onRegen: (video: api.AdminVideo) => void | Promise<void>;
+  onGenerateHls: (video: api.AdminVideo) => void | Promise<void>;
+}) {
+  return (
+    <div className="admin-media-pipeline">
+      <div className="admin-media-pipeline__item">
+        <span className="admin-media-pipeline__label">Teaser</span>
+        <PreviewStatus s={video.previewStatus} />
+        <button
+          type="button"
+          className="admin-btn admin-btn--compact"
+          onClick={() => onRegen(video)}
+        >
+          <RefreshCw size={13} /> 重生
+        </button>
+      </div>
+      <div className="admin-media-pipeline__item">
+        <span className="admin-media-pipeline__label">HLS</span>
+        <HlsStatus s={video.hlsStatus} error={video.hlsError} />
+        <button
+          type="button"
+          className="admin-btn admin-btn--compact"
+          onClick={() => onGenerateHls(video)}
+          disabled={video.hlsStatus === "generating"}
+        >
+          <PlaySquare size={13} />
+          {video.hlsStatus === "ready" ? "重建" : "生成"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
 function formatDur(sec: number): string {
   if (!sec) return "—";
   const m = Math.floor(sec / 60);
@@ -271,11 +503,15 @@ function formatDur(sec: number): string {
 function EditVideoModal({
   video,
   availableTags,
+  onRegen,
+  onGenerateHls,
   onClose,
   onSaved,
 }: {
   video: api.AdminVideo;
   availableTags: api.AdminTag[];
+  onRegen: (video: api.AdminVideo) => void | Promise<void>;
+  onGenerateHls: (video: api.AdminVideo) => void | Promise<void>;
   onClose: () => void;
   onSaved: () => void;
 }) {
@@ -390,15 +626,19 @@ function EditVideoModal({
             onChange={(e) => setDescription(e.target.value)}
           />
         </div>
+        <div className="admin-form__section">
+          <div className="admin-form__section-title">媒体处理</div>
+          <MediaPipelineActions
+            video={video}
+            onRegen={onRegen}
+            onGenerateHls={onGenerateHls}
+          />
+        </div>
         <dl className="admin-kv" style={{ marginTop: 8 }}>
           <dt>来源盘</dt>
           <dd>{video.driveId}</dd>
           <dt>文件信息</dt>
           <dd>{fileMeta(video) || "—"}</dd>
-          <dt>Teaser</dt>
-          <dd>
-            <PreviewStatus s={video.previewStatus} />
-          </dd>
         </dl>
         <details className="admin-form__help" style={{ marginTop: 8 }}>
           <summary>技术信息（排查用）</summary>

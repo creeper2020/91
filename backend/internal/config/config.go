@@ -17,12 +17,13 @@ const (
 )
 
 type Config struct {
-	Server  Server  `yaml:"server"`
-	Storage Storage `yaml:"storage"`
-	Scanner Scanner `yaml:"scanner"`
-	Preview Preview `yaml:"preview"`
-	Nightly Nightly `yaml:"nightly"`
-	Drives  []Drive `yaml:"drives"`
+	Server   Server   `yaml:"server"`
+	Storage  Storage  `yaml:"storage"`
+	Scanner  Scanner  `yaml:"scanner"`
+	Preview  Preview  `yaml:"preview"`
+	Nightly  Nightly  `yaml:"nightly"`
+	Spider91 Spider91 `yaml:"spider91"`
+	Drives   []Drive  `yaml:"drives"`
 }
 
 type Server struct {
@@ -198,11 +199,18 @@ type Nightly struct {
 	MaxDuration time.Duration `yaml:"max_duration"`
 }
 
+// Spider91 是 91 爬虫的独立调度配置。
+type Spider91 struct {
+	// CrawlInterval >0 时启用独立 91 爬虫间隔任务；只跑 91 抓取和迁移，
+	// 不触发普通网盘扫描。例：4h。
+	CrawlInterval time.Duration `yaml:"crawl_interval"`
+}
+
 // Drive 配置项中的敏感字段（Cookie / RefreshToken 等）最终由管理后台写入 DB
 // 这里保留 yaml 中的静态定义，用于启动时预置盘。生产建议只在 DB 里维护。
 type Drive struct {
 	ID     string            `yaml:"id"`
-	Kind   string            `yaml:"kind"` // quark / p115 / pikpak / wopan / onedrive
+	Kind   string            `yaml:"kind"` // quark / p115 / pikpak / wopan / onedrive / googledrive
 	Name   string            `yaml:"name"`
 	RootID string            `yaml:"root_id"`
 	Params map[string]string `yaml:"params,omitempty"`
@@ -274,5 +282,8 @@ func (c *Config) applyDefaults() {
 		c.Nightly.MaxDuration = 6 * time.Hour
 	} else if c.Nightly.CronHour < 0 || c.Nightly.CronHour > 23 {
 		c.Nightly.CronHour = 1
+	}
+	if c.Spider91.CrawlInterval < 0 {
+		c.Spider91.CrawlInterval = 0
 	}
 }

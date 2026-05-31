@@ -40,9 +40,9 @@ export function RecommendedRail({ videos }: Props) {
       <header className="vd-rail__head">
         <span className="vd-rail__head-bar" aria-hidden="true" />
         <div className="vd-rail__head-text">
-          <h2 className="vd-rail__head-title">推荐视频</h2>
+          <h2 className="vd-rail__head-title">类似视频</h2>
           <span className="vd-rail__head-sub">
-            根据当前视频 · {videos.length} 条
+            标签和分类相似 · {videos.length} 条
           </span>
         </div>
       </header>

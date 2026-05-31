@@ -1,9 +1,12 @@
 import { useEffect, useRef, useState } from "react";
+import Hls from "hls.js";
 
 type Props = {
   src: string;
+  hlsSrc?: string;
   poster: string;
   title: string;
+  status?: string;
   /**
    * 用户首次按下播放时触发。同一个 VideoPlayer 实例只会触发一次；
    * 后续暂停-继续不会重复触发。换 src 时会重置（详情页切换视频用）。
@@ -18,7 +21,14 @@ const FAST_RATE = 2;
 /** 默认倍速。 */
 const NORMAL_RATE = 1;
 
-export function VideoPlayer({ src, poster, title, onFirstPlay }: Props) {
+export function VideoPlayer({
+  src,
+  hlsSrc,
+  poster,
+  title,
+  status,
+  onFirstPlay,
+}: Props) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const playedRef = useRef(false);
   // 长按计时器：按下后启动，到时未松开则进入 2 倍速
@@ -26,6 +36,61 @@ export function VideoPlayer({ src, poster, title, onFirstPlay }: Props) {
   // 当前是否处在"长按 2 倍速"状态
   const [fastActive, setFastActive] = useState(false);
   const fastActiveRef = useRef(false);
+
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video) return;
+    const preferredSrc = hlsSrc || src;
+    let hls: Hls | null = null;
+
+    if (!preferredSrc) {
+      video.removeAttribute("src");
+      video.load();
+      return;
+    }
+
+    let didFallback = false;
+    const fallbackToSource = () => {
+      if (didFallback || !src) return;
+      didFallback = true;
+      if (hls) {
+        hls.destroy();
+        hls = null;
+      }
+      video.src = src;
+      video.load();
+    };
+
+    if (hlsSrc && Hls.isSupported()) {
+      hls = new Hls({
+        enableWorker: true,
+        lowLatencyMode: false,
+        maxBufferLength: 60,
+        backBufferLength: 30,
+      });
+      hls.loadSource(hlsSrc);
+      hls.attachMedia(video);
+      hls.on(Hls.Events.ERROR, (_event, data) => {
+        if (data.fatal) {
+          fallbackToSource();
+        }
+      });
+    } else {
+      video.src = preferredSrc;
+      if (hlsSrc) {
+        video.addEventListener("error", fallbackToSource);
+      }
+    }
+
+    return () => {
+      video.removeEventListener("error", fallbackToSource);
+      if (hls) {
+        hls.destroy();
+      }
+      video.removeAttribute("src");
+      video.load();
+    };
+  }, [src, hlsSrc]);
 
   // 长按 2 倍速：直接在 video DOM 元素上监听事件。
   // 这样在 iOS / Android 进入原生全屏播放器后，事件依然能触达，
@@ -140,7 +205,7 @@ export function VideoPlayer({ src, poster, title, onFirstPlay }: Props) {
     if (videoRef.current) {
       videoRef.current.playbackRate = NORMAL_RATE;
     }
-  }, [src]);
+  }, [src, hlsSrc]);
 
   function handlePlay() {
     if (!playedRef.current) {
@@ -153,7 +218,6 @@ export function VideoPlayer({ src, poster, title, onFirstPlay }: Props) {
     <div className="video-player">
       <video
         ref={videoRef}
-        src={src}
         poster={poster}
         controls
         controlsList="nodownload"
@@ -164,6 +228,11 @@ export function VideoPlayer({ src, poster, title, onFirstPlay }: Props) {
         onPlay={handlePlay}
         onContextMenu={(e) => e.preventDefault()}
       />
+      {status && (
+        <div className="video-player__status" aria-live="polite">
+          {status}
+        </div>
+      )}
       {fastActive && (
         <div className="video-player__rate-hint" aria-hidden="true">
           2x

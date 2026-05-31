@@ -351,6 +351,12 @@
   color: var(--drive-onedrive);
 }
 
+.vd-meta__chip[data-tone="googledrive"] {
+  background: rgba(52, 168, 83, 0.14);
+  border-color: rgba(52, 168, 83, 0.3);
+  color: var(--drive-googledrive);
+}
+
 /* ---------- Actions toolbar ---------- */
 .vd-actions {
   display: flex;

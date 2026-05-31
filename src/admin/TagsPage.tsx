@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { Film, Plus, RefreshCw, Search, Tags } from "lucide-react";
+import { Film, Plus, RefreshCw, Search, Tags, Trash2 } from "lucide-react";
 import * as api from "./api";
 import { useToast } from "./ToastContext";
 
@@ -9,6 +9,7 @@ export function TagsPage() {
   const [aliases, setAliases] = useState("");
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
+  const [deletingId, setDeletingId] = useState<number | null>(null);
   const [searchQuery, setSearchQuery] = useState("");
   const [filterSource, setFilterSource] = useState<string>("all");
   const { show } = useToast();
@@ -42,6 +43,22 @@ export function TagsPage() {
       show(e instanceof Error ? e.message : "添加标签失败", "error");
     } finally {
       setSaving(false);
+    }
+  }
+
+  async function handleDelete(tag: api.AdminTag) {
+    if (tag.source === "system" || deletingId !== null) return;
+    const confirmed = window.confirm(`删除标签「${tag.label}」？已关联视频会同步移除这个标签。`);
+    if (!confirmed) return;
+    setDeletingId(tag.id);
+    try {
+      const r = await api.deleteTag(tag.id);
+      show(`已删除标签，影响 ${r.removedVideos} 个视频`, "success");
+      await refresh();
+    } catch (e) {
+      show(e instanceof Error ? e.message : "删除标签失败", "error");
+    } finally {
+      setDeletingId(null);
     }
   }
 
@@ -227,9 +244,23 @@ export function TagsPage() {
 
                   <div className="admin-tag-card__footer">
                     <span>ID: {tag.id}</span>
-                    <span className="admin-tag-card__count">
-                      <Film size={11} />
-                      <strong>{tag.count} 视频</strong>
+                    <span className="admin-tag-card__footer-actions">
+                      <span className="admin-tag-card__count">
+                        <Film size={11} />
+                        <strong>{tag.count} 视频</strong>
+                      </span>
+                      {tag.source !== "system" && (
+                        <button
+                          type="button"
+                          className="admin-tag-card__delete"
+                          onClick={() => handleDelete(tag)}
+                          disabled={deletingId !== null}
+                          title="删除标签"
+                        >
+                          <Trash2 size={10} />
+                          {deletingId === tag.id ? "删除中" : "删除"}
+                        </button>
+                      )}
                     </span>
                   </div>
                 </div>

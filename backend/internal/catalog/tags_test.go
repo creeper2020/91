@@ -3,6 +3,7 @@ package catalog
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"testing"
 	"time"
 )
@@ -68,6 +69,60 @@ func TestCreateTagAndClassifyAddsTagToMatchingExistingVideos(t *testing.T) {
 	if len(other.Tags) != 0 {
 		t.Fatalf("non-matching tags = %#v, want none", other.Tags)
 	}
+}
+
+func TestDeleteTagRemovesAssociationsAndKeepsSystemTags(t *testing.T) {
+	ctx := context.Background()
+	cat, err := Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cat.Close(); err != nil {
+			t.Fatalf("close catalog: %v", err)
+		}
+	})
+
+	now := time.Now()
+	if err := cat.UpsertVideo(ctx, &Video{
+		ID:          "video-1",
+		DriveID:     "drive",
+		FileID:      "file-1",
+		Title:       "清纯短发合集",
+		PublishedAt: now,
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}); err != nil {
+		t.Fatalf("seed video: %v", err)
+	}
+	if _, err := cat.CreateTagAndClassify(ctx, "清纯", nil, "user"); err != nil {
+		t.Fatalf("create user tag: %v", err)
+	}
+	if _, err := cat.CreateTagAndClassify(ctx, "系统标签", nil, "system"); err != nil {
+		t.Fatalf("create system tag: %v", err)
+	}
+
+	userTag := mustFindTag(t, cat, ctx, "清纯")
+	removed, err := cat.DeleteTag(ctx, userTag.ID)
+	if err != nil {
+		t.Fatalf("delete user tag: %v", err)
+	}
+	if removed != 1 {
+		t.Fatalf("removed = %d, want 1", removed)
+	}
+	got, err := cat.GetVideo(ctx, "video-1")
+	if err != nil {
+		t.Fatalf("get video: %v", err)
+	}
+	if len(got.Tags) != 0 {
+		t.Fatalf("tags after delete = %#v, want none", got.Tags)
+	}
+
+	systemTag := mustFindTag(t, cat, ctx, "系统标签")
+	if _, err := cat.DeleteTag(ctx, systemTag.ID); !errors.Is(err, ErrSystemTag) {
+		t.Fatalf("delete system tag err = %v, want ErrSystemTag", err)
+	}
+	mustFindTag(t, cat, ctx, "系统标签")
 }
 
 func TestOpenClassifiesSystemTagsForExistingVideos(t *testing.T) {
@@ -644,6 +699,21 @@ func sameStrings(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+func mustFindTag(t *testing.T, cat *Catalog, ctx context.Context, label string) Tag {
+	t.Helper()
+	tags, err := cat.ListTags(ctx)
+	if err != nil {
+		t.Fatalf("list tags: %v", err)
+	}
+	for _, tag := range tags {
+		if tag.Label == label {
+			return tag
+		}
+	}
+	t.Fatalf("tag %q not found", label)
+	return Tag{}
 }
 
 // 删除 collection 标签的最后一个引用视频后，标签应当自动从 tags 表里消失。

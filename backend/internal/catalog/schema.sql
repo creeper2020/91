@@ -21,6 +21,10 @@ CREATE TABLE IF NOT EXISTS videos (
     preview_file_id  TEXT,                      -- deprecated: 旧版回写网盘后的 teaser file id
     preview_local    TEXT,                      -- 本地 teaser 路径（兜底）
     preview_status   TEXT DEFAULT 'pending',    -- pending / ready / failed
+    hls_dir          TEXT DEFAULT '',           -- 本地 HLS 转封装目录
+    hls_status       TEXT DEFAULT 'pending',    -- pending / generating / ready / failed
+    hls_error        TEXT DEFAULT '',
+    hls_updated_at   INTEGER DEFAULT 0,
     views            INTEGER DEFAULT 0,
     favorites        INTEGER DEFAULT 0,
     comments         INTEGER DEFAULT 0,
@@ -64,7 +68,7 @@ CREATE INDEX IF NOT EXISTS idx_video_tags_video ON video_tags(video_id);
 -- 网盘账户
 CREATE TABLE IF NOT EXISTS drives (
     id            TEXT PRIMARY KEY,
-    kind          TEXT NOT NULL,                -- quark / p115 / pikpak / wopan / onedrive / spider91
+    kind          TEXT NOT NULL,                -- quark / p115 / pikpak / wopan / onedrive / googledrive / spider91
     name          TEXT NOT NULL,
     root_id       TEXT NOT NULL DEFAULT '0',
     scan_root_id  TEXT,                          -- 扫描起点（默认 root_id）
@@ -74,10 +78,11 @@ CREATE TABLE IF NOT EXISTS drives (
     -- 是否给该盘生成 teaser/封面：1 开 / 0 关。
     -- 替代了早期的全局 preview.enabled 设置（保留旧 setting 行不再读）。
     teaser_enabled INTEGER NOT NULL DEFAULT 1,
-    -- 扫描时要跳过的目录 ID 集合（JSON array of string）。命中其中任意一个的目录及其
-    -- 全部子目录都不会被递归扫描，也不会进入 SeenFileIDs / VisitedDirIDs 统计。
-    -- 替代了早期硬编码"影视"目录的特例分支。
+    -- 旧版扫描跳过目录集合，保留用于兼容已保存配置。
     skip_dir_ids  TEXT NOT NULL DEFAULT '[]',
+    -- 扫描白名单目录 ID 集合（JSON array of string）。非空时只扫描这些目录及其子目录；
+    -- 空数组表示从 scan_root_id/root_id 开始完整扫描。
+    scan_dir_ids  TEXT NOT NULL DEFAULT '[]',
     -- 扫描入库的最小视频文件大小；0 表示不按大小过滤。
     -- 小于该值的文件不会入库，用来过滤下载目录里夹带的广告小视频。
     min_scan_file_size_bytes INTEGER NOT NULL DEFAULT 0,

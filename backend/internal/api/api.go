@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -88,6 +89,7 @@ type VideoDTO struct {
 type VideoDetailDTO struct {
 	VideoDTO
 	VideoSrc      string        `json:"videoSrc"`
+	HLSSrc        string        `json:"hlsSrc,omitempty"`
 	Poster        string        `json:"poster"`
 	Description   string        `json:"description"`
 	EmbedURL      string        `json:"embedUrl"`
@@ -138,6 +140,7 @@ func (s *Server) RegisterRoutes(r chi.Router, a *auth.Authenticator) {
 		r.Get("/p/spider91/{videoID}", s.handleSpider91Video)
 		r.Get("/p/preview/{videoID}", s.handlePreview)
 		r.Get("/p/thumb/{videoID}", s.handleThumb)
+		r.Get("/p/hls/{videoID}/{file}", s.handleHLS)
 	})
 }
 
@@ -155,39 +158,48 @@ func (s *Server) handleGetTheme(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleHome(w http.ResponseWriter, r *http.Request) {
-	// 首页优先展示封面已经生成好的视频，避免新盘扫盘时大量黑封面占满首页。
-	// 候选仍按发布时间覆盖最近 200 个，随后随机洗牌；封面不足时再用普通可见视频补齐。
-	const candidatePool = 200
-	readyItems, _, err := s.Catalog.ListVideos(r.Context(), catalog.ListParams{
-		Sort: "latest", Page: 1, PageSize: candidatePool, ThumbnailReadyOnly: true,
-	})
+	items, err := s.pickHomeRecommendations(r.Context(), homePageSize)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusOK, mapVideos(items))
+}
+
+func (s *Server) pickHomeRecommendations(ctx context.Context, total int) ([]*catalog.Video, error) {
+	if total <= 0 {
+		return nil, nil
+	}
+
+	// 首页候选优先来自已生成封面的视频，避免扫盘或预览任务排队时黑封面占满首屏。
+	// 主页保留随机展示语义，避免每次都固定命中同一批头部视频。
+	const candidatePool = 200
+	readyItems, _, err := s.Catalog.ListVideos(ctx, catalog.ListParams{
+		Sort: "latest", Page: 1, PageSize: candidatePool, ThumbnailReadyOnly: true,
+	})
+	if err != nil {
+		return nil, err
 	}
 	rand.Shuffle(len(readyItems), func(i, j int) {
 		readyItems[i], readyItems[j] = readyItems[j], readyItems[i]
 	})
 
-	items := appendUniqueVideos(nil, readyItems, homePageSize)
-	if len(items) > homePageSize {
-		items = items[:homePageSize]
+	items := appendUniqueVideos(nil, readyItems, total)
+	if len(items) >= total {
+		return items, nil
 	}
-	if len(items) < homePageSize {
-		fallback, _, err := s.Catalog.ListVideos(r.Context(), catalog.ListParams{
-			Sort: "latest", Page: 1, PageSize: candidatePool,
-		})
-		if err != nil {
-			writeErr(w, http.StatusInternalServerError, err)
-			return
-		}
-		rand.Shuffle(len(fallback), func(i, j int) {
-			fallback[i], fallback[j] = fallback[j], fallback[i]
-		})
-		items = appendUniqueVideos(items, fallback, homePageSize)
+
+	fallback, _, err := s.Catalog.ListVideos(ctx, catalog.ListParams{
+		Sort: "latest", Page: 1, PageSize: candidatePool, PreferReadyThumbnails: true,
+	})
+	if err != nil {
+		return nil, err
 	}
-	w.Header().Set("Cache-Control", "no-store")
-	writeJSON(w, http.StatusOK, mapVideos(items))
+	rand.Shuffle(len(fallback), func(i, j int) {
+		fallback[i], fallback[j] = fallback[j], fallback[i]
+	})
+	return appendUniqueVideos(items, fallback, total), nil
 }
 
 func appendUniqueVideos(dst []*catalog.Video, candidates []*catalog.Video, limit int) []*catalog.Video {
@@ -268,6 +280,7 @@ func (s *Server) handleVideoDetail(w http.ResponseWriter, r *http.Request) {
 	detail := VideoDetailDTO{
 		VideoDTO:    dto,
 		VideoSrc:    s.videoSource(v),
+		HLSSrc:      s.hlsSource(v),
 		Poster:      thumbnailURL(v),
 		Description: v.Description,
 		EmbedURL:    fmt.Sprintf(`<iframe src="/embed/%s" width="640" height="360" frameborder="0" allowfullscreen></iframe>`, v.ID),
@@ -286,57 +299,37 @@ func (s *Server) handleVideoDetail(w http.ResponseWriter, r *http.Request) {
 }
 
 // pickRelatedVideos 选 total 个推荐视频。
-// 一半来自同标签命中，剩下用全库随机补齐；两段都优先取已有封面的视频，
-// 不够时再回退到未生成封面的候选。结果不会重复，也不会包含当前视频。
+// 推荐先按已生成封面的候选排序，不足时再回退到普通可见视频。排序优先考虑
+// 标签重合，其次是分类、作者和来源目录；互动热度只在相似度接近时做轻微排序。
 func (s *Server) pickRelatedVideos(ctx context.Context, current *catalog.Video, total int) []*catalog.Video {
 	if total <= 0 || current == nil {
 		return nil
 	}
-	tagQuota := total / 2
-	if tagQuota <= 0 && len(current.Tags) > 0 {
-		tagQuota = 1
-	}
 
 	picked := make([]*catalog.Video, 0, total)
 	seen := map[string]struct{}{current.ID: {}}
+	now := time.Now()
 
-	// 1) 同标签候选：先取已有封面的候选，数量不够再从全部候选里补。
-	if tagQuota > 0 && len(current.Tags) > 0 {
-		picked = appendRandomRelated(
-			picked,
-			s.relatedTagPool(ctx, current.Tags, seen, true),
-			tagQuota,
-			seen,
-		)
-		if len(picked) < tagQuota {
-			picked = appendRandomRelated(
-				picked,
-				s.relatedTagPool(ctx, current.Tags, seen, false),
-				tagQuota,
-				seen,
-			)
-		}
+	readyPool := s.relatedCandidatePool(ctx, current, seen, true)
+	picked = appendRankedRelated(picked, rankVideos(readyPool, total, func(v *catalog.Video) int {
+		return relatedRecommendationScore(current, v, now)
+	}), total, seen)
+	if len(picked) >= total {
+		return picked
 	}
 
-	// 2) 随机补齐：同样优先已有封面的全库候选，不够再回退。
-	if len(picked) < total {
-		picked = appendRandomRelated(
-			picked,
-			s.relatedListPool(ctx, seen, true, 200),
-			total,
-			seen,
-		)
-	}
-	if len(picked) < total {
-		picked = appendRandomRelated(
-			picked,
-			s.relatedListPool(ctx, seen, false, 200),
-			total,
-			seen,
-		)
-	}
+	fallbackPool := s.relatedCandidatePool(ctx, current, seen, false)
+	return appendRankedRelated(picked, rankVideos(fallbackPool, total, func(v *catalog.Video) int {
+		return relatedRecommendationScore(current, v, now)
+	}), total, seen)
+}
 
-	return picked
+func (s *Server) relatedCandidatePool(ctx context.Context, current *catalog.Video, seen map[string]struct{}, readyOnly bool) []*catalog.Video {
+	pool := make([]*catalog.Video, 0, 240)
+	pool = append(pool, s.relatedTagPool(ctx, current.Tags, seen, readyOnly)...)
+	pool = append(pool, s.relatedCategoryPool(ctx, current.Category, seen, readyOnly)...)
+	pool = append(pool, s.relatedListPool(ctx, seen, readyOnly, 200)...)
+	return dedupeCandidatePool(pool, seen)
 }
 
 func (s *Server) relatedTagPool(ctx context.Context, tags []string, seen map[string]struct{}, readyOnly bool) []*catalog.Video {
@@ -374,6 +367,35 @@ func (s *Server) relatedTagPool(ctx context.Context, tags []string, seen map[str
 	return pool
 }
 
+func (s *Server) relatedCategoryPool(ctx context.Context, category string, seen map[string]struct{}, readyOnly bool) []*catalog.Video {
+	category = strings.TrimSpace(category)
+	if category == "" {
+		return nil
+	}
+	items, _, err := s.Catalog.ListVideos(ctx, catalog.ListParams{
+		Category:              category,
+		Sort:                  "latest",
+		Page:                  1,
+		PageSize:              60,
+		ThumbnailReadyOnly:    readyOnly,
+		PreferReadyThumbnails: !readyOnly,
+	})
+	if err != nil {
+		return nil
+	}
+	pool := make([]*catalog.Video, 0, len(items))
+	for _, v := range items {
+		if v == nil {
+			continue
+		}
+		if _, ok := seen[v.ID]; ok {
+			continue
+		}
+		pool = append(pool, v)
+	}
+	return pool
+}
+
 func (s *Server) relatedListPool(ctx context.Context, seen map[string]struct{}, readyOnly bool, pageSize int) []*catalog.Video {
 	items, _, err := s.Catalog.ListVideos(ctx, catalog.ListParams{
 		Sort:                  "latest",
@@ -398,14 +420,30 @@ func (s *Server) relatedListPool(ctx context.Context, seen map[string]struct{}, 
 	return pool
 }
 
-func appendRandomRelated(picked []*catalog.Video, pool []*catalog.Video, targetLen int, seen map[string]struct{}) []*catalog.Video {
-	if len(picked) >= targetLen || len(pool) == 0 {
+func dedupeCandidatePool(candidates []*catalog.Video, seen map[string]struct{}) []*catalog.Video {
+	pool := make([]*catalog.Video, 0, len(candidates))
+	poolSeen := make(map[string]struct{}, len(candidates))
+	for _, v := range candidates {
+		if v == nil {
+			continue
+		}
+		if _, ok := seen[v.ID]; ok {
+			continue
+		}
+		if _, ok := poolSeen[v.ID]; ok {
+			continue
+		}
+		poolSeen[v.ID] = struct{}{}
+		pool = append(pool, v)
+	}
+	return pool
+}
+
+func appendRankedRelated(picked []*catalog.Video, ranked []*catalog.Video, targetLen int, seen map[string]struct{}) []*catalog.Video {
+	if len(picked) >= targetLen || len(ranked) == 0 {
 		return picked
 	}
-	rand.Shuffle(len(pool), func(i, j int) {
-		pool[i], pool[j] = pool[j], pool[i]
-	})
-	for _, v := range pool {
+	for _, v := range ranked {
 		if len(picked) >= targetLen {
 			break
 		}
@@ -419,6 +457,134 @@ func appendRandomRelated(picked []*catalog.Video, pool []*catalog.Video, targetL
 		picked = append(picked, v)
 	}
 	return picked
+}
+
+func rankVideos(candidates []*catalog.Video, limit int, score func(*catalog.Video) int) []*catalog.Video {
+	if limit <= 0 || len(candidates) == 0 {
+		return nil
+	}
+	ranked := dedupeCandidatePool(candidates, nil)
+	rand.Shuffle(len(ranked), func(i, j int) {
+		ranked[i], ranked[j] = ranked[j], ranked[i]
+	})
+	sort.SliceStable(ranked, func(i, j int) bool {
+		left := ranked[i]
+		right := ranked[j]
+		leftScore := score(left)
+		rightScore := score(right)
+		if leftScore != rightScore {
+			return leftScore > rightScore
+		}
+		if !left.PublishedAt.Equal(right.PublishedAt) {
+			return left.PublishedAt.After(right.PublishedAt)
+		}
+		return left.ID < right.ID
+	})
+	if len(ranked) > limit {
+		ranked = ranked[:limit]
+	}
+	return ranked
+}
+
+func relatedRecommendationScore(current *catalog.Video, v *catalog.Video, now time.Time) int {
+	if current == nil || v == nil {
+		return 0
+	}
+	score := 0
+	score += sharedTagCount(current.Tags, v.Tags) * 100000
+	if sameNonEmpty(current.Category, v.Category) {
+		score += 40000
+	}
+	if sameNonEmpty(current.Author, v.Author) {
+		score += 25000
+	}
+	if current.ParentID != "" && current.ParentID == v.ParentID {
+		score += 15000
+	}
+	if current.DriveID != "" && current.DriveID == v.DriveID {
+		score += 3000
+	}
+	if isPreviewReady(v) {
+		score += 1200
+	}
+	score += relatedEngagementScore(v)
+	score += relatedFreshnessScore(v.PublishedAt, now)
+	return score
+}
+
+func relatedEngagementScore(v *catalog.Video) int {
+	if v == nil {
+		return 0
+	}
+	score := 0
+	score += minInt(v.Likes*10, 600)
+	score += minInt(v.Favorites*8, 400)
+	score += minInt(v.Comments*5, 200)
+	score += minInt(v.Views/200, 300)
+	return score
+}
+
+func relatedFreshnessScore(publishedAt time.Time, now time.Time) int {
+	if publishedAt.IsZero() {
+		return 0
+	}
+	days := int(now.Sub(publishedAt).Hours() / 24)
+	if days < 0 {
+		days = 0
+	}
+	switch {
+	case days <= 1:
+		return 1200
+	case days <= 7:
+		return 900
+	case days <= 30:
+		return 600
+	case days <= 90:
+		return 300
+	default:
+		return 0
+	}
+}
+
+func sharedTagCount(a, b []string) int {
+	if len(a) == 0 || len(b) == 0 {
+		return 0
+	}
+	seen := make(map[string]struct{}, len(a))
+	for _, tag := range a {
+		tag = strings.ToLower(strings.TrimSpace(tag))
+		if tag != "" {
+			seen[tag] = struct{}{}
+		}
+	}
+	count := 0
+	for _, tag := range b {
+		tag = strings.ToLower(strings.TrimSpace(tag))
+		if tag == "" {
+			continue
+		}
+		if _, ok := seen[tag]; ok {
+			count++
+		}
+	}
+	return count
+}
+
+func isPreviewReady(v *catalog.Video) bool {
+	return v != nil && strings.EqualFold(strings.TrimSpace(v.PreviewStatus), "ready")
+}
+
+func sameNonEmpty(a, b string) bool {
+	a = strings.TrimSpace(a)
+	b = strings.TrimSpace(b)
+	return a != "" && b != "" && strings.EqualFold(a, b)
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func (s *Server) handleTags(w http.ResponseWriter, r *http.Request) {
@@ -451,6 +617,7 @@ type shortsNextReq struct {
 type ShortsItemDTO struct {
 	VideoDTO
 	VideoSrc string `json:"videoSrc"`
+	HLSSrc   string `json:"hlsSrc,omitempty"`
 	Poster   string `json:"poster"`
 }
 
@@ -510,6 +677,7 @@ func (s *Server) handleShortsNext(w http.ResponseWriter, r *http.Request) {
 		out = append(out, ShortsItemDTO{
 			VideoDTO: dto,
 			VideoSrc: s.videoSource(v),
+			HLSSrc:   s.hlsSource(v),
 			Poster:   thumbnailURL(v),
 		})
 	}
@@ -817,6 +985,43 @@ func (s *Server) handleThumb(w http.ResponseWriter, r *http.Request) {
 	s.Proxy.ServeLocal(w, r, clean)
 }
 
+func (s *Server) handleHLS(w http.ResponseWriter, r *http.Request) {
+	videoID := chi.URLParam(r, "videoID")
+	name := chi.URLParam(r, "file")
+	if !validHLSFileName(name) {
+		http.Error(w, "invalid hls file", http.StatusForbidden)
+		return
+	}
+	v, err := s.Catalog.GetVideo(r.Context(), videoID)
+	if err != nil || v.Hidden || v.HLSStatus != "ready" || v.HLSDir == "" {
+		http.NotFound(w, r)
+		return
+	}
+	root := filepath.Clean(s.LocalDir)
+	dir := filepath.Clean(v.HLSDir)
+	if !pathWithin(root, dir) {
+		http.Error(w, "invalid hls directory", http.StatusForbidden)
+		return
+	}
+	path := filepath.Join(dir, name)
+	clean := filepath.Clean(path)
+	if !pathWithin(dir, clean) {
+		http.Error(w, "invalid hls path", http.StatusForbidden)
+		return
+	}
+	if _, err := os.Stat(clean); err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	setHLSContentType(w, name)
+	if strings.EqualFold(filepath.Ext(name), ".m3u8") {
+		w.Header().Set("Cache-Control", "private, max-age=60")
+	} else {
+		w.Header().Set("Cache-Control", "private, max-age=86400")
+	}
+	http.ServeFile(w, r, clean)
+}
+
 // ---------- helpers ----------
 
 func mapVideo(v *catalog.Video) VideoDTO {
@@ -859,6 +1064,20 @@ func previewURL(v *catalog.Video) string {
 	return base + "?v=" + strconv.FormatInt(v.UpdatedAt.UnixMilli(), 10)
 }
 
+func (s *Server) hlsSource(v *catalog.Video) string {
+	if v == nil || v.HLSStatus != "ready" || v.HLSDir == "" {
+		return ""
+	}
+	base := "/p/hls/" + v.ID + "/index.m3u8"
+	if !v.HLSUpdatedAt.IsZero() {
+		return base + "?v=" + strconv.FormatInt(v.HLSUpdatedAt.UnixMilli(), 10)
+	}
+	if !v.UpdatedAt.IsZero() {
+		return base + "?v=" + strconv.FormatInt(v.UpdatedAt.UnixMilli(), 10)
+	}
+	return base
+}
+
 func thumbnailURL(v *catalog.Video) string {
 	if v.ThumbnailURL != "" {
 		return v.ThumbnailURL
@@ -899,11 +1118,57 @@ func driveKindLabel(kind string) string {
 		return "联通沃盘"
 	case "onedrive":
 		return "OneDrive"
+	case "googledrive":
+		return "Google Drive"
 	case spider91.Kind:
 		return "91 爬虫"
 	default:
 		return kind
 	}
+}
+
+func validHLSFileName(name string) bool {
+	if strings.TrimSpace(name) == "" || filepath.Base(name) != name {
+		return false
+	}
+	switch strings.ToLower(filepath.Ext(name)) {
+	case ".m3u8", ".m4s", ".mp4", ".ts":
+		return true
+	default:
+		return false
+	}
+}
+
+func setHLSContentType(w http.ResponseWriter, name string) {
+	switch strings.ToLower(filepath.Ext(name)) {
+	case ".m3u8":
+		w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+	case ".m4s":
+		w.Header().Set("Content-Type", "video/iso.segment")
+	case ".mp4":
+		w.Header().Set("Content-Type", "video/mp4")
+	case ".ts":
+		w.Header().Set("Content-Type", "video/mp2t")
+	}
+}
+
+func pathWithin(root, path string) bool {
+	if root == "" || path == "" {
+		return false
+	}
+	rootAbs, err := filepath.Abs(root)
+	if err != nil {
+		return false
+	}
+	pathAbs, err := filepath.Abs(path)
+	if err != nil {
+		return false
+	}
+	rel, err := filepath.Rel(rootAbs, pathAbs)
+	if err != nil {
+		return false
+	}
+	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator)))
 }
 
 func (s *Server) localUploadFilePath(fileID string) (string, error) {

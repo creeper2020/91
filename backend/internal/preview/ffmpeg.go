@@ -796,6 +796,9 @@ func shouldProxyFFmpegLink(link *drives.StreamLink) bool {
 	if !strings.HasPrefix(raw, "http://") && !strings.HasPrefix(raw, "https://") {
 		return false
 	}
+	if strings.TrimSpace(link.Headers.Get("Authorization")) != "" {
+		return true
+	}
 	if strings.Contains(raw, "115cdn") {
 		return true
 	}
@@ -1034,10 +1037,8 @@ type ThumbWorker struct {
 }
 
 const (
-	defaultTransientMediaCooldown            = 5 * time.Minute
-	defaultGenerationRateLimitCooldown       = 5 * time.Minute
-	maxPreviewTeaserSizeBytes          int64 = 5 * 1024 * 1024 * 1024
-	previewStatusSkipped                     = "skipped"
+	defaultTransientMediaCooldown      = 5 * time.Minute
+	defaultGenerationRateLimitCooldown = 5 * time.Minute
 )
 
 type rateLimitState struct {
@@ -1489,29 +1490,53 @@ func (w *ThumbWorker) process(ctx context.Context, v *catalog.Video) {
 	if w.skipIfRateLimited(v) {
 		return
 	}
-	if current, err := w.Catalog.GetVideo(ctx, v.ID); err == nil {
-		if current.ThumbnailURL != "" {
-			_ = w.Catalog.UpdateVideoMeta(ctx, v.ID, catalog.VideoMetaPatch{ThumbnailStatus: "ready"})
-			return
+
+	current := v
+	if loaded, err := w.Catalog.GetVideo(ctx, v.ID); err == nil {
+		if loaded.PreviewLocal == "" {
+			loaded.PreviewLocal = v.PreviewLocal
 		}
-	}
-	_ = w.Catalog.UpdateVideoMeta(ctx, v.ID, catalog.VideoMetaPatch{ThumbnailStatus: "pending"})
-	link, err := w.Drive.StreamURL(ctx, v.FileID)
-	if err != nil {
-		if localLink, ok := localPreviewLink(v); ok {
-			link = localLink
-		} else {
-			if w.pauseForRecoverableError(err, "streamURL", v.Title) {
-				return
-			}
-			log.Printf("[thumb] streamURL %s: %v", v.Title, err)
-			_ = w.Catalog.UpdateVideoMeta(ctx, v.ID, catalog.VideoMetaPatch{ThumbnailStatus: "failed"})
+		current = loaded
+		v = loaded
+		if loaded.ThumbnailURL != "" && loaded.DurationSeconds > 0 {
+			_ = w.Catalog.UpdateVideoMeta(ctx, loaded.ID, catalog.VideoMetaPatch{ThumbnailStatus: "ready"})
 			return
 		}
 	}
 
+	if current.ThumbnailURL != "" {
+		link, err := w.streamLink(ctx, current)
+		if err != nil {
+			if w.pauseForRecoverableError(err, "streamURL", current.Title) {
+				return
+			}
+			log.Printf("[thumb] probe streamURL %s: %v", current.Title, err)
+		} else if w.probeDuration(ctx, current, link) {
+			return
+		}
+		_ = w.Catalog.UpdateVideoMeta(ctx, current.ID, catalog.VideoMetaPatch{ThumbnailStatus: "ready"})
+		return
+	}
+
+	_ = w.Catalog.UpdateVideoMeta(ctx, v.ID, catalog.VideoMetaPatch{ThumbnailStatus: "pending"})
+	link, err := w.streamLink(ctx, v)
+	if err != nil {
+		if w.pauseForRecoverableError(err, "streamURL", v.Title) {
+			return
+		}
+		log.Printf("[thumb] streamURL %s: %v", v.Title, err)
+		_ = w.Catalog.UpdateVideoMeta(ctx, v.ID, catalog.VideoMetaPatch{ThumbnailStatus: "failed"})
+		return
+	}
+	if w.probeDuration(ctx, v, link) {
+		return
+	}
+
 	if err := w.generateThumbnailFromLink(ctx, v, link); err != nil {
 		if localLink, ok := localPreviewLink(v); ok && link.URL != localLink.URL {
+			if w.probeDuration(ctx, v, localLink) {
+				return
+			}
 			if localErr := w.generateThumbnailFromLink(ctx, v, localLink); localErr == nil {
 				return
 			}
@@ -1523,6 +1548,38 @@ func (w *ThumbWorker) process(ctx context.Context, v *catalog.Video) {
 		_ = w.Catalog.UpdateVideoMeta(ctx, v.ID, catalog.VideoMetaPatch{ThumbnailStatus: "failed"})
 		return
 	}
+}
+
+func (w *ThumbWorker) streamLink(ctx context.Context, v *catalog.Video) (*drives.StreamLink, error) {
+	link, err := w.Drive.StreamURL(ctx, v.FileID)
+	if err == nil {
+		return link, nil
+	}
+	if localLink, ok := localPreviewLink(v); ok {
+		return localLink, nil
+	}
+	return nil, err
+}
+
+func (w *ThumbWorker) probeDuration(ctx context.Context, v *catalog.Video, link *drives.StreamLink) bool {
+	if v.DurationSeconds > 0 {
+		return false
+	}
+	duration, err := w.Gen.Probe(ctx, link)
+	if err != nil {
+		if w.pauseForRecoverableError(err, "probe", v.Title) {
+			return true
+		}
+		log.Printf("[thumb] probe %s: %v", v.Title, err)
+		return false
+	}
+	if duration <= 0 {
+		return false
+	}
+	_ = w.Catalog.UpdateVideoMeta(ctx, v.ID, catalog.VideoMetaPatch{
+		DurationSeconds: int(duration),
+	})
+	return false
 }
 
 func (w *ThumbWorker) generateThumbnailFromLink(ctx context.Context, v *catalog.Video, link *drives.StreamLink) error {
@@ -1550,15 +1607,6 @@ func localPreviewLink(v *catalog.Video) (*drives.StreamLink, bool) {
 }
 
 func (w *Worker) process(ctx context.Context, v *catalog.Video) {
-	if shouldSkipTeaser(v) {
-		removePreviousLocalTeaser(v.PreviewLocal, "")
-		if err := w.Catalog.UpdatePreview(ctx, v.ID, "", previewStatusSkipped); err != nil {
-			log.Printf("[preview] skip %s: update status: %v", v.Title, err)
-			return
-		}
-		log.Printf("[preview] skip %s: size=%d exceeds 5GiB teaser limit", v.Title, v.Size)
-		return
-	}
 	if w.skipIfRateLimited(v) {
 		return
 	}
@@ -1605,10 +1653,6 @@ func (w *Worker) process(ctx context.Context, v *catalog.Video) {
 	removePreviousLocalTeaser(v.PreviewLocal, local)
 	w.Catalog.UpdatePreview(ctx, v.ID, local, "ready")
 	log.Printf("[preview] ready %s (duration=%.1fs)", v.Title, duration)
-}
-
-func shouldSkipTeaser(v *catalog.Video) bool {
-	return v != nil && v.Size > maxPreviewTeaserSizeBytes
 }
 
 func (w *Worker) generateTeaser(ctx context.Context, v *catalog.Video, link *drives.StreamLink, duration float64) (string, error) {

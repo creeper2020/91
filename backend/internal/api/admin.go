@@ -39,6 +39,7 @@ type AdminServer struct {
 	OnDriveRemoved             func(driveID string)
 	OnScanRequested            func(driveID string)
 	OnRegenPreview             func(videoID string)
+	OnGenerateHLS              func(videoID string)
 	OnRegenAllPreviews         func()
 	OnRegenFailedPreviews      func(driveID string)
 	OnRegenFailedThumbnails    func(driveID string)
@@ -50,16 +51,18 @@ type AdminServer struct {
 	// Theme 读写（"dark" | "pink"）
 	GetTheme func() string
 	SetTheme func(theme string) error
-	// Spider91 → 115/PikPak 上传目标 drive ID 读写
+	// Spider91 上传目标 drive ID 读写
 	GetSpider91UploadDriveID func() string
 	SetSpider91UploadDriveID func(driveID string) error
 	// OnRunNightlyJob 触发一次完整的凌晨流水线（Phase1 扫盘 + Phase2 91 爬虫 +
 	// Phase3 迁移）。立即返回 —— 实际任务在后台跑，admin 在日志或下次状态查询里
 	// 看进度。若流水线正在跑，Runner 最多保留一个待触发请求，当前轮结束后再跑一轮。
 	OnRunNightlyJob func()
+	// OnRunSpider91Migration 只触发 spider91 本地视频迁移，不重新爬取。
+	OnRunSpider91Migration func() error
 	// ListDriveDirChildren 列出某个 drive 在 parentID 目录下的直接子目录。
 	// parentID 为空时使用 drive 的 RootID。返回 (子目录列表, error)。
-	// 用于"设置跳过目录"弹窗按需展开浏览网盘目录树；只返回目录条目，文件忽略。
+	// 用于管理后台按需展开浏览网盘目录树；只返回目录条目，文件忽略。
 	// 调用方应当处理 error 并以 5xx 返回前端。
 	ListDriveDirChildren func(ctx context.Context, driveID, parentID string) ([]DriveDirEntry, error)
 	// GetDriveCleanupPreview dry-run 扫描某个 drive，返回如果现在执行扫描清理会
@@ -105,8 +108,10 @@ type GenerationStatus struct {
 }
 
 type DriveGenerationStatuses struct {
-	Thumbnail GenerationStatus `json:"thumbnail"`
-	Preview   GenerationStatus `json:"preview"`
+	Thumbnail   GenerationStatus `json:"thumbnail"`
+	Preview     GenerationStatus `json:"preview"`
+	HLS         GenerationStatus `json:"hls"`
+	Fingerprint GenerationStatus `json:"fingerprint"`
 }
 
 func (a *AdminServer) Register(r chi.Router) {
@@ -130,6 +135,7 @@ func (a *AdminServer) Register(r chi.Router) {
 			r.Post("/drives/{id}/rescan", a.handleRescan)
 			r.Post("/drives/{id}/teaser-enabled", a.handleSetDriveTeaserEnabled)
 			r.Post("/drives/{id}/skip-dirs", a.handleSetDriveSkipDirs)
+			r.Post("/drives/{id}/scan-dirs", a.handleSetDriveScanDirs)
 			r.Post("/drives/{id}/scan-filter", a.handleSetDriveScanFilter)
 			r.Get("/drives/{id}/cleanup-preview", a.handleDriveCleanupPreview)
 			r.Get("/drives/{id}/dirtree", a.handleListDriveDirTree)
@@ -138,13 +144,16 @@ func (a *AdminServer) Register(r chi.Router) {
 
 			// 视频
 			r.Get("/videos", a.handleAdminListVideos)
+			r.Post("/videos/bulk-tags", a.handleBulkVideoTags)
 			r.Put("/videos/{id}", a.handleUpdateVideo)
 			r.Post("/videos/regen-preview", a.handleRegenAllPreviews)
 			r.Post("/videos/{id}/regen-preview", a.handleRegenPreview)
+			r.Post("/videos/{id}/hls", a.handleGenerateHLS)
 
 			// 标签
 			r.Get("/tags", a.handleListTags)
 			r.Post("/tags", a.handleCreateTag)
+			r.Delete("/tags/{id}", a.handleDeleteTag)
 
 			// 运行时设置
 			r.Get("/settings", a.handleGetSettings)
@@ -153,6 +162,7 @@ func (a *AdminServer) Register(r chi.Router) {
 			// 运维任务
 			r.Get("/update/check", a.handleCheckUpdate)
 			r.Post("/jobs/nightly/run", a.handleRunNightlyJob)
+			r.Post("/jobs/spider91/migrate", a.handleRunSpider91Migration)
 		})
 	})
 }
@@ -375,6 +385,11 @@ func (a *AdminServer) handleListDrives(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
 	}
+	fingerprintCounts, err := a.Catalog.CountFingerprintsByDrive(r.Context())
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
 	generationStatuses := map[string]DriveGenerationStatuses{}
 	if a.GetDriveGenerationStatuses != nil {
 		generationStatuses = a.GetDriveGenerationStatuses()
@@ -391,36 +406,50 @@ func (a *AdminServer) handleListDrives(w http.ResponseWriter, r *http.Request) {
 		HasCredential bool   `json:"hasCredential"`
 		// TeaserEnabled 控制是否给本盘生成 teaser/封面。前端用它在网盘列表/编辑表单展示开关状态。
 		TeaserEnabled bool `json:"teaserEnabled"`
-		// SkipDirIDs 是用户在 admin 配置的"扫描跳过目录"集合（drive 侧目录 fileID）。
-		// 前端用它在"设置跳过目录"弹窗里回显已选项；JSON 字段名 camelCase 与
-		// catalog.Drive 保持一致。
+		// SkipDirIDs 是旧版"扫描跳过目录"集合，保留给旧客户端兼容。
 		SkipDirIDs []string `json:"skipDirIds"`
+		// ScanDirIDs 是用户在 admin 配置的"需要扫描目录"集合（drive 侧目录 fileID）。
+		// 非空时 scanner 只扫描这些目录及其子目录。
+		ScanDirIDs []string `json:"scanDirIds"`
 		// MinScanFileSizeBytes 是扫描入库的最小文件大小阈值；0 表示关闭大小过滤。
 		MinScanFileSizeBytes int64 `json:"minScanFileSizeBytes"`
 		// SkipFileNameKeywords 是扫描时按文件名跳过视频的关键词列表。
 		SkipFileNameKeywords []string `json:"skipFileNameKeywords"`
 		// LastCrawlAt 是 spider91 上次成功爬取的 unix 秒（来自 credentials.last_crawl_at）。
 		// 其它 kind 留 0；前端用它显示"上次抓取: N 小时前"。
-		LastCrawlAt               int64            `json:"lastCrawlAt,omitempty"`
-		ThumbnailGenerationStatus GenerationStatus `json:"thumbnailGenerationStatus"`
-		PreviewGenerationStatus   GenerationStatus `json:"previewGenerationStatus"`
-		ThumbnailReadyCount       int              `json:"thumbnailReadyCount"`
-		ThumbnailPendingCount     int              `json:"thumbnailPendingCount"`
-		ThumbnailFailedCount      int              `json:"thumbnailFailedCount"`
-		TeaserReadyCount          int              `json:"teaserReadyCount"`
-		TeaserPendingCount        int              `json:"teaserPendingCount"`
-		TeaserFailedCount         int              `json:"teaserFailedCount"`
+		LastCrawlAt                 int64            `json:"lastCrawlAt,omitempty"`
+		ThumbnailGenerationStatus   GenerationStatus `json:"thumbnailGenerationStatus"`
+		PreviewGenerationStatus     GenerationStatus `json:"previewGenerationStatus"`
+		HLSGenerationStatus         GenerationStatus `json:"hlsGenerationStatus"`
+		FingerprintGenerationStatus GenerationStatus `json:"fingerprintGenerationStatus"`
+		ThumbnailReadyCount         int              `json:"thumbnailReadyCount"`
+		ThumbnailPendingCount       int              `json:"thumbnailPendingCount"`
+		ThumbnailFailedCount        int              `json:"thumbnailFailedCount"`
+		TeaserReadyCount            int              `json:"teaserReadyCount"`
+		TeaserPendingCount          int              `json:"teaserPendingCount"`
+		TeaserFailedCount           int              `json:"teaserFailedCount"`
+		TeaserSkippedCount          int              `json:"teaserSkippedCount"`
+		FingerprintReadyCount       int              `json:"fingerprintReadyCount"`
+		FingerprintPendingCount     int              `json:"fingerprintPendingCount"`
+		FingerprintFailedCount      int              `json:"fingerprintFailedCount"`
 	}
 	list := make([]out, 0, len(drives))
 	for _, d := range drives {
 		counts := teaserCounts[d.ID]
 		thumbCounts := thumbnailCounts[d.ID]
+		fingerprintCount := fingerprintCounts[d.ID]
 		generation := generationStatuses[d.ID]
 		if generation.Thumbnail.State == "" {
 			generation.Thumbnail.State = "idle"
 		}
 		if generation.Preview.State == "" {
 			generation.Preview.State = "idle"
+		}
+		if generation.HLS.State == "" {
+			generation.HLS.State = "idle"
+		}
+		if generation.Fingerprint.State == "" {
+			generation.Fingerprint.State = "idle"
 		}
 		// spider91 没有用户凭证概念；只要存在 drive 行就视为"已配置"。
 		// last_crawl_at 是后端自动写入的运行状态字段，不计入 hasCredential 判定。
@@ -447,20 +476,27 @@ func (a *AdminServer) handleListDrives(w http.ResponseWriter, r *http.Request) {
 			ID: d.ID, Kind: d.Kind, Name: d.Name,
 			RootID: d.RootID, ScanRootID: d.ScanRootID,
 			Status: d.Status, LastError: d.LastError,
-			HasCredential:             hasCred,
-			TeaserEnabled:             d.TeaserEnabled,
-			SkipDirIDs:                append([]string{}, d.SkipDirIDs...),
-			MinScanFileSizeBytes:      d.MinScanFileSizeBytes,
-			SkipFileNameKeywords:      append([]string{}, d.SkipFileNameKeywords...),
-			LastCrawlAt:               lastCrawlAt,
-			ThumbnailGenerationStatus: generation.Thumbnail,
-			PreviewGenerationStatus:   generation.Preview,
-			ThumbnailReadyCount:       thumbCounts.Ready,
-			ThumbnailPendingCount:     thumbCounts.Pending,
-			ThumbnailFailedCount:      thumbCounts.Failed,
-			TeaserReadyCount:          counts.Ready,
-			TeaserPendingCount:        counts.Pending,
-			TeaserFailedCount:         counts.Failed,
+			HasCredential:               hasCred,
+			TeaserEnabled:               d.TeaserEnabled,
+			SkipDirIDs:                  append([]string{}, d.SkipDirIDs...),
+			ScanDirIDs:                  append([]string{}, d.ScanDirIDs...),
+			MinScanFileSizeBytes:        d.MinScanFileSizeBytes,
+			SkipFileNameKeywords:        append([]string{}, d.SkipFileNameKeywords...),
+			LastCrawlAt:                 lastCrawlAt,
+			ThumbnailGenerationStatus:   generation.Thumbnail,
+			PreviewGenerationStatus:     generation.Preview,
+			HLSGenerationStatus:         generation.HLS,
+			FingerprintGenerationStatus: generation.Fingerprint,
+			ThumbnailReadyCount:         thumbCounts.Ready,
+			ThumbnailPendingCount:       thumbCounts.Pending,
+			ThumbnailFailedCount:        thumbCounts.Failed,
+			TeaserReadyCount:            counts.Ready,
+			TeaserPendingCount:          counts.Pending,
+			TeaserFailedCount:           counts.Failed,
+			TeaserSkippedCount:          counts.Skipped,
+			FingerprintReadyCount:       fingerprintCount.Ready,
+			FingerprintPendingCount:     fingerprintCount.Pending,
+			FingerprintFailedCount:      fingerprintCount.Failed,
 		})
 	}
 	writeJSON(w, http.StatusOK, list)
@@ -481,6 +517,8 @@ type upsertDriveReq struct {
 	// 推荐前端"设置跳过目录"走专用 POST /drives/{id}/skip-dirs；
 	// 这里支持是为了允许批量编辑场景一次性提交。
 	SkipDirIDs *[]string `json:"skipDirIds,omitempty"`
+	// ScanDirIDs 是新版"需要扫描目录"白名单；未传沿用旧值，空数组表示关闭白名单。
+	ScanDirIDs *[]string `json:"scanDirIds,omitempty"`
 	// MinScanFileSizeBytes 同样支持"未传 = 沿用旧值"；新建时默认 0。
 	MinScanFileSizeBytes *int64 `json:"minScanFileSizeBytes,omitempty"`
 	// SkipFileNameKeywords 同样支持"未传 = 沿用旧值"；新建时默认空数组。
@@ -526,8 +564,19 @@ func (a *AdminServer) handleUpsertDrive(w http.ResponseWriter, r *http.Request) 
 	switch {
 	case body.SkipDirIDs != nil:
 		skipDirIDs = *body.SkipDirIDs
+	case body.ScanDirIDs != nil:
+		skipDirIDs = nil
 	case existing != nil:
 		skipDirIDs = existing.SkipDirIDs
+	}
+
+	// scanDirIds 解析顺序同 skipDirIds；非空时作为新版扫描白名单生效。
+	var scanDirIDs []string
+	switch {
+	case body.ScanDirIDs != nil:
+		scanDirIDs = *body.ScanDirIDs
+	case existing != nil:
+		scanDirIDs = existing.ScanDirIDs
 	}
 
 	minScanFileSizeBytes := int64(0)
@@ -557,6 +606,7 @@ func (a *AdminServer) handleUpsertDrive(w http.ResponseWriter, r *http.Request) 
 		Status:               "disconnected",
 		TeaserEnabled:        teaserEnabled,
 		SkipDirIDs:           skipDirIDs,
+		ScanDirIDs:           scanDirIDs,
 		MinScanFileSizeBytes: minScanFileSizeBytes,
 		SkipFileNameKeywords: skipFileNameKeywords,
 	}
@@ -599,6 +649,20 @@ func (a *AdminServer) handleRescan(w http.ResponseWriter, r *http.Request) {
 func (a *AdminServer) handleRunNightlyJob(w http.ResponseWriter, r *http.Request) {
 	if a.OnRunNightlyJob != nil {
 		a.OnRunNightlyJob()
+	}
+	writeJSON(w, http.StatusAccepted, map[string]any{"ok": true})
+}
+
+// handleRunSpider91Migration 只把已下载到本地的 spider91 视频迁移到上传目标。
+// 不重新爬取；用于 admin 手动确认迁移是否启动。
+func (a *AdminServer) handleRunSpider91Migration(w http.ResponseWriter, r *http.Request) {
+	if a.OnRunSpider91Migration == nil {
+		http.Error(w, "spider91 migration is not available", http.StatusNotFound)
+		return
+	}
+	if err := a.OnRunSpider91Migration(); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
 	}
 	writeJSON(w, http.StatusAccepted, map[string]any{"ok": true})
 }
@@ -650,6 +714,14 @@ type skipDirsReq struct {
 	DirIDs []string `json:"dirIds"`
 }
 
+// scanDirsReq 是 POST /admin/api/drives/{id}/scan-dirs 的入参。
+//
+// 整体覆盖语义：传啥就保存啥（不是增量合并）。dirIds 可以是 nil/空数组 表示
+// 关闭目录白名单，回到按扫描起点完整扫描。
+type scanDirsReq struct {
+	DirIDs []string `json:"dirIds"`
+}
+
 // handleSetDriveSkipDirs 更新某盘的"扫描跳过目录"集合。
 //
 // 与 upsertDrive 的区别：那条接口要重传 kind / name / rootId / credentials 等字段，
@@ -670,20 +742,7 @@ func (a *AdminServer) handleSetDriveSkipDirs(w http.ResponseWriter, r *http.Requ
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
-	// 去重 + trim 空白；前端理论上保证清洁，这里再防一道。
-	seen := map[string]struct{}{}
-	cleaned := make([]string, 0, len(body.DirIDs))
-	for _, raw := range body.DirIDs {
-		s := raw
-		if s == "" {
-			continue
-		}
-		if _, ok := seen[s]; ok {
-			continue
-		}
-		seen[s] = struct{}{}
-		cleaned = append(cleaned, s)
-	}
+	cleaned := cleanStringList(body.DirIDs)
 	if err := a.Catalog.SetDriveSkipDirIDs(r.Context(), id, cleaned); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			http.Error(w, "drive not found", http.StatusNotFound)
@@ -693,6 +752,35 @@ func (a *AdminServer) handleSetDriveSkipDirs(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "skipDirIds": cleaned})
+}
+
+// handleSetDriveScanDirs 更新某盘的"需要扫描目录"白名单。
+//
+// 行为：
+//   - 写 catalog.drives.scan_dir_ids（整体覆盖）
+//   - 非空时扫描只从这些目录开始递归；空数组表示按 scanRoot/root 完整扫描
+//   - 不会删除源文件；后续扫描清理只删除 catalog 里的旧记录
+func (a *AdminServer) handleSetDriveScanDirs(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	if id == "" {
+		http.Error(w, "id is required", http.StatusBadRequest)
+		return
+	}
+	var body scanDirsReq
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	cleaned := cleanStringList(body.DirIDs)
+	if err := a.Catalog.SetDriveScanDirIDs(r.Context(), id, cleaned); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			http.Error(w, "drive not found", http.StatusNotFound)
+			return
+		}
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "scanDirIds": cleaned})
 }
 
 // scanFilterReq 是 POST /admin/api/drives/{id}/scan-filter 的入参。
@@ -793,6 +881,44 @@ func cleanStringList(values []string) []string {
 	return out
 }
 
+func mergeLabels(existing []string, added []string) []string {
+	out := cleanStringList(existing)
+	seen := make(map[string]struct{}, len(out)+len(added))
+	for _, label := range out {
+		seen[strings.ToLower(label)] = struct{}{}
+	}
+	for _, label := range cleanStringList(added) {
+		key := strings.ToLower(label)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, label)
+	}
+	if out == nil {
+		return []string{}
+	}
+	return out
+}
+
+func removeLabels(existing []string, removed []string) []string {
+	blocked := map[string]struct{}{}
+	for _, label := range cleanStringList(removed) {
+		blocked[strings.ToLower(label)] = struct{}{}
+	}
+	out := make([]string, 0, len(existing))
+	for _, label := range cleanStringList(existing) {
+		if _, ok := blocked[strings.ToLower(label)]; ok {
+			continue
+		}
+		out = append(out, label)
+	}
+	if out == nil {
+		return []string{}
+	}
+	return out
+}
+
 // handleListDriveDirTree 列出某 drive 在指定父目录下的直接子目录。
 //
 // 查询参数 ?parent=<dirID>：留空 = drive 的 RootID。前端按需展开调用 ——
@@ -832,7 +958,10 @@ func (a *AdminServer) handleAdminListVideos(w http.ResponseWriter, r *http.Reque
 		size = 100
 	}
 	items, total, err := a.Catalog.ListVideos(r.Context(), catalog.ListParams{
+		Keyword:  strings.TrimSpace(q.Get("keyword")),
 		DriveID:  q.Get("driveId"),
+		Tag:      strings.TrimSpace(q.Get("tag")),
+		Category: strings.TrimSpace(q.Get("category")),
 		Page:     page,
 		PageSize: size,
 	})
@@ -879,6 +1008,27 @@ func (a *AdminServer) handleCreateTag(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (a *AdminServer) handleDeleteTag(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	if err != nil || id <= 0 {
+		writeErr(w, http.StatusBadRequest, errors.New("invalid tag id"))
+		return
+	}
+	removedVideos, err := a.Catalog.DeleteTag(r.Context(), id)
+	if err != nil {
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+			writeErr(w, http.StatusNotFound, err)
+		case errors.Is(err, catalog.ErrSystemTag):
+			writeErr(w, http.StatusBadRequest, err)
+		default:
+			writeErr(w, http.StatusInternalServerError, err)
+		}
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "removedVideos": removedVideos})
+}
+
 type updateVideoReq struct {
 	Title       string   `json:"title"`
 	Author      string   `json:"author"`
@@ -889,6 +1039,77 @@ type updateVideoReq struct {
 	Thumbnail   string   `json:"thumbnail"`
 	Quality     string   `json:"quality"`
 	DurationSec int      `json:"durationSeconds"`
+}
+
+type bulkVideoTagsReq struct {
+	VideoIDs []string `json:"videoIds"`
+	Tags     []string `json:"tags"`
+	Mode     string   `json:"mode"`
+}
+
+func (a *AdminServer) handleBulkVideoTags(w http.ResponseWriter, r *http.Request) {
+	var body bulkVideoTagsReq
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	videoIDs := cleanStringList(body.VideoIDs)
+	if len(videoIDs) == 0 {
+		http.Error(w, "videoIds is required", http.StatusBadRequest)
+		return
+	}
+	if len(videoIDs) > 500 {
+		http.Error(w, "too many videos selected", http.StatusBadRequest)
+		return
+	}
+	mode := strings.ToLower(strings.TrimSpace(body.Mode))
+	if mode == "" {
+		mode = "add"
+	}
+	if mode != "add" && mode != "remove" && mode != "replace" {
+		http.Error(w, "mode must be add, remove, or replace", http.StatusBadRequest)
+		return
+	}
+	tags := cleanStringList(body.Tags)
+	if mode != "replace" && len(tags) == 0 {
+		http.Error(w, "tags is required", http.StatusBadRequest)
+		return
+	}
+
+	videos := make([]*catalog.Video, 0, len(videoIDs))
+	for _, id := range videoIDs {
+		v, err := a.Catalog.GetVideo(r.Context(), id)
+		if err != nil {
+			writeErr(w, http.StatusNotFound, err)
+			return
+		}
+		videos = append(videos, v)
+	}
+
+	updated := 0
+	for _, v := range videos {
+		nextTags := tags
+		switch mode {
+		case "add":
+			nextTags = mergeLabels(v.Tags, tags)
+		case "remove":
+			nextTags = removeLabels(v.Tags, tags)
+		}
+		if err := a.Catalog.SetManualVideoTags(r.Context(), v.ID, nextTags); err != nil {
+			if errors.Is(err, catalog.ErrUnknownTag) {
+				writeErr(w, http.StatusBadRequest, err)
+				return
+			}
+			writeErr(w, http.StatusInternalServerError, err)
+			return
+		}
+		updated++
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":      true,
+		"updated": updated,
+	})
 }
 
 func (a *AdminServer) handleUpdateVideo(w http.ResponseWriter, r *http.Request) {
@@ -954,6 +1175,16 @@ func (a *AdminServer) handleRegenPreview(w http.ResponseWriter, r *http.Request)
 	if a.OnRegenPreview != nil {
 		a.OnRegenPreview(id)
 	}
+	writeJSON(w, http.StatusAccepted, map[string]any{"ok": true})
+}
+
+func (a *AdminServer) handleGenerateHLS(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	if a.OnGenerateHLS == nil {
+		http.Error(w, "hls generation is not available", http.StatusNotImplemented)
+		return
+	}
+	a.OnGenerateHLS(id)
 	writeJSON(w, http.StatusAccepted, map[string]any{"ok": true})
 }
 

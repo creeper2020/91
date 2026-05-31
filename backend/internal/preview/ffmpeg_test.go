@@ -234,6 +234,14 @@ func TestShouldProxy115FFmpegLinks(t *testing.T) {
 	if !shouldProxyFFmpegLink(&drives.StreamLink{URL: "https://cdnfhnfile.115cdn.net/file.mp4"}) {
 		t.Fatal("115 CDN link should use local ffmpeg proxy")
 	}
+	if !shouldProxyFFmpegLink(&drives.StreamLink{
+		URL: "https://www.googleapis.com/drive/v3/files/file-id?alt=media",
+		Headers: http.Header{
+			"Authorization": {"Bearer token"},
+		},
+	}) {
+		t.Fatal("authorization header link should use local ffmpeg proxy")
+	}
 	if shouldProxyFFmpegLink(&drives.StreamLink{URL: "https://download.example/file.mp4"}) {
 		t.Fatal("generic link should not use local ffmpeg proxy")
 	}

@@ -392,6 +392,51 @@
   cursor: not-allowed;
 }
 
+.admin-btn--compact {
+  min-height: 28px;
+  padding: 5px 9px;
+  font-size: var(--font-xs);
+}
+
+/* =========================================================
+ * Media processing
+ * ========================================================= */
+.admin-media-pipeline {
+  display: grid;
+  gap: 8px;
+  min-width: 230px;
+}
+
+.admin-media-pipeline__item {
+  display: grid;
+  grid-template-columns: 58px max-content max-content;
+  align-items: center;
+  gap: 8px;
+}
+
+.admin-media-pipeline__label {
+  color: var(--text-faint);
+  font-size: var(--font-xs);
+  font-weight: var(--weight-semibold);
+}
+
+.admin-media-pipeline .admin-status {
+  justify-self: start;
+}
+
+.admin-form__section {
+  display: grid;
+  gap: 10px;
+  padding-top: var(--space-3);
+  border-top: 1px solid var(--border-subtle);
+}
+
+.admin-form__section-title {
+  color: var(--text-default);
+  font-size: var(--font-sm);
+  font-weight: var(--weight-semibold);
+}
+
 /* =========================================================
  * Drive teaser quick-pick
  * ========================================================= */
@@ -452,6 +497,7 @@
 
 .admin-drive-teaser__metric.is-ready { color: var(--success); }
 .admin-drive-teaser__metric.is-pending { color: var(--warning); }
+.admin-drive-teaser__metric.is-skipped { color: var(--text-muted); }
 .admin-drive-teaser__metric.is-failed { color: var(--danger); }
 
 /* ----- Generation counts column in table ----- */
@@ -469,6 +515,55 @@
   width: 100%;
   min-width: 200px;
   max-width: 320px;
+}
+
+.admin-generation-pipeline {
+  display: grid;
+  gap: var(--space-3);
+}
+
+.admin-generation-pipeline__lane {
+  display: grid;
+  gap: 10px;
+  padding: var(--space-3);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  background: var(--bg-sunken);
+}
+
+.admin-generation-pipeline__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+
+.admin-generation-pipeline__head strong {
+  color: var(--text-strong);
+  font-size: var(--font-sm);
+  white-space: nowrap;
+}
+
+.admin-generation-pipeline__bar {
+  display: flex;
+  width: 100%;
+  height: 9px;
+  overflow: hidden;
+  border-radius: var(--radius-sm);
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.admin-generation-pipeline__bar span {
+  min-width: 3px;
+}
+
+.admin-generation-pipeline__bar .is-ready { background: var(--success); }
+.admin-generation-pipeline__bar .is-pending { background: var(--warning); }
+.admin-generation-pipeline__bar .is-skipped { background: var(--text-faint); }
+.admin-generation-pipeline__bar .is-failed { background: var(--danger); }
+.admin-generation-pipeline__bar .is-empty {
+  flex: 1;
+  background: rgba(255, 255, 255, 0.08);
 }
 
 .admin-generation-row {
@@ -1165,8 +1260,17 @@
 
   /* Span main fields to full row width */
   .admin-table:not(.admin-drives-table) td[data-label="标题"],
-  .admin-table:not(.admin-drives-table) td[data-label="标签"] {
+  .admin-table:not(.admin-drives-table) td[data-label="标签"],
+  .admin-table:not(.admin-drives-table) td[data-label="媒体处理"] {
     grid-column: 1 / -1;
+  }
+
+  .admin-media-pipeline {
+    min-width: 0;
+  }
+
+  .admin-media-pipeline__item {
+    grid-template-columns: 64px minmax(0, 1fr) max-content;
   }
 
   .admin-table:not(.admin-drives-table) td.is-actions {
@@ -1318,6 +1422,46 @@
   margin: -8px 0 var(--space-4);
   font-size: var(--font-xs);
   color: var(--text-faint);
+}
+
+.admin-bulk-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  margin-bottom: var(--space-3);
+  padding: var(--space-3);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  background: var(--bg-surface);
+}
+
+.admin-bulk-toolbar__select-all {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--text-muted);
+  font-size: var(--font-sm);
+  cursor: pointer;
+}
+
+.admin-bulk-toolbar__select-all input,
+.admin-table-checkbox input {
+  width: 15px;
+  height: 15px;
+  accent-color: var(--accent);
+}
+
+.admin-bulk-toolbar__count {
+  color: var(--text-faint);
+  font-size: var(--font-xs);
+  min-width: 58px;
+}
+
+.admin-table th.admin-table-checkbox,
+.admin-table td.admin-table-checkbox {
+  width: 38px;
+  padding-right: 0;
 }
 
 .admin-table-pagination {
@@ -1825,6 +1969,7 @@
 .admin-drive-card__brand-icon[data-kind="pikpak"] { background: var(--drive-pikpak); }
 .admin-drive-card__brand-icon[data-kind="wopan"] { background: var(--drive-wopan); }
 .admin-drive-card__brand-icon[data-kind="onedrive"] { background: var(--drive-onedrive); }
+.admin-drive-card__brand-icon[data-kind="googledrive"] { background: var(--drive-googledrive); }
 .admin-drive-card__brand-icon[data-kind="spider91"] { background: var(--accent); }
 
 .admin-drive-card__info {
@@ -2294,4 +2439,35 @@
   gap: 4px;
   font-weight: var(--weight-semibold);
   color: var(--text-default);
+}
+
+.admin-tag-card__footer-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.admin-tag-card__delete {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  border: 1px solid var(--danger);
+  border-radius: var(--radius-xs);
+  background: var(--danger-soft);
+  color: var(--danger);
+  padding: 3px 6px;
+  font-size: 10px;
+  font-weight: var(--weight-semibold);
+  cursor: pointer;
+  transition: all var(--transition-fast);
+}
+
+.admin-tag-card__delete:hover:not(:disabled) {
+  background: var(--danger);
+  color: white;
+}
+
+.admin-tag-card__delete:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
 }

@@ -1,5 +1,5 @@
 // Package spider91migrate 周期性把 spider91 drive 下载到本地的视频
-// 上传到一个指定的目标 drive 目录（PikPak 或 115），上传成功后：
+// 上传到一个指定的目标 drive 目录（PikPak、115 或 Google Drive），上传成功后：
 //
 //   - 改写 catalog 行：drive_id / file_id / content_hash 改成目标盘的；
 //     视频自身的 id 不变（仍是 spider91-<driveID>-<viewkey>），video_tags、
@@ -28,19 +28,21 @@ import (
 
 	"github.com/video-site/backend/internal/catalog"
 	"github.com/video-site/backend/internal/drives"
+	"github.com/video-site/backend/internal/drives/googledrive"
 	"github.com/video-site/backend/internal/drives/p115"
 	"github.com/video-site/backend/internal/drives/pikpak"
 	"github.com/video-site/backend/internal/drives/spider91"
 )
 
 // uploadTarget 是 migrator 调用目标 drive 的最小接口。任何一种"接收 spider91 上传"的
-// 网盘都要实现它；当前 PikPak 和 115 各自通过适配器满足。
+// 网盘都要实现它；当前 PikPak、115 和 Google Drive 各自通过适配器满足。
 //
 // 这一层抽象把"迁移调用方"和"具体盘的 SDK 协议"解耦：
-//   - PikPak 走 GCID + OSS PutObject（pikpak.UploadResult）
-//   - 115   走 SHA1   + 秒传 / OSS / 分片（p115.UploadResult）
+//   - PikPak       走 GCID + OSS PutObject（pikpak.UploadResult）
+//   - 115          走 SHA1 + 秒传 / OSS / 分片（p115.UploadResult）
+//   - Google Drive 走 resumable upload + md5Checksum（googledrive.UploadResult）
 //
-// 两个返回值都被归一成本地的 UploadResult，并在 catalog 改写阶段统一处理。
+// 各 driver 返回值都被归一成本地的 UploadResult，并在 catalog 改写阶段统一处理。
 type uploadTarget interface {
 	ID() string
 	Kind() string
@@ -52,7 +54,7 @@ type uploadTarget interface {
 // UploadResult 是 uploadTarget.UploadAndReportHash 的归一返回。
 //
 // FileID  目标盘上的新文件 ID；
-// Hash    GCID（PikPak）或 SHA1 HEX 大写（115），写入 catalog.content_hash 用于跨盘去重；
+// Hash    GCID（PikPak）、SHA1 HEX 大写（115）或 MD5（Google Drive），写入 catalog.content_hash 用于跨盘去重；
 // Size    实际上传字节数。
 type UploadResult struct {
 	FileID string
@@ -60,7 +62,7 @@ type UploadResult struct {
 	Size   int64
 }
 
-// pikpakAdapter / p115Adapter 把具体 driver 包装成 uploadTarget。
+// pikpakAdapter / p115Adapter / googleDriveAdapter 把具体 driver 包装成 uploadTarget。
 //
 // 之所以不让 driver 直接实现 uploadTarget：
 //
@@ -103,6 +105,24 @@ func (a *p115Adapter) Rename(ctx context.Context, fileID, newName string) error 
 	return a.d.Rename(ctx, fileID, newName)
 }
 
+type googleDriveAdapter struct {
+	d *googledrive.Driver
+}
+
+func (a *googleDriveAdapter) ID() string     { return a.d.ID() }
+func (a *googleDriveAdapter) Kind() string   { return a.d.Kind() }
+func (a *googleDriveAdapter) RootID() string { return a.d.RootID() }
+func (a *googleDriveAdapter) UploadAndReportHash(ctx context.Context, parentID, name string, r io.Reader, size int64) (UploadResult, error) {
+	res, err := a.d.UploadAndReportHash(ctx, parentID, name, r, size)
+	if err != nil {
+		return UploadResult{}, err
+	}
+	return UploadResult{FileID: res.FileID, Hash: res.Hash, Size: res.Size}, nil
+}
+func (a *googleDriveAdapter) Rename(ctx context.Context, fileID, newName string) error {
+	return a.d.Rename(ctx, fileID, newName)
+}
+
 // adaptUploadTarget 把通用 drive 包装成 uploadTarget。
 // 不支持的盘 kind 返回 error；调用方静默跳过。
 func adaptUploadTarget(d drives.Drive) (uploadTarget, error) {
@@ -111,6 +131,8 @@ func adaptUploadTarget(d drives.Drive) (uploadTarget, error) {
 		return &pikpakAdapter{d: v}, nil
 	case *p115.Driver:
 		return &p115Adapter{d: v}, nil
+	case *googledrive.Driver:
+		return &googleDriveAdapter{d: v}, nil
 	case uploadTarget:
 		// 测试或自定义实现可以直接传入；优先使用具体类型分支以拿到适配器。
 		return v, nil
@@ -272,7 +294,7 @@ func (m *Migrator) runOnce(ctx context.Context) {
 
 	target, pp, err := m.resolveTarget()
 	if err != nil {
-		// 没目标就静默 —— 用户选择了本地保存，或还没配 115/PikPak drive。
+		// 没目标就静默 —— 用户选择了本地保存，或还没配可上传的目标 drive。
 		return
 	}
 
@@ -517,7 +539,7 @@ func (m *Migrator) migrateOne(ctx context.Context, v *catalog.Video, src *spider
 	//   <sanitized title>-<viewkey 后 8 位>.<ext>
 	//
 	// 这样网盘 Web 端列出来的文件名能直接看出是哪个视频，
-	// 又用 viewkey 后 8 位避免同标题撞名。两个目标盘（PikPak / 115）共用同一格式，
+	// 又用 viewkey 后 8 位避免同标题撞名。所有上传目标共用同一格式，
 	// 简化前端 / catalog 的认知。
 	parent := pp.RootID()
 	uploadName := desiredPikPakName(v.Title, extractViewKey(v.ID), v.Ext)
@@ -639,7 +661,7 @@ func (m *Migrator) cleanupOldLocalVideos(ctx context.Context, src *spider91.Driv
 	return deleted, nil
 }
 
-// backfillFileNames 扫描目标 drive（PikPak 或 115）下所有 spider91-* 起始 ID 的视频，
+// backfillFileNames 扫描目标 drive 下所有 spider91-* 起始 ID 的视频，
 // 对文件名不是 desiredPikPakName(...) 期望格式的，调 target.Rename 修正，
 // 并把 catalog.file_name 同步到新名字。
 //

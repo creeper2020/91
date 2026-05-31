@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"path"
+	"sort"
 	"strings"
 	"time"
 
@@ -16,13 +17,12 @@ type Scanner struct {
 	Catalog *catalog.Catalog
 	Drive   drives.Drive
 	Exts    map[string]bool
-	// SkipDirIDs 是用户在 admin 后台配置的"扫描跳过目录"集合（drive 侧的目录 fileID）。
-	// 命中其中任意一个时 scanner 直接 continue —— 不递归、不收集文件、不计入
-	// SeenFileIDs / VisitedDirIDs，自然也不会被后续 cleanupMissingDriveVideos 当
-	// 成"消失了"误删。替代旧版硬编码 p115 "影视" 目录例外分支。
-	//
-	// nil / 空集合 → 行为等同于不跳过任何目录。
+	// SkipDirIDs 是旧版"扫描跳过目录"集合。仅当 ScanDirIDs 为空时兼容生效；
+	// 配了白名单后，以 ScanDirIDs 为准。
 	SkipDirIDs map[string]struct{}
+	// ScanDirIDs 是"需要扫描目录"白名单。非空时只扫描这些目录及其子目录；
+	// 空集合表示从 scan_root_id/root_id 开始完整扫描。
+	ScanDirIDs map[string]struct{}
 	// MinFileSizeBytes 是扫描入库的最小文件大小阈值。0 表示关闭大小过滤。
 	// 小于该值的视频文件不会进入 SeenFileIDs，因此下一次完整扫描会把既有小文件
 	// 元数据当作不再可见并清理掉。
@@ -46,26 +46,17 @@ const defaultScanProgressInterval = 30 * time.Second
 
 // New 构造一个 Scanner。
 //
-// skipDirIDs 是用户为该 drive 配置的"扫描跳过目录"集合（可空）；nil / 空集合
-// 表示不跳过任何目录。被跳过的目录及其全部子目录都不递归。
+// skipDirIDs 是旧版"扫描跳过目录"集合（可空）；nil / 空集合表示不跳过任何目录。
 func New(cat *catalog.Catalog, drv drives.Drive, exts []string, skipDirIDs []string, onNew func(v *catalog.Video)) *Scanner {
 	m := make(map[string]bool, len(exts))
 	for _, e := range exts {
 		m[strings.ToLower(e)] = true
 	}
-	skip := make(map[string]struct{}, len(skipDirIDs))
-	for _, id := range skipDirIDs {
-		id = strings.TrimSpace(id)
-		if id == "" {
-			continue
-		}
-		skip[id] = struct{}{}
-	}
 	return &Scanner{
 		Catalog:    cat,
 		Drive:      drv,
 		Exts:       m,
-		SkipDirIDs: skip,
+		SkipDirIDs: idSet(skipDirIDs),
 		OnNewVideo: onNew,
 	}
 }
@@ -120,6 +111,19 @@ func (s *Scanner) Run(ctx context.Context, startDirID string) (Stats, error) {
 			now.Sub(started).Round(time.Second), shown)
 	}
 
+	if len(s.ScanDirIDs) > 0 {
+		for _, dirID := range sortedIDs(s.ScanDirIDs) {
+			if _, visited := stats.VisitedDirIDs[dirID]; visited {
+				continue
+			}
+			if err := s.walk(ctx, dirID, "", &stats, progress); err != nil {
+				stats.Errors++
+				log.Printf("[scanner] walk selected dir %s error: %v", dirID, err)
+			}
+		}
+		return stats, nil
+	}
+
 	if err := s.walk(ctx, startDirID, "", &stats, progress); err != nil {
 		return stats, err
 	}
@@ -144,8 +148,8 @@ func (s *Scanner) walk(ctx context.Context, dirID, dirName string, stats *Stats,
 			if strings.EqualFold(e.Name, "previews") {
 				continue
 			}
-			// 用户在 admin 配置的跳过目录：直接 continue，不递归、不收集文件。
-			if _, skip := s.SkipDirIDs[e.ID]; skip {
+			// 兼容旧版跳过目录：只有没有配置白名单时才生效。
+			if len(s.ScanDirIDs) == 0 && s.isSkippedDir(e.ID) {
 				continue
 			}
 			if err := s.walk(ctx, e.ID, e.Name, stats, progress); err != nil {
@@ -261,6 +265,39 @@ func (s *Scanner) walk(ctx context.Context, dirID, dirName string, stats *Stats,
 		progress(dirName)
 	}
 	return nil
+}
+
+func (s *Scanner) SetScanDirIDs(ids []string) {
+	s.ScanDirIDs = idSet(ids)
+}
+
+func (s *Scanner) isSkippedDir(id string) bool {
+	if s == nil || len(s.SkipDirIDs) == 0 {
+		return false
+	}
+	_, ok := s.SkipDirIDs[id]
+	return ok
+}
+
+func idSet(ids []string) map[string]struct{} {
+	out := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		out[id] = struct{}{}
+	}
+	return out
+}
+
+func sortedIDs(ids map[string]struct{}) []string {
+	out := make([]string, 0, len(ids))
+	for id := range ids {
+		out = append(out, id)
+	}
+	sort.Strings(out)
+	return out
 }
 
 func (s *Scanner) matchSkipFileNameKeyword(name string) (string, bool) {

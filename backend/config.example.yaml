@@ -45,6 +45,11 @@ nightly:
   # 单次流水线总耗时上限（软超时）；超过后当前 phase 跑完不启动后续 phase。
   max_duration: 6h
 
+spider91:
+  # 91 爬虫独立间隔任务。0 表示关闭，只跟随 nightly 每天跑一次。
+  # 例：4h 表示每 4 小时只跑 91 抓取 + 迁移，不扫描其它网盘。
+  crawl_interval: 0
+
 preview:
   # 是否启用 ffmpeg 抽帧生成 teaser
   enabled: true
@@ -59,12 +64,22 @@ preview:
   width: 480
 
 # 盘列表。上线后请通过管理后台添加，本文件可留空。
-# kind 支持 quark / p115 / pikpak / wopan / onedrive。
+# kind 支持 quark / p115 / pikpak / wopan / onedrive / googledrive。
 # OneDrive 示例：
 # - id: "my-onedrive"
 #   kind: "onedrive"
 #   name: "我的 OneDrive"
 #   root_id: "root"
 #   params:
+#     refresh_token: "..."
+# Google Drive 示例：
+# - id: "my-google-drive"
+#   kind: "googledrive"
+#   name: "我的 Google Drive"
+#   root_id: "root"
+#   scan_root_id: "root"
+#   params:
+#     client_id: "..."
+#     client_secret: "..."
 #     refresh_token: "..."
 drives: []

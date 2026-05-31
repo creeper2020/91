@@ -732,6 +732,95 @@ func TestHandleVideoDetailRecommendationsPreferReadyThumbnails(t *testing.T) {
 	}
 }
 
+func TestHandleVideoDetailRecommendationsPrioritizeSimilarityOverEngagement(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cat.Close(); err != nil {
+			t.Fatalf("close catalog: %v", err)
+		}
+	})
+
+	now := time.Now()
+	videos := []*catalog.Video{
+		{
+			ID:           "current-video",
+			DriveID:      "drive",
+			FileID:       "current-video",
+			Title:        "Current",
+			Tags:         []string{"same-tag"},
+			Category:     "cat-a",
+			Author:       "author-a",
+			ThumbnailURL: "https://thumb.example/current-video.jpg",
+			PublishedAt:  now,
+			CreatedAt:    now,
+			UpdatedAt:    now,
+		},
+		{
+			ID:           "shared-tag",
+			DriveID:      "drive",
+			FileID:       "shared-tag",
+			Title:        "Shared tag",
+			Tags:         []string{"same-tag"},
+			ThumbnailURL: "https://thumb.example/shared-tag.jpg",
+			PublishedAt:  now.Add(-30 * 24 * time.Hour),
+			CreatedAt:    now.Add(-30 * 24 * time.Hour),
+			UpdatedAt:    now.Add(-30 * 24 * time.Hour),
+		},
+		{
+			ID:           "same-category",
+			DriveID:      "drive",
+			FileID:       "same-category",
+			Title:        "Same category",
+			Category:     "cat-a",
+			ThumbnailURL: "https://thumb.example/same-category.jpg",
+			PublishedAt:  now.Add(-time.Hour),
+			CreatedAt:    now.Add(-time.Hour),
+			UpdatedAt:    now.Add(-time.Hour),
+		},
+		{
+			ID:           "other-fresh",
+			DriveID:      "drive",
+			FileID:       "other-fresh",
+			Title:        "Other fresh",
+			Likes:        10000,
+			Favorites:    10000,
+			Comments:     10000,
+			Views:        1000000,
+			ThumbnailURL: "https://thumb.example/other-fresh.jpg",
+			PublishedAt:  now,
+			CreatedAt:    now,
+			UpdatedAt:    now,
+		},
+	}
+	for _, v := range videos {
+		if err := cat.UpsertVideo(ctx, v); err != nil {
+			t.Fatalf("seed video %s: %v", v.ID, err)
+		}
+	}
+
+	req := requestWithVideoID(http.MethodGet, "/api/video/current-video", "current-video", strings.NewReader(``))
+	rr := httptest.NewRecorder()
+	(&Server{Catalog: cat}).handleVideoDetail(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	var got VideoDetailDTO
+	if err := json.NewDecoder(rr.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(got.RelatedVideos) == 0 {
+		t.Fatal("related videos is empty")
+	}
+	if got.RelatedVideos[0].ID != "shared-tag" {
+		t.Fatalf("first related = %q, want shared-tag; items=%#v", got.RelatedVideos[0].ID, got.RelatedVideos)
+	}
+}
+
 func TestHandleHideVideoRemovesVideoFromPublicListAndDetail(t *testing.T) {
 	ctx := context.Background()
 	cat, err := catalog.Open(t.TempDir() + "/catalog.db")

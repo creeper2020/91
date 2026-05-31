@@ -16,7 +16,10 @@ import (
 	"github.com/video-site/backend/internal/fixedtags"
 )
 
-var ErrUnknownTag = errors.New("unknown tag")
+var (
+	ErrUnknownTag = errors.New("unknown tag")
+	ErrSystemTag  = errors.New("system tag cannot be deleted")
+)
 
 const avTagLabel = "AV"
 
@@ -61,6 +64,34 @@ func (c *Catalog) migrate(ctx context.Context) error {
 	if err := c.addColumnIfMissing(ctx, "videos", "thumbnail_status", "TEXT DEFAULT 'pending'"); err != nil {
 		return err
 	}
+	if err := c.addColumnIfMissing(ctx, "videos", "hls_dir", "TEXT DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := c.addColumnIfMissing(ctx, "videos", "hls_status", "TEXT DEFAULT 'pending'"); err != nil {
+		return err
+	}
+	if err := c.addColumnIfMissing(ctx, "videos", "hls_error", "TEXT DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := c.addColumnIfMissing(ctx, "videos", "hls_updated_at", "INTEGER DEFAULT 0"); err != nil {
+		return err
+	}
+	if _, err := c.db.ExecContext(ctx, `
+UPDATE videos
+   SET hls_status = 'pending'
+ WHERE COALESCE(hls_dir, '') = ''
+   AND COALESCE(hls_status, '') = ''
+`); err != nil {
+		return err
+	}
+	if _, err := c.db.ExecContext(ctx, `
+UPDATE videos
+   SET hls_status = 'pending',
+       hls_error = ''
+ WHERE COALESCE(hls_status, 'pending') = 'generating'
+`); err != nil {
+		return err
+	}
 	// drives.teaser_enabled：每盘 teaser 开关，替代旧的全局 preview.enabled。
 	// 升级路径：直接让 ALTER TABLE 的 DEFAULT 1 兜底 —— 每个现存 drive 都默认开启，
 	// 不读旧的 settings.preview.enabled 字段。这样老用户即便之前关过全局开关，
@@ -68,10 +99,13 @@ func (c *Catalog) migrate(ctx context.Context) error {
 	if _, err := c.addColumnIfMissingReportNew(ctx, "drives", "teaser_enabled", "INTEGER NOT NULL DEFAULT 1"); err != nil {
 		return err
 	}
-	// drives.skip_dir_ids：每盘扫描跳过目录集合（JSON array of string）。命中
-	// 其中任意一个的目录及其全部子目录都不会被递归扫描。替代旧版硬编码"影视"
-	// 目录例外分支；旧 drive 升级后默认空数组 → 行为等同于以前未启用跳过。
+	// drives.skip_dir_ids：旧版每盘扫描跳过目录集合，保留用于兼容已保存配置。
 	if err := c.addColumnIfMissing(ctx, "drives", "skip_dir_ids", "TEXT NOT NULL DEFAULT '[]'"); err != nil {
+		return err
+	}
+	// drives.scan_dir_ids：每盘扫描白名单目录集合。非空时只扫描这些目录及其子目录；
+	// 空数组保持旧行为，从 scan_root_id/root_id 开始完整扫描。
+	if err := c.addColumnIfMissing(ctx, "drives", "scan_dir_ids", "TEXT NOT NULL DEFAULT '[]'"); err != nil {
 		return err
 	}
 	// drives.min_scan_file_size_bytes：每盘扫描入库的最小文件大小阈值。默认 0
@@ -387,6 +421,62 @@ func (c *Catalog) CreateTagAndClassify(ctx context.Context, label string, aliase
 		return 0, err
 	}
 	return c.classifyTag(ctx, tag)
+}
+
+func (c *Catalog) DeleteTag(ctx context.Context, tagID int64) (int, error) {
+	tx, err := c.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+
+	tag, err := c.getTagByIDTx(ctx, tx, tagID)
+	if err != nil {
+		return 0, err
+	}
+	if tag.Source == "system" {
+		return 0, ErrSystemTag
+	}
+
+	rows, err := tx.QueryContext(ctx, `SELECT video_id FROM video_tags WHERE tag_id = ?`, tagID)
+	if err != nil {
+		return 0, err
+	}
+	var videoIDs []string
+	for rows.Next() {
+		var videoID string
+		if err := rows.Scan(&videoID); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		videoIDs = append(videoIDs, videoID)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return 0, err
+	}
+	if err := rows.Close(); err != nil {
+		return 0, err
+	}
+
+	if _, err := tx.ExecContext(ctx, `DELETE FROM video_tags WHERE tag_id = ?`, tagID); err != nil {
+		return 0, err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM tags WHERE id = ?`, tagID); err != nil {
+		return 0, err
+	}
+
+	for _, videoID := range videoIDs {
+		manual := hasManualTagsTx(ctx, tx, videoID)
+		if err := syncVideoTagsJSONTx(ctx, tx, videoID, manual); err != nil {
+			return 0, err
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return len(videoIDs), nil
 }
 
 func (c *Catalog) ListTags(ctx context.Context) ([]Tag, error) {
@@ -824,6 +914,56 @@ func (c *Catalog) getTagByLabelTx(ctx context.Context, tx *sql.Tx, label string)
 		`SELECT id, label, aliases, source, 0 FROM tags WHERE label = ? COLLATE NOCASE`,
 		label)
 	return scanTag(row)
+}
+
+func (c *Catalog) getTagByIDTx(ctx context.Context, tx *sql.Tx, id int64) (Tag, error) {
+	row := tx.QueryRowContext(ctx,
+		`SELECT id, label, aliases, source, 0 FROM tags WHERE id = ?`,
+		id)
+	return scanTag(row)
+}
+
+func hasManualTagsTx(ctx context.Context, tx *sql.Tx, videoID string) bool {
+	var manual int
+	err := tx.QueryRowContext(ctx, `SELECT COALESCE(tags_manual, 0) FROM videos WHERE id = ?`, videoID).Scan(&manual)
+	return err == nil && manual == 1
+}
+
+func syncVideoTagsJSONTx(ctx context.Context, tx *sql.Tx, videoID string, manual bool) error {
+	rows, err := tx.QueryContext(ctx, `
+SELECT t.label
+FROM video_tags vt
+JOIN tags t ON t.id = vt.tag_id
+WHERE vt.video_id = ?
+ORDER BY t.id ASC`, videoID)
+	if err != nil {
+		return err
+	}
+	var labels []string
+	for rows.Next() {
+		var label string
+		if err := rows.Scan(&label); err != nil {
+			rows.Close()
+			return err
+		}
+		labels = append(labels, label)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	labelsJSON, _ := json.Marshal(labels)
+	manualValue := 0
+	if manual {
+		manualValue = 1
+	}
+	_, err = tx.ExecContext(ctx,
+		`UPDATE videos SET tags = ?, tags_manual = ?, updated_at = ? WHERE id = ?`,
+		string(labelsJSON), manualValue, time.Now().UnixMilli(), videoID)
+	return err
 }
 
 type tagRowScanner interface {

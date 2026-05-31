@@ -25,6 +25,7 @@ import (
 	"github.com/video-site/backend/internal/catalog"
 	"github.com/video-site/backend/internal/config"
 	"github.com/video-site/backend/internal/drives"
+	"github.com/video-site/backend/internal/drives/googledrive"
 	"github.com/video-site/backend/internal/drives/localupload"
 	"github.com/video-site/backend/internal/drives/onedrive"
 	"github.com/video-site/backend/internal/drives/p115"
@@ -69,6 +70,7 @@ func main() {
 		registry:           proxy.NewRegistry(),
 		workers:            make(map[string]*preview.Worker),
 		thumbWorkers:       make(map[string]*preview.ThumbWorker),
+		hlsWorkers:         make(map[string]*preview.HLSWorker),
 		fingerprintWorkers: make(map[string]*fingerprint.Worker),
 		spider91Crawlers:   make(map[string]*spider91.Crawler),
 	}
@@ -77,6 +79,7 @@ func main() {
 		Catalog:          cat,
 		Registry:         app.registry,
 		GetTargetDriveID: func() string { return app.Spider91UploadDriveID() },
+		KeepLatestN:      -1,
 	})
 
 	// 初始化现有 drives
@@ -97,6 +100,11 @@ func main() {
 		if err := app.attachDrive(ctx, d); err != nil {
 			log.Printf("[drive %s] attach failed: %v", d.ID, err)
 		}
+	}
+	if removed, err := cat.DeleteVideosForMissingDrives(ctx, []string{localupload.DriveID}); err != nil {
+		log.Printf("[catalog] cleanup missing-drive videos failed: %v", err)
+	} else if removed > 0 {
+		log.Printf("[catalog] removed %d videos for deleted drives", removed)
 	}
 
 	authr := &auth.Authenticator{
@@ -168,13 +176,16 @@ func main() {
 			_, isSpider91 := app.spider91Crawlers[driveID]
 			app.mu.Unlock()
 			if isSpider91 {
-				go app.runSpider91Crawl(ctx, driveID)
+				go app.runSpider91CrawlAndMigrate(ctx, "manual", []string{driveID})
 				return
 			}
 			app.scheduleScan(ctx, driveID)
 		},
 		OnRegenPreview: func(videoID string) {
 			go app.regenPreview(ctx, videoID)
+		},
+		OnGenerateHLS: func(videoID string) {
+			go app.generateHLS(ctx, videoID)
 		},
 		OnRegenAllPreviews: func() {
 			go app.regenAllPreviews(ctx)
@@ -213,6 +224,17 @@ func main() {
 				app.nightlyRunner.TriggerNow()
 			}
 		},
+		OnRunSpider91Migration: func() error {
+			if app.Spider91UploadDriveID() == "" {
+				return errors.New("请先在 91 爬虫配置里选择视频自动上传目标")
+			}
+			go func() {
+				if err := app.runSpider91Migration(ctx); err != nil {
+					log.Printf("[spider91migrate] manual migrate failed: %v", err)
+				}
+			}()
+			return nil
+		},
 		ListDriveDirChildren: func(reqCtx context.Context, driveID, parentID string) ([]api.DriveDirEntry, error) {
 			return app.listDriveDirChildren(reqCtx, driveID, parentID)
 		},
@@ -244,10 +266,11 @@ func main() {
 		ListSpider91Drives:    app.listSpider91DriveIDs,
 		RunSpider91Crawl:      app.runSpider91Crawl,
 		WaitPreviewQueuesIdle: app.waitAllPreviewQueuesIdle,
-		RunMigration:          app.spider91Migrator.RunOnce,
+		RunMigration:          app.runSpider91Migration,
 		RunDedupeAssetCleanup: app.cleanupDuplicateVideoAssets,
 	})
 	go app.nightlyRunner.Run(ctx)
+	app.startSpider91IntervalCrawl(ctx, cfg.Spider91.CrawlInterval)
 
 	srv := &http.Server{
 		Addr:    cfg.Server.Listen,
@@ -281,6 +304,7 @@ type App struct {
 	mu                 sync.Mutex
 	workers            map[string]*preview.Worker
 	thumbWorkers       map[string]*preview.ThumbWorker
+	hlsWorkers         map[string]*preview.HLSWorker
 	fingerprintWorkers map[string]*fingerprint.Worker
 	cancels            map[string]context.CancelFunc
 	// spider91Crawlers 按 driveID 索引，每个 spider91 drive 独立一个 Crawler
@@ -289,11 +313,15 @@ type App struct {
 	// 全站主题（"dark" | "pink"），从 DB 读
 	theme string
 	// 显式指定的 spider91 上传目标 drive ID。
-	// 空字符串表示本地保存不上传，不再自动挑选 pikpak/p115 drive。
+	// 空字符串表示本地保存不上传，不再自动挑选上传目标 drive。
 	spider91UploadDriveID string
 
-	// spider91Migrator 周期把 spider91 视频上传到目标 drive（PikPak 或 115）。
+	// spider91Migrator 周期把 spider91 视频上传到目标 drive。
 	spider91Migrator *spider91migrate.Migrator
+	// spider91CrawlMu 串行化手动抓取和独立间隔抓取，避免同一批视频重复下载。
+	spider91CrawlMu sync.Mutex
+	// spider91MigrateMu 串行化手动抓取、手动迁移和 nightly 的迁移阶段。
+	spider91MigrateMu sync.Mutex
 
 	// nightlyRunner 是凌晨流水线调度器：每天 cron_hour 串行跑扫盘 → 91 爬虫 → 迁移。
 	// 也响应 admin 「扫描所有网盘」按钮（TriggerNow）。
@@ -378,7 +406,7 @@ func (a *App) loadTheme(ctx context.Context) {
 }
 
 // Spider91UploadDriveID 返回当前配置的 spider91 上传目标 drive ID。
-// 空字符串表示本地保存不上传；只有管理员显式选择 pikpak/p115 drive 时才迁移上传。
+// 空字符串表示本地保存不上传；只有管理员显式选择支持上传的云盘时才迁移上传。
 func (a *App) Spider91UploadDriveID() string {
 	a.mu.Lock()
 	explicit := a.spider91UploadDriveID
@@ -395,7 +423,7 @@ func (a *App) Spider91UploadDriveID() string {
 
 // SetSpider91UploadDriveID 设置 spider91 上传目标 drive ID 并持久化。
 // 接受空字符串（本地保存不上传）。
-// 设置一个不存在或 kind 不是 pikpak / p115 的 drive 会返回错误。
+// 设置一个不存在或 kind 不是 pikpak / p115 / googledrive 的 drive 会返回错误。
 func (a *App) SetSpider91UploadDriveID(ctx context.Context, driveID string) error {
 	driveID = strings.TrimSpace(driveID)
 	if driveID != "" {
@@ -404,7 +432,7 @@ func (a *App) SetSpider91UploadDriveID(ctx context.Context, driveID string) erro
 			return fmt.Errorf("drive %q not found", driveID)
 		}
 		if !isSpider91UploadKind(d.Kind()) {
-			return fmt.Errorf("drive %q kind=%s, only pikpak or p115 can be spider91 upload target", driveID, d.Kind())
+			return fmt.Errorf("drive %q kind=%s, only pikpak, p115 or googledrive can be spider91 upload target", driveID, d.Kind())
 		}
 	}
 	a.mu.Lock()
@@ -416,7 +444,7 @@ func (a *App) SetSpider91UploadDriveID(ctx context.Context, driveID string) erro
 // isSpider91UploadKind 是 spider91 迁移目标盘的 allowlist。
 // 与 spider91migrate.adaptUploadTarget 的支持范围保持一致。
 func isSpider91UploadKind(kind string) bool {
-	return kind == "pikpak" || kind == "p115"
+	return kind == "pikpak" || kind == "p115" || kind == "googledrive"
 }
 
 // loadSpider91UploadDriveID 从 DB 读上传目标 drive ID 设置；不存在时使用空串。
@@ -441,9 +469,17 @@ func (a *App) driveGenerationStatuses() map[string]api.DriveGenerationStatuses {
 	for id, worker := range a.thumbWorkers {
 		thumbWorkers[id] = worker
 	}
+	hlsWorkers := make(map[string]*preview.HLSWorker, len(a.hlsWorkers))
+	for id, worker := range a.hlsWorkers {
+		hlsWorkers[id] = worker
+	}
+	fingerprintWorkers := make(map[string]*fingerprint.Worker, len(a.fingerprintWorkers))
+	for id, worker := range a.fingerprintWorkers {
+		fingerprintWorkers[id] = worker
+	}
 	a.mu.Unlock()
 
-	out := make(map[string]api.DriveGenerationStatuses, len(previewWorkers)+len(thumbWorkers))
+	out := make(map[string]api.DriveGenerationStatuses, len(previewWorkers)+len(thumbWorkers)+len(hlsWorkers)+len(fingerprintWorkers))
 	for id, worker := range previewWorkers {
 		status := out[id]
 		status.Preview = generationStatusFromPreview(worker.Status())
@@ -454,7 +490,7 @@ func (a *App) driveGenerationStatuses() map[string]api.DriveGenerationStatuses {
 		status.Thumbnail = generationStatusFromPreview(worker.Status())
 		missing, err := a.cat.CountVideosNeedingThumbnail(context.Background(), id)
 		if err != nil {
-			log.Printf("[thumb] count missing thumbnails %s: %v", id, err)
+			log.Printf("[thumb] count thumbnail work %s: %v", id, err)
 		} else {
 			status.Thumbnail.QueueLength = missing
 			if missing > 0 && status.Thumbnail.State == "idle" {
@@ -463,10 +499,45 @@ func (a *App) driveGenerationStatuses() map[string]api.DriveGenerationStatuses {
 		}
 		out[id] = status
 	}
+	for id, worker := range fingerprintWorkers {
+		status := out[id]
+		status.Fingerprint = generationStatusFromFingerprint(worker.Status())
+		pending, err := a.cat.CountVideosNeedingFingerprint(context.Background(), id)
+		if err != nil {
+			log.Printf("[fingerprint] count pending fingerprints %s: %v", id, err)
+		} else {
+			status.Fingerprint.QueueLength = pending
+			if pending > 0 && status.Fingerprint.State == "idle" {
+				status.Fingerprint.State = "queued"
+			}
+		}
+		out[id] = status
+	}
+	for id, worker := range hlsWorkers {
+		status := out[id]
+		status.HLS = generationStatusFromPreview(worker.Status())
+		out[id] = status
+	}
 	return out
 }
 
 func generationStatusFromPreview(status preview.TaskStatus) api.GenerationStatus {
+	state := status.State
+	if state == "" {
+		state = "idle"
+	}
+	out := api.GenerationStatus{
+		State:        state,
+		CurrentTitle: status.CurrentTitle,
+		QueueLength:  status.QueueLength,
+	}
+	if !status.CooldownUntil.IsZero() {
+		out.CooldownUntil = status.CooldownUntil.Format(time.RFC3339)
+	}
+	return out
+}
+
+func generationStatusFromFingerprint(status fingerprint.TaskStatus) api.GenerationStatus {
 	state := status.State
 	if state == "" {
 		state = "idle"
@@ -553,6 +624,27 @@ func (a *App) attachDrive(ctx context.Context, d *catalog.Drive) error {
 				_ = a.cat.UpsertDrive(ctx, d)
 			},
 		})
+	case googledrive.Kind:
+		drv = googledrive.New(googledrive.Config{
+			ID:           d.ID,
+			RootID:       d.RootID,
+			ClientID:     d.Credentials["client_id"],
+			ClientSecret: d.Credentials["client_secret"],
+			AccessToken:  d.Credentials["access_token"],
+			RefreshToken: d.Credentials["refresh_token"],
+			TokenURL:     d.Credentials["token_url"],
+			APIBaseURL:   d.Credentials["api_base_url"],
+			OnTokenUpdate: func(access, refresh string) {
+				if d.Credentials == nil {
+					d.Credentials = make(map[string]string)
+				}
+				d.Credentials["access_token"] = access
+				if refresh != "" {
+					d.Credentials["refresh_token"] = refresh
+				}
+				_ = a.cat.UpsertDrive(ctx, d)
+			},
+		})
 	case spider91.Kind:
 		drv = spider91.New(spider91.Config{
 			ID:      d.ID,
@@ -586,14 +678,16 @@ func (a *App) attachDrive(ctx context.Context, d *catalog.Drive) error {
 	})
 	worker := preview.NewWorker(gen, a.cat, drv)
 	thumbWorker := preview.NewThumbWorker(gen, a.cat, drv)
-	fingerprintWorker := fingerprint.NewWorker(a.cat, drv, fingerprint.Config{})
+	hlsWorker := preview.NewHLSWorker(gen, a.cat, drv)
+	fingerprintWorker := fingerprint.NewWorker(a.cat, drv, fingerprintConfigForDrive(drv))
 
 	workerCtx, cancel := context.WithCancel(ctx)
 	go worker.Run(workerCtx)
 	go thumbWorker.Run(workerCtx)
+	go hlsWorker.Run(workerCtx)
 	go fingerprintWorker.Run(workerCtx)
 
-	a.registerPreviewWorkers(ctx, d.ID, worker, thumbWorker, fingerprintWorker, cancel)
+	a.registerPreviewWorkers(ctx, d.ID, worker, thumbWorker, hlsWorker, fingerprintWorker, cancel)
 
 	// spider91 driver 还需要一个 crawler，挂在专用 map 里供 crawlerLoop 调用
 	if sd, ok := drv.(*spider91.Driver); ok {
@@ -620,19 +714,35 @@ func (a *App) attachLocalUpload(ctx context.Context) error {
 	})
 	worker := preview.NewWorker(gen, a.cat, drv)
 	thumbWorker := preview.NewThumbWorker(gen, a.cat, drv)
-	fingerprintWorker := fingerprint.NewWorker(a.cat, drv, fingerprint.Config{})
+	hlsWorker := preview.NewHLSWorker(gen, a.cat, drv)
+	fingerprintWorker := fingerprint.NewWorker(a.cat, drv, fingerprintConfigForDrive(drv))
 
 	workerCtx, cancel := context.WithCancel(ctx)
 	go worker.Run(workerCtx)
 	go thumbWorker.Run(workerCtx)
+	go hlsWorker.Run(workerCtx)
 	go fingerprintWorker.Run(workerCtx)
 
-	a.registerPreviewWorkers(ctx, drv.ID(), worker, thumbWorker, fingerprintWorker, cancel)
+	a.registerPreviewWorkers(ctx, drv.ID(), worker, thumbWorker, hlsWorker, fingerprintWorker, cancel)
 	return nil
 }
 
 func (a *App) localUploadDir() string {
 	return filepath.Join(filepath.Dir(a.cfg.Storage.LocalPreviewDir), "uploads")
+}
+
+func fingerprintConfigForDrive(drv drives.Drive) fingerprint.Config {
+	cfg := fingerprint.Config{RateLimitCooldown: 5 * time.Minute}
+	if drv == nil {
+		return cfg
+	}
+	switch strings.ToLower(drv.Kind()) {
+	case "p115", "onedrive":
+		cfg.RateLimitCooldown = 10 * time.Minute
+	case "pikpak":
+		cfg.RateLimitCooldown = 5 * time.Minute
+	}
+	return cfg
 }
 
 // spider91RootDir 是所有 spider91 drive 共享的根目录。
@@ -719,7 +829,7 @@ func (a *App) attachSpider91Crawler(d *catalog.Drive, drv *spider91.Driver) {
 	}()
 }
 
-func (a *App) registerPreviewWorkers(ctx context.Context, driveID string, worker *preview.Worker, thumbWorker *preview.ThumbWorker, fingerprintWorker *fingerprint.Worker, cancel context.CancelFunc) {
+func (a *App) registerPreviewWorkers(ctx context.Context, driveID string, worker *preview.Worker, thumbWorker *preview.ThumbWorker, hlsWorker *preview.HLSWorker, fingerprintWorker *fingerprint.Worker, cancel context.CancelFunc) {
 	a.mu.Lock()
 	if a.cancels == nil {
 		a.cancels = make(map[string]context.CancelFunc)
@@ -729,6 +839,9 @@ func (a *App) registerPreviewWorkers(ctx context.Context, driveID string, worker
 	}
 	if a.thumbWorkers == nil {
 		a.thumbWorkers = make(map[string]*preview.ThumbWorker)
+	}
+	if a.hlsWorkers == nil {
+		a.hlsWorkers = make(map[string]*preview.HLSWorker)
 	}
 	if a.fingerprintWorkers == nil {
 		a.fingerprintWorkers = make(map[string]*fingerprint.Worker)
@@ -745,6 +858,11 @@ func (a *App) registerPreviewWorkers(ctx context.Context, driveID string, worker
 		a.thumbWorkers[driveID] = thumbWorker
 	} else {
 		delete(a.thumbWorkers, driveID)
+	}
+	if hlsWorker != nil {
+		a.hlsWorkers[driveID] = hlsWorker
+	} else {
+		delete(a.hlsWorkers, driveID)
 	}
 	if fingerprintWorker != nil {
 		a.fingerprintWorkers[driveID] = fingerprintWorker
@@ -775,21 +893,42 @@ func (a *App) registerPreviewWorkers(ctx context.Context, driveID string, worker
 }
 
 func (a *App) enqueuePending(ctx context.Context, driveID string, w *preview.Worker) {
-	pending, err := a.cat.ListVideosByPreviewStatus(ctx, driveID, "pending", 0)
+	pending, err := a.listVideosByPreviewStatuses(ctx, driveID, "pending", "skipped")
 	if err != nil {
-		log.Printf("[preview] list pending %s: %v", driveID, err)
+		log.Printf("[preview] list pending/skipped %s: %v", driveID, err)
 		return
 	}
 	if len(pending) == 0 {
 		return
 	}
-	log.Printf("[preview] enqueue %d pending videos for drive=%s", len(pending), driveID)
+	log.Printf("[preview] enqueue %d pending/skipped videos for drive=%s", len(pending), driveID)
 	for _, v := range pending {
+		if v.PreviewStatus == "skipped" {
+			if err := a.cat.UpdatePreview(ctx, v.ID, "", "pending"); err != nil {
+				log.Printf("[preview] reset skipped video %s drive=%s: %v", v.ID, driveID, err)
+				continue
+			}
+			v.PreviewFileID = ""
+			v.PreviewLocal = ""
+			v.PreviewStatus = "pending"
+		}
 		if !w.EnqueueBlocking(ctx, v) {
-			log.Printf("[preview] enqueue pending canceled for drive=%s", driveID)
+			log.Printf("[preview] enqueue pending/skipped canceled for drive=%s", driveID)
 			return
 		}
 	}
+}
+
+func (a *App) listVideosByPreviewStatuses(ctx context.Context, driveID string, statuses ...string) ([]*catalog.Video, error) {
+	var out []*catalog.Video
+	for _, status := range statuses {
+		items, err := a.cat.ListVideosByPreviewStatus(ctx, driveID, status, 0)
+		if err != nil {
+			return nil, fmt.Errorf("list %s videos: %w", status, err)
+		}
+		out = append(out, items...)
+	}
+	return out, nil
 }
 
 func (a *App) enqueueDriveGeneration(ctx context.Context, driveID string, worker *preview.Worker, thumbWorker *preview.ThumbWorker) {
@@ -813,7 +952,7 @@ func (a *App) waitForThumbnailsBeforePreview(ctx context.Context, driveID string
 	for {
 		missing, err := a.cat.CountVideosNeedingThumbnail(ctx, driveID)
 		if err != nil {
-			log.Printf("[preview] count missing thumbnails drive=%s: %v", driveID, err)
+			log.Printf("[preview] count thumbnail work drive=%s: %v", driveID, err)
 			return false
 		}
 		if missing == 0 {
@@ -821,7 +960,7 @@ func (a *App) waitForThumbnailsBeforePreview(ctx context.Context, driveID string
 		}
 		now := time.Now()
 		if lastLog.IsZero() || now.Sub(lastLog) >= time.Minute {
-			log.Printf("[preview] drive=%s waiting for %d thumbnails before teaser generation", driveID, missing)
+			log.Printf("[preview] drive=%s waiting for %d thumbnail/duration tasks before teaser generation", driveID, missing)
 			lastLog = now
 		}
 		timer := time.NewTimer(pollInterval)
@@ -843,10 +982,10 @@ func (a *App) enqueueThumbnails(ctx context.Context, driveID string, w *preview.
 	if len(pending) == 0 {
 		return
 	}
-	log.Printf("[thumb] enqueue %d missing thumbnails for drive=%s", len(pending), driveID)
+	log.Printf("[thumb] enqueue %d thumbnail/duration tasks for drive=%s", len(pending), driveID)
 	for _, v := range pending {
 		if !w.EnqueueBlocking(ctx, v) {
-			log.Printf("[thumb] enqueue missing thumbnails canceled for drive=%s", driveID)
+			log.Printf("[thumb] enqueue thumbnail/duration tasks canceled for drive=%s", driveID)
 			return
 		}
 	}
@@ -882,6 +1021,7 @@ func (a *App) detachDrive(id string) {
 	}
 	delete(a.workers, id)
 	delete(a.thumbWorkers, id)
+	delete(a.hlsWorkers, id)
 	delete(a.fingerprintWorkers, id)
 	delete(a.spider91Crawlers, id)
 	a.mu.Unlock()
@@ -998,14 +1138,15 @@ func (a *App) runScan(ctx context.Context, driveID string) {
 		}
 	}
 
-	// 使用 drive 的 scan_root_id，否则 root_id；同时把 admin 配置的 SkipDirIDs
-	// 传给 scanner（命中即不递归）。
+	// 使用 drive 的 scan_root_id，否则 root_id；scan_dir_ids 非空时只扫描这些目录。
+	// skip_dir_ids 是旧版兼容配置，只在没有 scan_dir_ids 时生效。
 	d, err := a.cat.GetDrive(ctx, driveID)
 	if err != nil {
 		log.Printf("[scan] get drive %s: %v", driveID, err)
 		return
 	}
 	sc := scanner.New(a.cat, drv, a.cfg.Scanner.VideoExtensions, d.SkipDirIDs, onNew)
+	sc.SetScanDirIDs(d.ScanDirIDs)
 	sc.MinFileSizeBytes = d.MinScanFileSizeBytes
 	sc.SkipFileNameKeywords = d.SkipFileNameKeywords
 
@@ -1017,7 +1158,7 @@ func (a *App) runScan(ctx context.Context, driveID string) {
 		startID = drv.RootID()
 	}
 
-	log.Printf("[scan] drive=%s start=%s skip_dirs=%d min_size=%d skip_keywords=%d", driveID, startID, len(d.SkipDirIDs), d.MinScanFileSizeBytes, len(d.SkipFileNameKeywords))
+	log.Printf("[scan] drive=%s start=%s scan_dirs=%d legacy_skip_dirs=%d min_size=%d skip_keywords=%d", driveID, startID, len(d.ScanDirIDs), len(d.SkipDirIDs), d.MinScanFileSizeBytes, len(d.SkipFileNameKeywords))
 	stats, err := sc.Run(ctx, startID)
 	if err != nil {
 		log.Printf("[scan] drive=%s error: %v", driveID, err)
@@ -1035,7 +1176,8 @@ func (a *App) runScan(ctx context.Context, driveID string) {
 		if stats.Errors > 0 {
 			log.Printf("[cleanup] skip stale cleanup for drive=%s kind=%s: scan had %d directory errors", driveID, drv.Kind(), stats.Errors)
 		} else {
-			removed, err := a.cleanupMissingDriveVideos(ctx, driveID, stats.SeenFileIDs, stats.VisitedDirIDs, startID == drv.RootID())
+			fullDriveScan := startID == drv.RootID() || len(d.ScanDirIDs) > 0
+			removed, err := a.cleanupMissingDriveVideos(ctx, driveID, stats.SeenFileIDs, stats.VisitedDirIDs, fullDriveScan)
 			if err != nil {
 				log.Printf("[cleanup] stale cleanup drive=%s kind=%s error: %v", driveID, drv.Kind(), err)
 			} else if removed > 0 {
@@ -1070,6 +1212,7 @@ func (a *App) previewDriveCleanup(ctx context.Context, driveID string) (api.Driv
 	}
 
 	sc := scanner.New(a.cat, drv, a.cfg.Scanner.VideoExtensions, d.SkipDirIDs, nil)
+	sc.SetScanDirIDs(d.ScanDirIDs)
 	sc.MinFileSizeBytes = d.MinScanFileSizeBytes
 	sc.SkipFileNameKeywords = d.SkipFileNameKeywords
 	sc.DryRun = true
@@ -1086,7 +1229,7 @@ func (a *App) previewDriveCleanup(ctx context.Context, driveID string) (api.Driv
 	if err != nil {
 		return out, err
 	}
-	fullDriveScan := startID == drv.RootID()
+	fullDriveScan := startID == drv.RootID() || len(d.ScanDirIDs) > 0
 	out.Scanned = stats.Scanned
 	out.Errors = stats.Errors
 	out.FullDriveScan = fullDriveScan
@@ -1386,6 +1529,24 @@ func (a *App) regenPreview(ctx context.Context, videoID string) {
 	}
 }
 
+func (a *App) generateHLS(ctx context.Context, videoID string) {
+	v, err := a.cat.GetVideo(ctx, videoID)
+	if err != nil {
+		log.Printf("[hls] get video for generate: %v", err)
+		return
+	}
+	a.mu.Lock()
+	worker := a.hlsWorkers[v.DriveID]
+	a.mu.Unlock()
+	if worker == nil {
+		log.Printf("[hls] generate skipped drive=%s: worker not found", v.DriveID)
+		return
+	}
+	if !worker.EnqueueBlocking(ctx, v) {
+		log.Printf("[hls] enqueue canceled drive=%s", v.DriveID)
+	}
+}
+
 func (a *App) regenAllPreviews(ctx context.Context) {
 	items, total, err := a.cat.ListVideos(ctx, catalog.ListParams{Page: 1, PageSize: 1000000})
 	if err != nil {
@@ -1415,9 +1576,9 @@ func (a *App) regenAllPreviews(ctx context.Context) {
 }
 
 func (a *App) regenFailedPreviews(ctx context.Context, driveID string) {
-	items, err := a.cat.ListVideosByPreviewStatus(ctx, driveID, "failed", 0)
+	items, err := a.listVideosByPreviewStatuses(ctx, driveID, "failed", "skipped")
 	if err != nil {
-		log.Printf("[preview] list failed videos for regen drive=%s: %v", driveID, err)
+		log.Printf("[preview] list failed/skipped videos for regen drive=%s: %v", driveID, err)
 		return
 	}
 	a.mu.Lock()
@@ -1427,27 +1588,27 @@ func (a *App) regenFailedPreviews(ctx context.Context, driveID string) {
 		log.Printf("[preview] regen failed drive=%s skipped: worker not found", driveID)
 		return
 	}
-	log.Printf("[preview] enqueue failed videos for regen drive=%s count=%d", driveID, len(items))
+	log.Printf("[preview] enqueue failed/skipped videos for regen drive=%s count=%d", driveID, len(items))
 	queued := 0
 	for _, v := range items {
 		if err := ctx.Err(); err != nil {
-			log.Printf("[preview] enqueue failed canceled drive=%s queued=%d: %v", driveID, queued, err)
+			log.Printf("[preview] enqueue failed/skipped canceled drive=%s queued=%d: %v", driveID, queued, err)
 			return
 		}
 		if err := a.cat.UpdatePreview(ctx, v.ID, "", "pending"); err != nil {
-			log.Printf("[preview] reset failed video %s drive=%s: %v", v.ID, driveID, err)
+			log.Printf("[preview] reset failed/skipped video %s drive=%s: %v", v.ID, driveID, err)
 			continue
 		}
 		v.PreviewFileID = ""
 		v.PreviewLocal = ""
 		v.PreviewStatus = "pending"
 		if !worker.EnqueueBlocking(ctx, v) {
-			log.Printf("[preview] enqueue failed canceled drive=%s queued=%d", driveID, queued)
+			log.Printf("[preview] enqueue failed/skipped canceled drive=%s queued=%d", driveID, queued)
 			return
 		}
 		queued++
 	}
-	log.Printf("[preview] enqueued failed videos for regen drive=%s queued=%d", driveID, queued)
+	log.Printf("[preview] enqueued failed/skipped videos for regen drive=%s queued=%d", driveID, queued)
 }
 
 // regenFailedThumbnails 把某 drive 下 thumbnail_status=failed 的视频全部重置为
@@ -1564,6 +1725,68 @@ func shouldScanDrive(d drives.Drive) bool {
 }
 
 // ---------- spider91 crawl ----------
+
+func (a *App) startSpider91IntervalCrawl(ctx context.Context, interval time.Duration) {
+	if interval <= 0 {
+		return
+	}
+	if interval < time.Minute {
+		log.Printf("[spider91schedule] crawl_interval=%s is too small; using 1m", interval)
+		interval = time.Minute
+	}
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		log.Printf("[spider91schedule] interval runner started; interval=%s", interval)
+		for {
+			select {
+			case <-ctx.Done():
+				log.Printf("[spider91schedule] interval runner stopping: %v", ctx.Err())
+				return
+			case <-ticker.C:
+				ids := a.listSpider91DriveIDs(ctx)
+				a.runSpider91CrawlAndMigrate(ctx, "interval", ids)
+			}
+		}
+	}()
+}
+
+func (a *App) runSpider91CrawlAndMigrate(ctx context.Context, reason string, driveIDs []string) {
+	if len(driveIDs) == 0 {
+		log.Printf("[spider91schedule] %s skipped: no spider91 drive configured", reason)
+		return
+	}
+	a.spider91CrawlMu.Lock()
+	defer a.spider91CrawlMu.Unlock()
+
+	started := time.Now()
+	log.Printf("[spider91schedule] %s start drives=%d", reason, len(driveIDs))
+	if err := a.runSpider91Migration(ctx); err != nil {
+		log.Printf("[spider91migrate] %s pre-crawl migrate failed: %v", reason, err)
+	}
+	for _, driveID := range driveIDs {
+		if err := ctx.Err(); err != nil {
+			log.Printf("[spider91schedule] %s aborted before crawl drive=%s: %v", reason, driveID, err)
+			return
+		}
+		a.runSpider91Crawl(ctx, driveID)
+	}
+	log.Printf("[spider91schedule] %s waiting for preview queues to drain", reason)
+	if err := a.waitAllPreviewQueuesIdle(ctx); err != nil {
+		log.Printf("[spider91schedule] %s wait preview queues: %v", reason, err)
+		return
+	}
+	if err := a.runSpider91Migration(ctx); err != nil {
+		log.Printf("[spider91migrate] %s post-crawl migrate failed: %v", reason, err)
+	}
+	log.Printf("[spider91schedule] %s finish; took=%s", reason, time.Since(started).Round(time.Second))
+}
+
+func (a *App) runSpider91Migration(ctx context.Context) error {
+	a.spider91MigrateMu.Lock()
+	defer a.spider91MigrateMu.Unlock()
+	return a.spider91Migrator.RunOnce(ctx)
+}
 
 // runSpider91Crawl 运行一次完整爬取流程并把 last_crawl_at 写回 drive.credentials。
 //

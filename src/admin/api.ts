@@ -77,7 +77,7 @@ export function checkUpdate() {
 
 export type AdminDrive = {
   id: string;
-  kind: "quark" | "p115" | "pikpak" | "wopan" | "onedrive" | "spider91";
+  kind: "quark" | "p115" | "pikpak" | "wopan" | "onedrive" | "googledrive" | "spider91";
   name: string;
   rootId: string;
   scanRootId: string;
@@ -87,11 +87,14 @@ export type AdminDrive = {
   /** 当前是否给该盘生成 teaser/封面（per-drive 开关，替代旧的全局 preview.enabled）。 */
   teaserEnabled: boolean;
   /**
-   * 用户在 admin 配置的"扫描跳过目录"集合（drive 侧目录 fileID 列表）。
-   * 命中其中任一目录时 scanner 直接跳过、不递归；空数组 = 不跳过任何目录。
-   * 替代旧版硬编码 p115 "影视" 目录例外分支。
+   * 旧版"扫描跳过目录"集合，保留给旧服务端 / 旧配置兼容。
    */
   skipDirIds: string[];
+  /**
+   * 用户在 admin 配置的"需要扫描目录"集合（drive 侧目录 fileID 列表）。
+   * 非空时只扫描这些目录及其子目录；空数组 = 按扫描起点完整扫描。
+   */
+  scanDirIds: string[];
   /** 扫描入库的最小文件大小阈值。0 表示不按大小过滤。 */
   minScanFileSizeBytes: number;
   /** 扫描时按文件名跳过的视频关键词。命中后不会入库，下次完整扫描会清理既有记录。 */
@@ -100,12 +103,18 @@ export type AdminDrive = {
   lastCrawlAt?: number;
   thumbnailGenerationStatus?: DriveGenerationStatus;
   previewGenerationStatus?: DriveGenerationStatus;
+  hlsGenerationStatus?: DriveGenerationStatus;
+  fingerprintGenerationStatus?: DriveGenerationStatus;
   thumbnailReadyCount: number;
   thumbnailPendingCount: number;
   thumbnailFailedCount: number;
   teaserReadyCount: number;
   teaserPendingCount: number;
   teaserFailedCount: number;
+  teaserSkippedCount: number;
+  fingerprintReadyCount: number;
+  fingerprintPendingCount: number;
+  fingerprintFailedCount: number;
 };
 
 export type DriveGenerationStatus = {
@@ -137,17 +146,20 @@ export function getDriveStorage() {
 
 export type UpsertDriveInput = {
   id: string;
-  kind: "quark" | "p115" | "pikpak" | "wopan" | "onedrive" | "spider91";
+  kind: "quark" | "p115" | "pikpak" | "wopan" | "onedrive" | "googledrive" | "spider91";
   name: string;
   rootId: string;
   scanRootId: string;
   credentials: Record<string, string>;
   /**
-   * 可选：写入"扫描跳过目录"集合。`undefined` 表示不变（沿用服务端旧值），
-   * 空数组 `[]` 表示清空。常见保存路径走 setDriveSkipDirIds 专用接口；
-   * 这里允许同时上传是为了批量编辑场景。
+   * 可选：写入旧版"扫描跳过目录"集合。`undefined` 表示不变（沿用服务端旧值）。
    */
   skipDirIds?: string[];
+  /**
+   * 可选：写入"需要扫描目录"集合。`undefined` 表示不变（沿用服务端旧值），
+   * 空数组 `[]` 表示关闭白名单。
+   */
+  scanDirIds?: string[];
   /** 可选：最小扫描文件大小阈值，单位 bytes。undefined 表示不变。 */
   minScanFileSizeBytes?: number;
   /** 可选：文件名跳过关键词。undefined 表示不变，空数组表示清空。 */
@@ -220,6 +232,20 @@ export function listDriveDirChildren(id: string, parentId?: string) {
 export function setDriveSkipDirIds(id: string, dirIds: string[]) {
   return request<{ ok: boolean; skipDirIds: string[] }>(
     `/drives/${encodeURIComponent(id)}/skip-dirs`,
+    {
+      method: "POST",
+      body: JSON.stringify({ dirIds }),
+    }
+  );
+}
+
+/**
+ * 整体覆盖某盘的"需要扫描目录"集合（drive 侧目录 fileID）。
+ * 传空数组 = 按扫描起点完整扫描。下次扫描时生效，不会立刻重扫。
+ */
+export function setDriveScanDirIds(id: string, dirIds: string[]) {
+  return request<{ ok: boolean; scanDirIds: string[] }>(
+    `/drives/${encodeURIComponent(id)}/scan-dirs`,
     {
       method: "POST",
       body: JSON.stringify({ dirIds }),
@@ -315,6 +341,8 @@ export type AdminVideo = {
   quality: string;
   thumbnailUrl: string;
   previewStatus: string;
+  hlsStatus: string;
+  hlsError?: string;
   views: number;
   favorites: number;
   comments: number;
@@ -333,9 +361,19 @@ export type AdminVideoList = {
   size: number;
 };
 
-export function listVideos(params: { driveId?: string; page?: number; size?: number } = {}) {
+export function listVideos(params: {
+  driveId?: string;
+  keyword?: string;
+  tag?: string;
+  category?: string;
+  page?: number;
+  size?: number;
+} = {}) {
   const qs = new URLSearchParams();
   if (params.driveId) qs.set("driveId", params.driveId);
+  if (params.keyword) qs.set("keyword", params.keyword);
+  if (params.tag) qs.set("tag", params.tag);
+  if (params.category) qs.set("category", params.category);
   if (params.page) qs.set("page", String(params.page));
   if (params.size) qs.set("size", String(params.size));
   const suffix = qs.toString() ? `?${qs.toString()}` : "";
@@ -368,6 +406,26 @@ export function regenPreview(id: string) {
   );
 }
 
+export function generateHls(id: string) {
+  return request<{ ok: boolean }>(
+    `/videos/${encodeURIComponent(id)}/hls`,
+    { method: "POST" }
+  );
+}
+
+export type BulkVideoTagMode = "add" | "remove" | "replace";
+
+export function bulkUpdateVideoTags(
+  videoIds: string[],
+  tags: string[],
+  mode: BulkVideoTagMode
+) {
+  return request<{ ok: boolean; updated: number }>("/videos/bulk-tags", {
+    method: "POST",
+    body: JSON.stringify({ videoIds, tags, mode }),
+  });
+}
+
 // ---------- Tags ----------
 
 export type AdminTag = {
@@ -389,6 +447,12 @@ export function createTag(label: string, aliases: string[]) {
   });
 }
 
+export function deleteTag(id: number) {
+  return request<{ ok: boolean; removedVideos: number }>(`/tags/${encodeURIComponent(String(id))}`, {
+    method: "DELETE",
+  });
+}
+
 // ---------- Settings ----------
 
 export type Theme = "dark" | "pink";
@@ -396,9 +460,9 @@ export type Theme = "dark" | "pink";
 export type Settings = {
   theme: Theme;
   /**
-   * spider91 视频迁移到云盘时的目标 drive ID（必须是已挂载的 pikpak 或 p115 drive）。
+   * spider91 视频迁移到云盘时的目标 drive ID（必须是已挂载的 pikpak / p115 / googledrive drive）。
    * - 空字符串：本地保存，不上传到云盘。
-   * - 非空：显式指定。后端会校验 drive 存在且 kind ∈ {pikpak, p115}。
+   * - 非空：显式指定。后端会校验 drive 存在且 kind ∈ {pikpak, p115, googledrive}。
    */
   spider91UploadDriveId: string;
 };
@@ -431,4 +495,11 @@ export function updateSettings(body: Partial<Settings>) {
  */
 export function runNightlyJob() {
   return request<{ ok: boolean }>("/jobs/nightly/run", { method: "POST" });
+}
+
+/**
+ * 只触发 91 本地视频迁移到已配置的上传目标，不重新爬取。
+ */
+export function runSpider91Migration() {
+  return request<{ ok: boolean }>("/jobs/spider91/migrate", { method: "POST" });
 }

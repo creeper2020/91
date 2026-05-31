@@ -80,6 +80,7 @@ export function fetchTags(): Promise<TagItem[]> {
 /** 短视频模式单条记录。比 VideoItem 多 videoSrc / poster。 */
 export type ShortsItem = VideoItem & {
   videoSrc: string;
+  hlsSrc?: string;
   poster: string;
 };
 

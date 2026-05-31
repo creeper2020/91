@@ -13,7 +13,7 @@ import (
 	"github.com/video-site/backend/internal/drives"
 )
 
-func TestThumbWorkerUpdatesThumbnailWithoutChangingPreviewStatus(t *testing.T) {
+func TestThumbWorkerUpdatesThumbnailAndDurationWithoutChangingPreviewStatus(t *testing.T) {
 	ctx := context.Background()
 	cat, video := seedPreviewTestVideo(t, "thumb-worker-video")
 
@@ -33,8 +33,8 @@ func TestThumbWorkerUpdatesThumbnailWithoutChangingPreviewStatus(t *testing.T) {
 	if got.PreviewStatus != "pending" {
 		t.Fatalf("preview status = %q, want pending", got.PreviewStatus)
 	}
-	if got.DurationSeconds != 0 {
-		t.Fatalf("duration = %d, want unchanged", got.DurationSeconds)
+	if got.DurationSeconds != 42 {
+		t.Fatalf("duration = %d, want probed duration", got.DurationSeconds)
 	}
 	if gen.thumbnailVideoID != video.ID {
 		t.Fatalf("thumbnail video id = %q, want %q", gen.thumbnailVideoID, video.ID)
@@ -42,8 +42,8 @@ func TestThumbWorkerUpdatesThumbnailWithoutChangingPreviewStatus(t *testing.T) {
 	if gen.thumbnailDuration != 0 {
 		t.Fatalf("thumbnail duration = %.1f, want fixed-offset thumbnail generation", gen.thumbnailDuration)
 	}
-	if gen.probeCalls != 0 {
-		t.Fatalf("probe calls = %d, want 0 for thumbnail generation", gen.probeCalls)
+	if gen.probeCalls != 1 {
+		t.Fatalf("probe calls = %d, want duration probe before thumbnail generation", gen.probeCalls)
 	}
 	if drv.streamFileID != video.FileID {
 		t.Fatalf("stream file id = %q, want %q", drv.streamFileID, video.FileID)
@@ -241,10 +241,10 @@ func TestPreviewWorkerNeverCallsDriveUploadOrEnsureDir(t *testing.T) {
 	}
 }
 
-func TestPreviewWorkerSkipsTeaserForVideoLargerThanFiveGiB(t *testing.T) {
+func TestPreviewWorkerGeneratesTeaserForVideoLargerThanFiveGiB(t *testing.T) {
 	ctx := context.Background()
 	cat, video := seedPreviewTestVideo(t, "preview-large-video")
-	video.Size = maxPreviewTeaserSizeBytes + 1
+	video.Size = 6 * 1024 * 1024 * 1024
 	if err := cat.UpsertVideo(ctx, video); err != nil {
 		t.Fatalf("update video: %v", err)
 	}
@@ -259,24 +259,24 @@ func TestPreviewWorkerSkipsTeaserForVideoLargerThanFiveGiB(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get video: %v", err)
 	}
-	if got.PreviewStatus != previewStatusSkipped {
-		t.Fatalf("preview status = %q, want skipped", got.PreviewStatus)
+	if got.PreviewStatus != "ready" {
+		t.Fatalf("preview status = %q, want ready", got.PreviewStatus)
 	}
-	if got.PreviewLocal != "" {
-		t.Fatalf("preview local = %q, want empty", got.PreviewLocal)
+	if got.PreviewLocal != "/tmp/"+video.ID+".mp4" {
+		t.Fatalf("preview local = %q, want moved teaser path", got.PreviewLocal)
 	}
-	if drv.streamCalls != 0 {
-		t.Fatalf("stream calls = %d, want 0", drv.streamCalls)
+	if drv.streamCalls != 1 {
+		t.Fatalf("stream calls = %d, want 1", drv.streamCalls)
 	}
-	if gen.generateCalls != 0 {
-		t.Fatalf("generate calls = %d, want 0", gen.generateCalls)
+	if gen.generateCalls != 1 {
+		t.Fatalf("generate calls = %d, want 1", gen.generateCalls)
 	}
 }
 
 func TestPreviewWorkerGeneratesTeaserAtFiveGiBBoundary(t *testing.T) {
 	ctx := context.Background()
 	cat, video := seedPreviewTestVideo(t, "preview-five-gib-video")
-	video.Size = maxPreviewTeaserSizeBytes
+	video.Size = 5 * 1024 * 1024 * 1024
 	if err := cat.UpsertVideo(ctx, video); err != nil {
 		t.Fatalf("update video: %v", err)
 	}
@@ -567,7 +567,6 @@ func (d *previewFakeDrive) EnsureDir(context.Context, string) (string, error) {
 	return "", drives.ErrNotSupported
 }
 func (d *previewFakeDrive) RootID() string { return "root" }
-
 
 func TestWorkerWaitIdleReturnsImmediatelyWhenQueueEmpty(t *testing.T) {
 	worker := NewWorker(&fakeTeaserGenerator{}, nil, &previewFakeDrive{})

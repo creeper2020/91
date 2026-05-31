@@ -2,7 +2,7 @@
 
 视频聚合站的 Go 后端。提供三件事：
 
-1. 多家网盘统一抽象（夸克 / 115 / PikPak / 联通沃盘 / OneDrive）
+1. 多家网盘统一抽象（夸克 / 115 / PikPak / 联通沃盘 / OneDrive / Google Drive）
 2. 视频元数据目录（SQLite）+ 扫描 + teaser 预生成
 3. REST API（前台）+ 管理后台 + 直链代理
 4. 标签池、视频隐藏、按网盘统计和详情页来源网盘类型展示能力
@@ -21,6 +21,7 @@ internal/
     pikpak/                 PikPak（自己实现，参考 OpenList pikpak）
     wopan/                  联通沃盘（壳子 + OpenListTeam/wopan-sdk-go）
     onedrive/               OneDrive（OpenList 在线续期 + Microsoft Graph 文件接口）
+    googledrive/            Google Drive（OAuth refresh token + Drive API v3）
   scanner/                  扫目录 → 落库
   preview/                  ffmpeg 抽封面和生成多段 teaser
   proxy/                    /p/stream/*、/p/preview/* 代理
@@ -101,13 +102,14 @@ go run ./cmd/server 后端 9192
 
 各网盘的凭证字段：
 
-| kind   | credentials 字段                                              |
-|--------|---------------------------------------------------------------|
-| quark  | `cookie`                                                      |
-| p115   | `cookie`（形如 `UID=...; CID=...; SEID=...; KID=...`）         |
-| pikpak | `username`、`password`，可选 `refresh_token`、`captcha_token`、`device_id`、`platform`、`disable_media_link` |
-| wopan  | `access_token`、`refresh_token`，可选 `family_id`              |
-| onedrive | `refresh_token` |
+| kind        | credentials 字段                                              |
+|-------------|---------------------------------------------------------------|
+| quark       | `cookie`                                                      |
+| p115        | `cookie`（形如 `UID=...; CID=...; SEID=...; KID=...`）         |
+| pikpak      | `username`、`password`，可选 `refresh_token`、`captcha_token`、`device_id`、`platform`、`disable_media_link` |
+| wopan       | `access_token`、`refresh_token`，可选 `family_id`              |
+| onedrive    | `refresh_token` |
+| googledrive | `client_id`、`client_secret`、`refresh_token`，可选 `access_token` |
 
 ### PikPak 速度说明
 
@@ -116,6 +118,8 @@ go run ./cmd/server 后端 9192
 当前服务器同时存在 sing-box TUN 透明代理，PikPak 默认出站会被 `tun0` 接管；但强制直连物理网卡并没有更快，慢速的主要差异来自 PikPak 取链方式。media/cache CDN 节点仍有波动，偶尔可能遇到慢节点；如果播放变慢，可重新获取直链或重新挂载 PikPak 后再测。
 
 OneDrive 按 OpenList 默认应用方式调用 `https://api.oplist.org/onedrive/renewapi` 在线刷新 token，不需要配置 Azure 应用的 `client_id` / `client_secret` / `redirect_uri`。后台新建 OneDrive 时只需要填 OpenList 代刷得到的 `refresh_token`；服务端会默认挂载根目录并自动回写新 token。
+
+Google Drive 使用 Google OAuth `refresh_token` 自动续期 `access_token`，通过 Drive API v3 列目录和读取视频。Drive 的媒体下载需要 `Authorization`，因此 `/p/stream` 会由后端代理回源，不会把 token 下发给浏览器。`rootId` / `scanRootId` 默认可填 `root`，如果只想扫描某个文件夹，可填该文件夹 ID。
 
 ## 文件名约定
 
@@ -136,7 +140,7 @@ OneDrive 按 OpenList 默认应用方式调用 `https://api.oplist.org/onedrive/
 2. 扫描时优先按网盘侧 `content_hash` 去重；没有 hash 时退化为 `file_name + size_bytes`。
 3. 扫描、爬虫、本地上传或服务启动挂载网盘后，后台指纹 worker 会异步读取视频的少量 Range 片段，生成 `sampled_sha256`。前台列表、首页、搜索、推荐会按 `size_bytes + sampled_sha256` 只展示最早入库的 canonical 视频。
 
-`sampled_sha256` 是文件级去重：适合识别同一个视频文件被复制到 115 / PikPak / OneDrive 等不同网盘的情况。它不会删除任何网盘文件，也不用于识别转码、裁剪、加水印后的同源视频。
+`sampled_sha256` 是文件级去重：适合识别同一个视频文件被复制到 115 / PikPak / OneDrive / Google Drive 等不同网盘的情况。它不会删除任何网盘文件，也不用于识别转码、裁剪、加水印后的同源视频。
 
 封面和 teaser 仍然优先生成，不等待指纹完成。夜间流水线最后会做一次重复资产清理：对 `size_bytes + sampled_sha256` 命中的非 canonical 视频，只删除本机生成的重复封面和 teaser，并把对应字段重置为 `pending`。网盘原文件和视频元数据记录不会被删除；如果 canonical 视频以后被移除，这些重复项会重新进入生成队列。
 

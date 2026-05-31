@@ -132,6 +132,7 @@ export default function VideoDetailPage() {
                 <div className="vd-player">
                   <VideoPlayer
                     src={detail.videoSrc}
+                    hlsSrc={detail.hlsSrc}
                     poster={detail.poster}
                     title={detail.title}
                     onFirstPlay={handleFirstPlay}

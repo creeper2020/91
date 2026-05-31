@@ -18,7 +18,7 @@ import (
 	"github.com/video-site/backend/internal/proxy"
 )
 
-func TestRegisterPreviewWorkerBackfillsPendingWhenDriveTeaserEnabled(t *testing.T) {
+func TestRegisterPreviewWorkerBackfillsPendingAndSkippedWhenDriveTeaserEnabled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -33,18 +33,32 @@ func TestRegisterPreviewWorkerBackfillsPendingWhenDriveTeaserEnabled(t *testing.
 	})
 
 	seedDriveWithTeaser(t, cat, "drive-id", true)
-	video := &catalog.Video{
-		ID:            "video-1",
-		DriveID:       "drive-id",
-		FileID:        "file-id",
-		Title:         "Clip",
-		PreviewStatus: "pending",
-		PublishedAt:   time.Now(),
-		CreatedAt:     time.Now(),
-		UpdatedAt:     time.Now(),
-	}
-	if err := cat.UpsertVideo(ctx, video); err != nil {
-		t.Fatalf("seed video: %v", err)
+	now := time.Now()
+	for _, video := range []*catalog.Video{
+		{
+			ID:            "video-1",
+			DriveID:       "drive-id",
+			FileID:        "file-id",
+			Title:         "Clip",
+			PreviewStatus: "pending",
+			PublishedAt:   now,
+			CreatedAt:     now,
+			UpdatedAt:     now,
+		},
+		{
+			ID:            "video-skipped",
+			DriveID:       "drive-id",
+			FileID:        "file-skipped",
+			Title:         "Skipped Clip",
+			PreviewStatus: "skipped",
+			PublishedAt:   now,
+			CreatedAt:     now,
+			UpdatedAt:     now,
+		},
+	} {
+		if err := cat.UpsertVideo(ctx, video); err != nil {
+			t.Fatalf("seed video %s: %v", video.ID, err)
+		}
 	}
 
 	app := &App{
@@ -55,28 +69,39 @@ func TestRegisterPreviewWorkerBackfillsPendingWhenDriveTeaserEnabled(t *testing.
 	worker := preview.NewWorker(&serverFakeTeaserGenerator{}, cat, &serverFakeDrive{})
 	go worker.Run(ctx)
 
-	app.registerPreviewWorkers(ctx, "drive-id", worker, nil, nil, func() {})
+	app.registerPreviewWorkers(ctx, "drive-id", worker, nil, nil, nil, func() {})
 
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		got, err := cat.GetVideo(ctx, video.ID)
+		first, err := cat.GetVideo(ctx, "video-1")
 		if err != nil {
-			t.Fatalf("get video: %v", err)
+			t.Fatalf("get pending video: %v", err)
 		}
-		if got.PreviewStatus == "ready" {
-			if got.PreviewLocal != "/tmp/video-1.mp4" {
-				t.Fatalf("preview local = %q, want generated local teaser path", got.PreviewLocal)
+		skipped, err := cat.GetVideo(ctx, "video-skipped")
+		if err != nil {
+			t.Fatalf("get skipped video: %v", err)
+		}
+		if first.PreviewStatus == "ready" && skipped.PreviewStatus == "ready" {
+			if first.PreviewLocal != "/tmp/video-1.mp4" {
+				t.Fatalf("pending preview local = %q, want generated local teaser path", first.PreviewLocal)
+			}
+			if skipped.PreviewLocal != "/tmp/video-skipped.mp4" {
+				t.Fatalf("skipped preview local = %q, want generated local teaser path", skipped.PreviewLocal)
 			}
 			return
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
 
-	got, err := cat.GetVideo(ctx, video.ID)
+	first, err := cat.GetVideo(ctx, "video-1")
 	if err != nil {
-		t.Fatalf("get video after timeout: %v", err)
+		t.Fatalf("get pending video after timeout: %v", err)
 	}
-	t.Fatalf("preview status = %q, want ready", got.PreviewStatus)
+	skipped, err := cat.GetVideo(ctx, "video-skipped")
+	if err != nil {
+		t.Fatalf("get skipped video after timeout: %v", err)
+	}
+	t.Fatalf("preview statuses = pending:%q skipped:%q, want ready", first.PreviewStatus, skipped.PreviewStatus)
 }
 
 func TestRegisterPreviewWorkersGenerateThumbnailsBeforePreviews(t *testing.T) {
@@ -119,7 +144,7 @@ func TestRegisterPreviewWorkersGenerateThumbnailsBeforePreviews(t *testing.T) {
 	go worker.Run(ctx)
 	go thumbWorker.Run(ctx)
 
-	app.registerPreviewWorkers(ctx, "drive-id", worker, thumbWorker, nil, func() {})
+	app.registerPreviewWorkers(ctx, "drive-id", worker, thumbWorker, nil, nil, func() {})
 
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
@@ -201,7 +226,7 @@ func TestRegisterPreviewWorkersBackfillsHistoricalFingerprints(t *testing.T) {
 	fingerprintWorker := fingerprint.NewWorker(cat, drv, fingerprint.Config{})
 	go fingerprintWorker.Run(ctx)
 
-	app.registerPreviewWorkers(ctx, "drive-id", nil, nil, fingerprintWorker, func() {})
+	app.registerPreviewWorkers(ctx, "drive-id", nil, nil, nil, fingerprintWorker, func() {})
 
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
@@ -273,7 +298,7 @@ func TestFailedThumbnailsDoNotBlockPreviewGeneration(t *testing.T) {
 	go worker.Run(ctx)
 	go thumbWorker.Run(ctx)
 
-	app.registerPreviewWorkers(ctx, "drive-id", worker, thumbWorker, nil, func() {})
+	app.registerPreviewWorkers(ctx, "drive-id", worker, thumbWorker, nil, nil, func() {})
 
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
@@ -298,7 +323,7 @@ func TestFailedThumbnailsDoNotBlockPreviewGeneration(t *testing.T) {
 	t.Fatalf("preview status = %q, want ready; events=%#v", got.PreviewStatus, gen.Events())
 }
 
-func TestRegenFailedPreviewsQueuesOnlyFailedVideosForDrive(t *testing.T) {
+func TestRegenFailedPreviewsQueuesOnlyFailedAndSkippedVideosForDrive(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -317,8 +342,10 @@ func TestRegenFailedPreviewsQueuesOnlyFailedVideosForDrive(t *testing.T) {
 	now := time.Now()
 	for _, v := range []*catalog.Video{
 		{ID: "target-failed", DriveID: "drive-id", FileID: "file-1", Title: "Target Failed", PreviewStatus: "failed"},
+		{ID: "target-skipped", DriveID: "drive-id", FileID: "file-skipped", Title: "Target Skipped", PreviewStatus: "skipped"},
 		{ID: "target-ready", DriveID: "drive-id", FileID: "file-2", Title: "Target Ready", PreviewStatus: "ready", PreviewLocal: "/tmp/ready.mp4"},
 		{ID: "other-failed", DriveID: "other-drive", FileID: "file-3", Title: "Other Failed", PreviewStatus: "failed"},
+		{ID: "other-skipped", DriveID: "other-drive", FileID: "file-4", Title: "Other Skipped", PreviewStatus: "skipped"},
 	} {
 		v.PublishedAt = now
 		v.CreatedAt = now
@@ -351,7 +378,16 @@ func TestRegenFailedPreviewsQueuesOnlyFailedVideosForDrive(t *testing.T) {
 			if got.PreviewLocal != "/tmp/target-failed.mp4" {
 				t.Fatalf("target preview local = %q, want regenerated local teaser path", got.PreviewLocal)
 			}
-			break
+			skipped, err := cat.GetVideo(ctx, "target-skipped")
+			if err != nil {
+				t.Fatalf("get target skipped: %v", err)
+			}
+			if skipped.PreviewStatus == "ready" {
+				if skipped.PreviewLocal != "/tmp/target-skipped.mp4" {
+					t.Fatalf("skipped preview local = %q, want regenerated local teaser path", skipped.PreviewLocal)
+				}
+				break
+			}
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
@@ -362,6 +398,13 @@ func TestRegenFailedPreviewsQueuesOnlyFailedVideosForDrive(t *testing.T) {
 	}
 	if target.PreviewStatus != "ready" {
 		t.Fatalf("target preview status = %q, want ready", target.PreviewStatus)
+	}
+	skipped, err := cat.GetVideo(ctx, "target-skipped")
+	if err != nil {
+		t.Fatalf("get regenerated skipped target: %v", err)
+	}
+	if skipped.PreviewStatus != "ready" {
+		t.Fatalf("skipped preview status = %q, want ready", skipped.PreviewStatus)
 	}
 	ready, err := cat.GetVideo(ctx, "target-ready")
 	if err != nil {
@@ -376,6 +419,13 @@ func TestRegenFailedPreviewsQueuesOnlyFailedVideosForDrive(t *testing.T) {
 	}
 	if other.PreviewStatus != "failed" {
 		t.Fatalf("other drive preview status = %q, want failed", other.PreviewStatus)
+	}
+	otherSkipped, err := cat.GetVideo(ctx, "other-skipped")
+	if err != nil {
+		t.Fatalf("get other skipped: %v", err)
+	}
+	if otherSkipped.PreviewStatus != "skipped" {
+		t.Fatalf("other drive skipped preview status = %q, want skipped", otherSkipped.PreviewStatus)
 	}
 }
 

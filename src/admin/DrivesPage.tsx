@@ -3,6 +3,7 @@ import {
   ArrowLeft,
   ChevronDown,
   ChevronRight,
+  CloudUpload,
   Download,
   Filter,
   FolderTree,
@@ -28,6 +29,7 @@ const kindLabel: Record<string, string> = {
   pikpak: "PikPak",
   wopan: "联通沃盘",
   onedrive: "OneDrive",
+  googledrive: "Google Drive",
   spider91: "91 爬虫",
 };
 
@@ -79,13 +81,14 @@ export function DrivesPage() {
   const [regenFailedThumbId, setRegenFailedThumbId] = useState("");
   // togglingTeaserId 在请求未返回前禁用按钮，避免连点导致两次切换互相覆盖。
   const [togglingTeaserId, setTogglingTeaserId] = useState("");
+  const [migratingSpider91, setMigratingSpider91] = useState(false);
   const [selectedDriveId, setSelectedDriveId] = useState<string | null>(null);
   const { show } = useToast();
 
-  // 当前系统中可作为 spider91 上传目标的 drive 列表（pikpak ∪ p115）。
+  // 当前系统中可作为 spider91 上传目标的 drive 列表（pikpak ∪ p115 ∪ googledrive）。
   // 用户保存 spider91 drive 时从这里挑一个；空表示本地保存不上传。
   const uploadTargets = useMemo(
-    () => list.filter((d) => d.kind === "pikpak" || d.kind === "p115"),
+    () => list.filter((d) => d.kind === "pikpak" || d.kind === "p115" || d.kind === "googledrive"),
     [list]
   );
 
@@ -222,7 +225,7 @@ export function DrivesPage() {
     try {
       await api.rescan(d.id);
       if (d.kind === "spider91") {
-        show("已触发抓取任务，需要 2-4 分钟，可稍后刷新视频列表查看", "success");
+        show("已触发抓取任务，并会先迁移已有本地视频", "success");
       } else {
         show("已触发扫描，可稍后刷新视频列表查看", "success");
       }
@@ -245,11 +248,23 @@ export function DrivesPage() {
     }
   }
 
+  async function handleRunSpider91Migration() {
+    setMigratingSpider91(true);
+    try {
+      await api.runSpider91Migration();
+      show("已触发 91 视频迁移，可稍后刷新视频列表查看", "success");
+    } catch (e) {
+      show(e instanceof Error ? e.message : "触发迁移失败", "error");
+    } finally {
+      setMigratingSpider91(false);
+    }
+  }
+
   async function handleRegenFailed(d: api.AdminDrive) {
     setRegenFailedId(d.id);
     try {
       await api.regenFailedPreviews(d.id);
-      show("已触发失败 teaser 重新生成", "success");
+      show("已触发失败/跳过 teaser 重新生成", "success");
       refresh();
     } catch (e) {
       show(e instanceof Error ? e.message : "触发失败", "error");
@@ -399,6 +414,11 @@ export function DrivesPage() {
                     </>
                   )}
                 </button>
+                {d.kind === "spider91" && (
+                  <button className="admin-btn" onClick={handleRunSpider91Migration} disabled={migratingSpider91}>
+                    <CloudUpload size={13} /> {migratingSpider91 ? "迁移中..." : "迁移到云盘"}
+                  </button>
+                )}
                 <button className="admin-btn" onClick={() => openEdit(d)}>
                   {d.kind === "spider91" ? "编辑配置" : "编辑配置凭证"}
                 </button>
@@ -411,7 +431,7 @@ export function DrivesPage() {
               </div>
             </div>
 
-            {/* 如果不是爬虫网盘，内嵌显示跳过目录设置 */}
+            {/* 如果不是爬虫网盘，内嵌显示扫描范围设置 */}
             {d.kind !== "spider91" && (
               <>
                 <ScanSizeFilterPanel
@@ -431,13 +451,13 @@ export function DrivesPage() {
                     refreshDriveList();
                   }}
                 />
-                <SkipDirsPanel
+                <ScanDirsPanel
                   drive={d}
                   onSaved={(saved) => {
                     setList((prev) =>
                       prev.map((item) =>
                         item.id === saved.id
-                          ? { ...item, skipDirIds: saved.skipDirIds }
+                          ? { ...item, scanDirIds: saved.scanDirIds }
                           : item
                       )
                     );
@@ -469,49 +489,19 @@ export function DrivesPage() {
                 </div>
               </header>
 
-              <div className="admin-detail-grid">
-                <div className="admin-detail-row">
-                  <span className="admin-detail-label">封面状态</span>
-                  <div className="admin-detail-value">
-                    <GenerationStatusLine label="封面" status={d.thumbnailGenerationStatus} />
-                  </div>
-                </div>
-                <div className="admin-detail-row">
-                  <span className="admin-detail-label">封面数量</span>
-                  <div className="admin-detail-value">
-                    <GenerationCounts
-                      ready={d.thumbnailReadyCount}
-                      pending={d.thumbnailPendingCount}
-                      failed={d.thumbnailFailedCount}
-                    />
-                  </div>
-                </div>
-                <div className="admin-detail-row">
-                  <span className="admin-detail-label">Teaser 状态</span>
-                  <div className="admin-detail-value">
-                    <GenerationStatusLine label="预览" status={d.previewGenerationStatus} />
-                  </div>
-                </div>
-                <div className="admin-detail-row">
-                  <span className="admin-detail-label">Teaser 数量</span>
-                  <div className="admin-detail-value">
-                    <GenerationCounts
-                      ready={d.teaserReadyCount}
-                      pending={d.teaserPendingCount}
-                      failed={d.teaserFailedCount}
-                    />
-                  </div>
-                </div>
-              </div>
+              <GenerationPipeline drive={d} />
 
               <div className="admin-detail-actions">
                 <button
                   className="admin-btn"
-                  disabled={(d.teaserFailedCount ?? 0) <= 0 || regenFailedId === d.id}
+                  disabled={
+                    ((d.teaserFailedCount ?? 0) + (d.teaserSkippedCount ?? 0) <= 0) ||
+                    regenFailedId === d.id
+                  }
                   onClick={() => handleRegenFailed(d)}
                 >
                   <RotateCcw size={13} />
-                  <span>重试失败 Teaser</span>
+                  <span>重试失败/跳过 Teaser</span>
                 </button>
                 <button
                   className="admin-btn"
@@ -607,7 +597,7 @@ export function DrivesPage() {
         <div className="admin-empty">加载中...</div>
       ) : list.length === 0 ? (
         <div className="admin-card admin-empty">
-          还没有配置任何网盘。点击右上角「新建」，选择夸克 / 115 / PikPak / 沃盘 / OneDrive，填入凭证即可。
+          还没有配置任何网盘。点击右上角「新建」，选择夸克 / 115 / PikPak / 沃盘 / OneDrive / Google Drive，填入凭证即可。
         </div>
       ) : (
         <div className="admin-drives-grid">
@@ -638,11 +628,11 @@ export function DrivesPage() {
                   </strong>
                 </div>
                 <div className="admin-drive-card__metric">
-                  <span>Teaser 数 (就绪/失败)</span>
+                  <span>Teaser 数 (就绪/跳过/失败)</span>
                   <strong>
                     {d.teaserReadyCount ?? 0}
                     <span style={{ fontSize: "11px", fontWeight: "normal", color: "var(--text-faint)" }}>
-                      {" "}/ {d.teaserFailedCount ?? 0}
+                      {" "}/ {d.teaserSkippedCount ?? 0} / {d.teaserFailedCount ?? 0}
                     </span>
                   </strong>
                 </div>
@@ -712,14 +702,106 @@ function StorageSummary({ storage }: { storage: api.AdminDriveStorage }) {
   );
 }
 
+function GenerationPipeline({ drive }: { drive: api.AdminDrive }) {
+  return (
+    <div className="admin-generation-pipeline">
+      <GenerationPipelineLane
+        title="封面"
+        statusLabel="封面"
+        status={drive.thumbnailGenerationStatus}
+        ready={drive.thumbnailReadyCount}
+        pending={drive.thumbnailPendingCount}
+        failed={drive.thumbnailFailedCount}
+      />
+      <GenerationPipelineLane
+        title="Teaser"
+        statusLabel="预览"
+        status={drive.previewGenerationStatus}
+        ready={drive.teaserReadyCount}
+        pending={drive.teaserPendingCount}
+        failed={drive.teaserFailedCount}
+        skipped={drive.teaserSkippedCount}
+      />
+      <GenerationPipelineLane
+        title="指纹"
+        statusLabel="指纹"
+        status={drive.fingerprintGenerationStatus}
+        ready={drive.fingerprintReadyCount}
+        pending={drive.fingerprintPendingCount}
+        failed={drive.fingerprintFailedCount}
+      />
+    </div>
+  );
+}
+
+function GenerationPipelineLane({
+  title,
+  statusLabel,
+  status,
+  ready,
+  pending,
+  failed,
+  skipped,
+}: {
+  title: string;
+  statusLabel: string;
+  status?: api.DriveGenerationStatus;
+  ready?: number;
+  pending?: number;
+  failed?: number;
+  skipped?: number;
+}) {
+  const segments = [
+    { key: "ready", label: "就绪", value: ready ?? 0 },
+    { key: "pending", label: "待生成", value: pending ?? 0 },
+    { key: "skipped", label: "跳过", value: skipped ?? 0 },
+    { key: "failed", label: "失败", value: failed ?? 0 },
+  ].filter((segment) => segment.value > 0);
+  const total = segments.reduce((sum, segment) => sum + segment.value, 0);
+
+  return (
+    <section className="admin-generation-pipeline__lane">
+      <div className="admin-generation-pipeline__head">
+        <strong>{title}</strong>
+        <GenerationStatusLine label={statusLabel} status={status} />
+      </div>
+      <div
+        className="admin-generation-pipeline__bar"
+        aria-label={`${title} 生成进度`}
+      >
+        {total > 0 ? (
+          segments.map((segment) => (
+            <span
+              key={segment.key}
+              className={`is-${segment.key}`}
+              style={{ flexGrow: segment.value }}
+              title={`${segment.label} ${segment.value}`}
+            />
+          ))
+        ) : (
+          <span className="is-empty" />
+        )}
+      </div>
+      <GenerationCounts
+        ready={ready}
+        pending={pending}
+        failed={failed}
+        skipped={skipped}
+      />
+    </section>
+  );
+}
+
 function GenerationCounts({
   ready,
   pending,
   failed,
+  skipped,
 }: {
   ready?: number;
   pending?: number;
   failed?: number;
+  skipped?: number;
 }) {
   return (
     <div className="admin-generation-counts">
@@ -729,6 +811,11 @@ function GenerationCounts({
       <span className="admin-drive-teaser__metric is-pending">
         待生成 {pending ?? 0}
       </span>
+      {skipped !== undefined && (
+        <span className="admin-drive-teaser__metric is-skipped">
+          跳过 {skipped ?? 0}
+        </span>
+      )}
       <span className="admin-drive-teaser__metric is-failed">
         失败 {failed ?? 0}
       </span>
@@ -899,6 +986,7 @@ function DriveForm({
           <option value="quark">夸克网盘</option>
           <option value="wopan">联通沃盘</option>
           <option value="onedrive">OneDrive</option>
+          <option value="googledrive">Google Drive</option>
         </select>
       </div>
       {showDirectoryFields && (
@@ -908,7 +996,7 @@ function DriveForm({
             <input
               value={form.rootId}
               onChange={(e) => set("rootId", e.target.value)}
-              placeholder={form.kind === "pikpak" ? "留空表示根目录" : form.kind === "onedrive" ? "root" : "0"}
+              placeholder={form.kind === "pikpak" ? "留空表示根目录" : form.kind === "onedrive" || form.kind === "googledrive" ? "root" : "0"}
             />
           </div>
           <div className="admin-form__row">
@@ -975,9 +1063,9 @@ function DriveForm({
  * Spider91UploadTargetField 是 spider91 drive 表单专属的"上传目标"下拉。
  *
  * 行为：
- *   - 选项 = "本地保存，不上传" + 系统中所有 pikpak/p115 drive
+ *   - 选项 = "本地保存，不上传" + 系统中所有 pikpak/p115/googledrive drive
  *   - value="" 时后端不迁移上传，视频保存在服务器本地
- *   - 没有任何 pikpak/p115 drive 时仍允许选择本地保存
+ *   - 没有任何上传目标 drive 时仍允许选择本地保存
  *   - 该字段写入的是全局 setting `spider91.upload_drive_id`，不是 drive 自己的
  *     credentials —— 所有 spider91 drive 共享同一个上传目标
  */
@@ -1002,7 +1090,7 @@ function Spider91UploadTargetField({
         ))}
       </select>
       <div className="admin-form__help">
-        选择本地保存时，爬取视频只保存在服务器本地；选择 115 网盘或 PikPak 后，较早的视频会上传到该云盘根目录。该设置全局生效。
+        选择本地保存时，爬取视频只保存在服务器本地；选择 115 网盘、PikPak 或 Google Drive 后，爬取完成的本地视频会上传到该云盘根目录。该设置全局生效。
       </div>
     </div>
   );
@@ -1021,8 +1109,10 @@ function credentialHelp(kind: Kind, isEdit: boolean): string {
       return `需要 access_token 和 refresh_token。后续会加扫码/短信登录入口，第一版只能手工粘贴。${note}`;
     case "onedrive":
       return `按 OpenList 默认应用在线挂载，只需要 refresh_token；保存时会自动刷新并保存 token。${note}`;
+    case "googledrive":
+      return `使用 Google OAuth refresh_token 挂载。保存时会自动刷新 access_token，并通过后端代理播放，不会把 token 下发给浏览器。${note}`;
     case "spider91":
-      return "91 爬虫会把定时抓取到的视频和封面先保存到本机，并作为一个视频来源接入站点；它不是外部网盘，不需要填写 Cookie 或目录 ID。后续流水线会把较早的视频上传到你选择的 115 / PikPak 目标盘。";
+      return "91 爬虫会把定时抓取到的视频和封面先保存到本机，并作为一个视频来源接入站点；它不是外部网盘，不需要填写 Cookie 或目录 ID。后续流水线会把较早的视频上传到你选择的 115 / PikPak / Google Drive 目标盘。";
     default:
       return "";
   }
@@ -1129,6 +1219,44 @@ function credentialFields(kind: Kind): Array<{
           required: true,
         },
       ];
+    case "googledrive":
+      return [
+        {
+          key: "client_id",
+          label: "client_id",
+          placeholder: "Google OAuth Client ID",
+          required: true,
+        },
+        {
+          key: "client_secret",
+          label: "client_secret",
+          placeholder: "Google OAuth Client Secret",
+          required: true,
+        },
+        {
+          key: "refresh_token",
+          label: "refresh_token",
+          placeholder: "Google Drive refresh_token",
+          multiline: true,
+          required: true,
+        },
+        {
+          key: "access_token",
+          label: "access_token（可选）",
+          placeholder: "留空会通过 refresh_token 自动刷新",
+          multiline: true,
+        },
+        {
+          key: "token_url",
+          label: "token_url（可选）",
+          placeholder: "https://oauth2.googleapis.com/token",
+        },
+        {
+          key: "api_base_url",
+          label: "api_base_url（可选）",
+          placeholder: "https://www.googleapis.com/drive/v3",
+        },
+      ];
     case "spider91":
       return [];
   }
@@ -1136,7 +1264,7 @@ function credentialFields(kind: Kind): Array<{
 
 function defaultRootId(kind: Kind): string {
   if (kind === "pikpak") return "";
-  if (kind === "onedrive") return "root";
+  if (kind === "onedrive" || kind === "googledrive") return "root";
   if (kind === "spider91") return "/";
   return "0";
 }
@@ -1354,43 +1482,38 @@ function cleanupReasonLabel(item: api.DriveCleanupPreviewItem): string {
 }
 
 
-// ---------- SkipDirsModal ----------
+// ---------- ScanDirsPanel ----------
 //
-// "设置跳过目录"弹窗：
+// "设置需要扫描目录"面板：
 // - 顶部说明 + 已选 chips（点 × 移除）
-// - 树形浏览器，按需展开（每展开一层调一次 listDriveDirChildren），勾选目录加入跳过集合
-// - 底部"保存"调 setDriveSkipDirIds 整体覆盖；"取消"丢弃改动
+// - 树形浏览器，按需展开（每展开一层调一次 listDriveDirChildren），勾选目录加入扫描集合
+// - "保存更改"调 setDriveScanDirIds 整体覆盖
 //
 // 设计取舍：
 // - 不一次性递归整棵树。115 等慢盘列目录有限频，按需展开体验稳定也避免风控
-// - 选中的目录 ID 直接对应 catalog.drives.skip_dir_ids；不存路径，因为同名目录
-//   在不同父级下可能各自需要决定是否跳过，ID 是网盘侧的稳定句柄
+// - 选中的目录 ID 直接对应 catalog.drives.scan_dir_ids；不存路径，因为同名目录
+//   在不同父级下可能各自需要决定是否扫描，ID 是网盘侧的稳定句柄
 // - 已选集合显示在顶部 chips；树里被选中的目录用样式标出，用户在浏览中可以一眼
 //   看到自己选了什么
-// - 子目录的勾选不影响父目录的跳过判定（scanner 只按 ID 比对），但展示上加视觉
-//   线索：父目录被跳过 → 整个子树灰显（提示用户"已被祖先跳过"），仍可单独勾选
-// ---------- SkipDirsPanel ----------
-//
-// "设置跳过目录"面板：
-// - 勾选目录加入跳过集合
-// - "保存更改"调 setDriveSkipDirIds 整体覆盖
-type SkipDirsPanelProps = {
+// - 子目录的勾选不影响父目录的扫描判定（scanner 从每个 ID 开始递归），但展示上加视觉
+//   线索：父目录已被选中 → 整个子树灰显（提示用户"已被祖先覆盖"），仍可单独勾选
+type ScanDirsPanelProps = {
   drive: api.AdminDrive;
-  onSaved: (saved: { id: string; skipDirIds: string[] }) => void;
+  onSaved: (saved: { id: string; scanDirIds: string[] }) => void;
 };
 
-function SkipDirsPanel({ drive, onSaved }: SkipDirsPanelProps) {
+function ScanDirsPanel({ drive, onSaved }: ScanDirsPanelProps) {
   const { show } = useToast();
   // selected 用 Set 方便 O(1) 增删 / contains 查询。
   const [selected, setSelected] = useState<Set<string>>(
-    () => new Set(drive.skipDirIds ?? [])
+    () => new Set(drive.scanDirIds ?? [])
   );
   const [saving, setSaving] = useState(false);
 
   // 当外部的 drive 对象改变时，重置内部选中状态，确保在切换详情页时，数据能正确同步
   useEffect(() => {
-    setSelected(new Set(drive.skipDirIds ?? []));
-  }, [drive.id, drive.skipDirIds]);
+    setSelected(new Set(drive.scanDirIds ?? []));
+  }, [drive.id, drive.scanDirIds]);
 
   const toggle = useCallback((id: string) => {
     setSelected((prev) => {
@@ -1408,8 +1531,8 @@ function SkipDirsPanel({ drive, onSaved }: SkipDirsPanelProps) {
     setSaving(true);
     try {
       const ids = Array.from(selected);
-      const resp = await api.setDriveSkipDirIds(drive.id, ids);
-      onSaved({ id: drive.id, skipDirIds: resp.skipDirIds });
+      const resp = await api.setDriveScanDirIds(drive.id, ids);
+      onSaved({ id: drive.id, scanDirIds: resp.scanDirIds });
     } catch (e) {
       show(e instanceof Error ? e.message : "保存失败", "error");
     } finally {
@@ -1424,7 +1547,7 @@ function SkipDirsPanel({ drive, onSaved }: SkipDirsPanelProps) {
       <header className="admin-detail-card__title">
         <div className="admin-detail-card__title-left">
           <FolderTree size={16} />
-          <span>扫描跳过目录</span>
+          <span>需要扫描目录</span>
         </div>
         <button
           className="admin-btn is-primary"
@@ -1438,11 +1561,10 @@ function SkipDirsPanel({ drive, onSaved }: SkipDirsPanelProps) {
 
       <div style={{ display: "flex", flexDirection: "column", gap: "12px" }}>
         <p className="admin-text-faint" style={{ margin: 0, fontSize: "12px", lineHeight: "1.5" }}>
-          勾选要在扫描时跳过的目录。命中目录及其全部子目录都不会被递归扫描。下次扫描生效。
+          勾选需要扫描的视频目录。勾选后只扫描这些目录及其子目录；未勾选并保存时按扫描起点完整扫描。下次扫描生效。
         </p>
 
         <SelectedDirsChips
-          drive={drive}
           selected={selectedList}
           onRemove={toggle}
         />
@@ -1454,7 +1576,7 @@ function SkipDirsPanel({ drive, onSaved }: SkipDirsPanelProps) {
             name={drive.name || drive.id}
             depth={0}
             initiallyOpen
-            ancestorSkipped={false}
+            ancestorSelected={false}
             selected={selected}
             onToggle={toggle}
           />
@@ -1467,11 +1589,9 @@ function SkipDirsPanel({ drive, onSaved }: SkipDirsPanelProps) {
 // SelectedDirsChips 显示已选目录的 ID 列表（chips）；目录"名"无法在不展开树
 // 的情况下拿到（树是按需展开的），所以这里只显示 ID + drive 信息。点 × 移除。
 function SelectedDirsChips({
-  drive,
   selected,
   onRemove,
 }: {
-  drive: api.AdminDrive;
   selected: string[];
   onRemove: (id: string) => void;
 }) {
@@ -1481,8 +1601,7 @@ function SelectedDirsChips({
         className="admin-text-faint"
         style={{ fontSize: "13px", padding: "6px 0" }}
       >
-        当前未勾选任何跳过目录（{drive.kind === "p115" ? "115 网盘" : drive.kind}{" "}
-        将完整扫描）。
+        当前未勾选需要扫描目录（保存后将按扫描起点完整扫描）。
       </div>
     );
   }
@@ -1530,7 +1649,7 @@ function SelectedDirsChips({
 //
 // - id="" 时表示根节点，调用 dirtree 时不传 parent → 后端用 drive 的 RootID
 // - depth=0 不展示 chevron 切换（根总是展开）
-// - ancestorSkipped=true 表示某个祖先已被勾选跳过 → 子树灰显但仍允许操作
+// - ancestorSelected=true 表示某个祖先已被勾选扫描 → 子树灰显但仍允许操作
 //   （考虑到用户可能想取消祖先转而精细勾选，UI 上不强制禁用）
 type DirTreeNodeProps = {
   driveId: string;
@@ -1538,7 +1657,7 @@ type DirTreeNodeProps = {
   name: string;
   depth: number;
   initiallyOpen?: boolean;
-  ancestorSkipped: boolean;
+  ancestorSelected: boolean;
   selected: Set<string>;
   onToggle: (id: string) => void;
 };
@@ -1549,7 +1668,7 @@ function DirTreeNode({
   name,
   depth,
   initiallyOpen,
-  ancestorSkipped,
+  ancestorSelected,
   selected,
   onToggle,
 }: DirTreeNodeProps) {
@@ -1561,7 +1680,7 @@ function DirTreeNode({
 
   const isRoot = depth === 0;
   const isSelected = id !== "" && selected.has(id);
-  const dimmed = ancestorSkipped;
+  const dimmed = ancestorSelected;
 
   const loadChildren = useCallback(async () => {
     if (loaded || loading) return;
@@ -1630,7 +1749,7 @@ function DirTreeNode({
             type="checkbox"
             checked={isSelected}
             onChange={() => onToggle(id)}
-            aria-label={`跳过目录 ${name}`}
+            aria-label={`扫描目录 ${name}`}
           />
         )}
 
@@ -1675,12 +1794,12 @@ function DirTreeNode({
           )}
           {children.map((child) => (
             <DirTreeNode
-              key={child.id}
+              key={`${child.id}:${child.name}`}
               driveId={driveId}
               id={child.id}
               name={child.name}
               depth={depth + 1}
-              ancestorSkipped={ancestorSkipped || isSelected}
+              ancestorSelected={ancestorSelected || isSelected}
               selected={selected}
               onToggle={onToggle}
             />

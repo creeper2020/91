@@ -72,5 +72,6 @@ function sourceKindFromLabel(label: string): string {
   if (value.includes("沃盘") || value.includes("wopan") || value.includes("联通"))
     return "wopan";
   if (value.includes("onedrive") || value.includes("one drive")) return "onedrive";
+  if (value.includes("googledrive") || value.includes("google drive")) return "googledrive";
   return "";
 }

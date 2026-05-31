@@ -285,7 +285,7 @@ function withRetryParam(src: string, retry: number): string {
 }
 
 // 从后端返回的 sourceLabel 推断网盘类型（用于颜色标识）。
-// 后端目前会下发中文名（"夸克网盘" / "115 网盘" / "PikPak" / "联通沃盘" / "OneDrive"）
+// 后端目前会下发中文名（"夸克网盘" / "115 网盘" / "PikPak" / "联通沃盘" / "OneDrive" / "Google Drive"）
 // 或英文 kind。两边都尝试匹配；都没匹配上时返回空字符串，CSS 会回落到默认色。
 function sourceKindFromLabel(label: string): string {
   const value = label.toLowerCase();
@@ -294,5 +294,6 @@ function sourceKindFromLabel(label: string): string {
   if (value.includes("pikpak")) return "pikpak";
   if (value.includes("沃盘") || value.includes("wopan") || value.includes("联通")) return "wopan";
   if (value.includes("onedrive") || value.includes("one drive")) return "onedrive";
+  if (value.includes("googledrive") || value.includes("google drive")) return "googledrive";
   return "";
 }

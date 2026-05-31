@@ -631,6 +631,84 @@ func TestRunSkipsConfiguredDirIDsAndDoesNotRecurse(t *testing.T) {
 	}
 }
 
+func TestRunScansOnlyConfiguredScanDirIDs(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cat.Close(); err != nil {
+			t.Fatalf("close catalog: %v", err)
+		}
+	})
+
+	drv := &scannerTreeFakeDrive{
+		entries: map[string][]drives.Entry{
+			"root": {
+				{ID: "scan-dir", Name: "Movies", IsDir: true},
+				{ID: "other-dir", Name: "Ads", IsDir: true},
+				{ID: "root-file", Name: "root.mp4", Size: 123},
+			},
+			"scan-dir": {
+				{ID: "selected-file", ParentID: "scan-dir", Name: "selected.mp4", Size: 456},
+				{ID: "nested-dir", Name: "Nested", IsDir: true},
+			},
+			"nested-dir": {
+				{ID: "nested-selected-file", ParentID: "nested-dir", Name: "nested.mp4", Size: 789},
+			},
+			"other-dir": {
+				{ID: "other-file", ParentID: "other-dir", Name: "other.mp4", Size: 999},
+			},
+		},
+	}
+	sc := New(cat, drv, []string{".mp4"}, []string{"scan-dir"}, nil)
+	sc.SetScanDirIDs([]string{"scan-dir"})
+
+	stats, err := sc.Run(ctx, "")
+	if err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+
+	if stats.Scanned != 2 {
+		t.Fatalf("scanned = %d, want files only under selected scan dir", stats.Scanned)
+	}
+	if _, ok := stats.VisitedDirIDs["root"]; ok {
+		t.Fatalf("visited root while scanDirIDs configured: %#v", stats.VisitedDirIDs)
+	}
+	if _, ok := stats.VisitedDirIDs["scan-dir"]; !ok {
+		t.Fatalf("visited dir ids = %#v, want scan-dir", stats.VisitedDirIDs)
+	}
+	if _, ok := stats.VisitedDirIDs["nested-dir"]; !ok {
+		t.Fatalf("visited dir ids = %#v, want nested-dir", stats.VisitedDirIDs)
+	}
+	if _, ok := stats.VisitedDirIDs["other-dir"]; ok {
+		t.Fatalf("visited non-selected dir, want only configured scan dirs")
+	}
+	for _, id := range []string{"selected-file", "nested-selected-file"} {
+		if _, ok := stats.SeenFileIDs[id]; !ok {
+			t.Fatalf("seen file ids = %#v, want %s", stats.SeenFileIDs, id)
+		}
+	}
+	for _, id := range []string{"root-file", "other-file"} {
+		if _, ok := stats.SeenFileIDs[id]; ok {
+			t.Fatalf("seen file ids = %#v, want %s excluded", stats.SeenFileIDs, id)
+		}
+	}
+	if _, err := cat.GetVideo(ctx, "fake-drive-selected-file"); err != nil {
+		t.Fatalf("selected video was not added: %v", err)
+	}
+	if _, err := cat.GetVideo(ctx, "fake-drive-nested-selected-file"); err != nil {
+		t.Fatalf("nested selected video was not added: %v", err)
+	}
+	if _, err := cat.GetVideo(ctx, "fake-drive-root-file"); err != sql.ErrNoRows {
+		t.Fatalf("root video lookup error = %v, want sql.ErrNoRows", err)
+	}
+	if _, err := cat.GetVideo(ctx, "fake-drive-other-file"); err != sql.ErrNoRows {
+		t.Fatalf("other video lookup error = %v, want sql.ErrNoRows", err)
+	}
+}
+
 // TestRunDoesNotEnforceLegacyMaxDepth 校验扫描会一直递归直到没有子目录，
 // 不再受旧的 max_depth 上限限制。构造 7 层嵌套（旧 default=5 时第 6+ 层会被截断），
 // 确保最深层的视频也能被入库。

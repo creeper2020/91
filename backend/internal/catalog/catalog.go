@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	_ "embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -61,6 +62,10 @@ type Video struct {
 	PreviewFileID     string    `json:"previewFileId"`
 	PreviewLocal      string    `json:"previewLocal"`
 	PreviewStatus     string    `json:"previewStatus"`
+	HLSDir            string    `json:"-"`
+	HLSStatus         string    `json:"hlsStatus"`
+	HLSError          string    `json:"hlsError"`
+	HLSUpdatedAt      time.Time `json:"hlsUpdatedAt"`
 	Views             int       `json:"views"`
 	Favorites         int       `json:"favorites"`
 	Comments          int       `json:"comments"`
@@ -172,6 +177,26 @@ func (c *Catalog) UpdatePreview(ctx context.Context, id, previewLocal, status st
 	return err
 }
 
+func (c *Catalog) UpdateHLS(ctx context.Context, id, hlsDir, status, errText string) error {
+	now := time.Now().UnixMilli()
+	res, err := c.db.ExecContext(ctx,
+		`UPDATE videos
+		    SET hls_dir = ?,
+		        hls_status = ?,
+		        hls_error = ?,
+		        hls_updated_at = ?,
+		        updated_at = ?
+		  WHERE id = ?`,
+		hlsDir, nullableStatus(status), errText, now, now, id)
+	if err != nil {
+		return err
+	}
+	if rows, err := res.RowsAffected(); err == nil && rows == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
 func (c *Catalog) HideVideo(ctx context.Context, id string) error {
 	res, err := c.db.ExecContext(ctx,
 		`UPDATE videos SET hidden = 1, updated_at = ? WHERE id = ?`,
@@ -214,7 +239,7 @@ func (c *Catalog) MigrateVideoToDrive(ctx context.Context, videoID, newDriveID, 
 }
 
 // ListVideosByDriveID 列出指定 drive 下所有未隐藏的视频，按 published_at 倒序。
-// 给 spider91 → 115/PikPak 迁移 worker 用：扫描 spider91 drive 下所有视频，
+// 给 spider91 迁移 worker 用：扫描 spider91 drive 下所有视频，
 // 检查哪些还有本地文件，依次上传到目标盘。
 func (c *Catalog) ListVideosByDriveID(ctx context.Context, driveID string, limit int) ([]*Video, error) {
 	if driveID == "" {
@@ -501,7 +526,7 @@ func (c *Catalog) ListVideosByThumbnailStatus(ctx context.Context, driveID, stat
 	return out, nil
 }
 
-// ListVideosNeedingThumbnail returns videos that still need a thumbnail attempt.
+// ListVideosNeedingThumbnail returns videos that still need thumbnail/duration work.
 // Failed thumbnails are reported separately and should not block teaser generation.
 // Videos whose local assets were cleared because they are fingerprint duplicates
 // stay pending in the DB, but uniqueVideoWhereSQL keeps them out of this queue
@@ -513,7 +538,10 @@ func (c *Catalog) ListVideosNeedingThumbnail(ctx context.Context, driveID string
 	rows, err := c.db.QueryContext(ctx,
 		`SELECT `+allVideoCols+` FROM videos
 		 WHERE drive_id = ?
-		   AND COALESCE(thumbnail_url, '') = ''
+		   AND (
+		        COALESCE(thumbnail_url, '') = ''
+		        OR COALESCE(duration_seconds, 0) <= 0
+		   )
 		   AND COALESCE(thumbnail_status, 'pending') NOT IN ('failed', 'skipped')
 		   AND COALESCE(hidden, 0) = 0
 		   AND `+uniqueVideoWhereSQL+`
@@ -540,7 +568,10 @@ func (c *Catalog) CountVideosNeedingThumbnail(ctx context.Context, driveID strin
 	err := c.db.QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM videos
 		 WHERE drive_id = ?
-		   AND COALESCE(thumbnail_url, '') = ''
+		   AND (
+		        COALESCE(thumbnail_url, '') = ''
+		        OR COALESCE(duration_seconds, 0) <= 0
+		   )
 		   AND COALESCE(thumbnail_status, 'pending') NOT IN ('failed', 'skipped')
 		   AND COALESCE(hidden, 0) = 0
 		   AND `+uniqueVideoWhereSQL,
@@ -657,6 +688,45 @@ func (c *Catalog) DeleteVideo(ctx context.Context, id string) error {
 	}
 
 	return tx.Commit()
+}
+
+func deleteVideosBySelector(ctx context.Context, tx *sql.Tx, selector string, args []any) (int64, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT DISTINCT tag_id FROM video_tags WHERE video_id IN (`+selector+`)`, args...)
+	if err != nil {
+		return 0, err
+	}
+	var tagIDs []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		tagIDs = append(tagIDs, id)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return 0, err
+	}
+	if err := rows.Close(); err != nil {
+		return 0, err
+	}
+
+	if _, err := tx.ExecContext(ctx, `DELETE FROM video_tags WHERE video_id IN (`+selector+`)`, args...); err != nil {
+		return 0, err
+	}
+	res, err := tx.ExecContext(ctx, `DELETE FROM videos WHERE id IN (`+selector+`)`, args...)
+	if err != nil {
+		return 0, err
+	}
+	if err := pruneOrphanCollectionTagsByID(ctx, tx, tagIDs); err != nil {
+		return 0, err
+	}
+	deleted, err := res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	return deleted, nil
 }
 
 func (c *Catalog) FindVideoByContentHash(ctx context.Context, hash string) (*Video, error) {
@@ -916,9 +986,16 @@ type DriveTeaserCounts struct {
 	Ready   int
 	Pending int
 	Failed  int
+	Skipped int
 }
 
 type DriveThumbnailCounts struct {
+	Ready   int
+	Pending int
+	Failed  int
+}
+
+type DriveFingerprintCounts struct {
 	Ready   int
 	Pending int
 	Failed  int
@@ -929,7 +1006,8 @@ func (c *Catalog) CountTeasersByDrive(ctx context.Context) (map[string]DriveTeas
 		`SELECT drive_id,
 		        COUNT(CASE WHEN COALESCE(preview_status, 'pending') = 'ready' THEN 1 END) AS ready_count,
 		        COUNT(CASE WHEN COALESCE(preview_status, 'pending') = 'pending' THEN 1 END) AS pending_count,
-		        COUNT(CASE WHEN COALESCE(preview_status, 'pending') = 'failed' THEN 1 END) AS failed_count
+		        COUNT(CASE WHEN COALESCE(preview_status, 'pending') = 'failed' THEN 1 END) AS failed_count,
+		        COUNT(CASE WHEN COALESCE(preview_status, 'pending') = 'skipped' THEN 1 END) AS skipped_count
 		   FROM videos
 		  WHERE COALESCE(hidden, 0) = 0
 		    AND `+uniqueVideoWhereSQL+`
@@ -943,7 +1021,7 @@ func (c *Catalog) CountTeasersByDrive(ctx context.Context) (map[string]DriveTeas
 	for rows.Next() {
 		var driveID string
 		var counts DriveTeaserCounts
-		if err := rows.Scan(&driveID, &counts.Ready, &counts.Pending, &counts.Failed); err != nil {
+		if err := rows.Scan(&driveID, &counts.Ready, &counts.Pending, &counts.Failed, &counts.Skipped); err != nil {
 			return nil, err
 		}
 		out[driveID] = counts
@@ -984,6 +1062,54 @@ func (c *Catalog) CountThumbnailsByDrive(ctx context.Context) (map[string]DriveT
 		return nil, err
 	}
 	return out, nil
+}
+
+func (c *Catalog) CountFingerprintsByDrive(ctx context.Context) (map[string]DriveFingerprintCounts, error) {
+	rows, err := c.db.QueryContext(ctx,
+		`SELECT drive_id,
+		        COUNT(CASE WHEN COALESCE(sampled_sha256, '') != ''
+		                      OR COALESCE(fingerprint_status, 'pending') = 'ready' THEN 1 END) AS ready_count,
+		        COUNT(CASE WHEN size_bytes > 0
+		                     AND COALESCE(sampled_sha256, '') = ''
+		                     AND COALESCE(fingerprint_status, 'pending') = 'pending' THEN 1 END) AS pending_count,
+		        COUNT(CASE WHEN COALESCE(sampled_sha256, '') = ''
+		                     AND COALESCE(fingerprint_status, 'pending') = 'failed' THEN 1 END) AS failed_count
+		   FROM videos
+		  WHERE COALESCE(hidden, 0) = 0
+		    AND `+uniqueVideoWhereSQL+`
+		  GROUP BY drive_id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make(map[string]DriveFingerprintCounts)
+	for rows.Next() {
+		var driveID string
+		var counts DriveFingerprintCounts
+		if err := rows.Scan(&driveID, &counts.Ready, &counts.Pending, &counts.Failed); err != nil {
+			return nil, err
+		}
+		out[driveID] = counts
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *Catalog) CountVideosNeedingFingerprint(ctx context.Context, driveID string) (int, error) {
+	var count int
+	err := c.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM videos
+		 WHERE drive_id = ?
+		   AND size_bytes > 0
+		   AND COALESCE(sampled_sha256, '') = ''
+		   AND COALESCE(fingerprint_status, 'pending') = 'pending'
+		   AND COALESCE(hidden, 0) = 0
+		   AND `+uniqueVideoWhereSQL,
+		driveID).Scan(&count)
+	return count, err
 }
 
 type LocalMediaRef struct {
@@ -1147,11 +1273,11 @@ type Drive struct {
 	// TeaserEnabled 控制是否给本盘生成 teaser/封面。
 	// 替代早期的全局 preview.enabled 开关；新建 drive 时 UpsertDrive 默认置 true。
 	TeaserEnabled bool `json:"teaserEnabled"`
-	// SkipDirIDs 是用户在管理后台为该盘选定的"扫描跳过目录"集合（网盘侧的目录 fileID）。
-	// scanner 在 walk 时命中其中任意一个就直接 continue —— 不递归、不收集文件，也
-	// 不参与 stats 统计。替代旧版硬编码"影视"目录的特例分支。
-	// 含义按"目录 ID 自身"匹配，所以同名目录在不同父级下需要分别选定。
+	// SkipDirIDs 是旧版"扫描跳过目录"集合，保留用于兼容历史配置。
 	SkipDirIDs []string `json:"skipDirIds,omitempty"`
+	// ScanDirIDs 是"需要扫描目录"白名单。非空时只扫描这些目录及其子目录；
+	// 空数组表示从 scan_root_id/root_id 开始完整扫描。
+	ScanDirIDs []string `json:"scanDirIds,omitempty"`
 	// MinScanFileSizeBytes 是扫描入库的最小文件大小阈值；0 表示关闭大小过滤。
 	MinScanFileSizeBytes int64 `json:"minScanFileSizeBytes"`
 	// SkipFileNameKeywords 是扫描时按文件名跳过视频的关键词列表。
@@ -1166,11 +1292,16 @@ func (c *Catalog) UpsertDrive(ctx context.Context, d *Drive) error {
 	if skipDirs == nil {
 		skipDirs = []string{}
 	}
+	scanDirs := d.ScanDirIDs
+	if scanDirs == nil {
+		scanDirs = []string{}
+	}
 	if d.MinScanFileSizeBytes < 0 {
 		d.MinScanFileSizeBytes = 0
 	}
 	skipFileNameKeywords := cleanDriveStringList(d.SkipFileNameKeywords)
-	skipDirsJSON, _ := json.Marshal(skipDirs)
+	skipDirsJSON, _ := json.Marshal(cleanDriveStringList(skipDirs))
+	scanDirsJSON, _ := json.Marshal(cleanDriveStringList(scanDirs))
 	skipFileNameKeywordsJSON, _ := json.Marshal(skipFileNameKeywords)
 	now := time.Now().UnixMilli()
 	if d.CreatedAt.IsZero() {
@@ -1178,8 +1309,8 @@ func (c *Catalog) UpsertDrive(ctx context.Context, d *Drive) error {
 	}
 	d.UpdatedAt = time.UnixMilli(now)
 	_, err := c.db.ExecContext(ctx, `
-INSERT INTO drives (id, kind, name, root_id, scan_root_id, credentials, status, last_error, teaser_enabled, skip_dir_ids, min_scan_file_size_bytes, skip_file_name_keywords, created_at, updated_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+INSERT INTO drives (id, kind, name, root_id, scan_root_id, credentials, status, last_error, teaser_enabled, skip_dir_ids, scan_dir_ids, min_scan_file_size_bytes, skip_file_name_keywords, created_at, updated_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(id) DO UPDATE SET
   kind                         = excluded.kind,
   name                         = excluded.name,
@@ -1190,16 +1321,17 @@ ON CONFLICT(id) DO UPDATE SET
   last_error                   = excluded.last_error,
   teaser_enabled               = excluded.teaser_enabled,
   skip_dir_ids                 = excluded.skip_dir_ids,
+  scan_dir_ids                 = excluded.scan_dir_ids,
   min_scan_file_size_bytes     = excluded.min_scan_file_size_bytes,
   skip_file_name_keywords      = excluded.skip_file_name_keywords,
   updated_at                   = excluded.updated_at
-`, d.ID, d.Kind, d.Name, d.RootID, d.ScanRootID, string(cred), d.Status, d.LastError, boolToInt(d.TeaserEnabled), string(skipDirsJSON), d.MinScanFileSizeBytes, string(skipFileNameKeywordsJSON),
+`, d.ID, d.Kind, d.Name, d.RootID, d.ScanRootID, string(cred), d.Status, d.LastError, boolToInt(d.TeaserEnabled), string(skipDirsJSON), string(scanDirsJSON), d.MinScanFileSizeBytes, string(skipFileNameKeywordsJSON),
 		d.CreatedAt.UnixMilli(), d.UpdatedAt.UnixMilli())
 	return err
 }
 
 func (c *Catalog) ListDrives(ctx context.Context) ([]*Drive, error) {
-	rows, err := c.db.QueryContext(ctx, `SELECT id, kind, name, root_id, COALESCE(scan_root_id, ''), COALESCE(credentials, '{}'), status, COALESCE(last_error, ''), COALESCE(teaser_enabled, 1), COALESCE(skip_dir_ids, '[]'), COALESCE(min_scan_file_size_bytes, 0), COALESCE(skip_file_name_keywords, '[]'), created_at, updated_at FROM drives ORDER BY created_at ASC`)
+	rows, err := c.db.QueryContext(ctx, `SELECT id, kind, name, root_id, COALESCE(scan_root_id, ''), COALESCE(credentials, '{}'), status, COALESCE(last_error, ''), COALESCE(teaser_enabled, 1), COALESCE(skip_dir_ids, '[]'), COALESCE(scan_dir_ids, '[]'), COALESCE(min_scan_file_size_bytes, 0), COALESCE(skip_file_name_keywords, '[]'), created_at, updated_at FROM drives ORDER BY created_at ASC`)
 	if err != nil {
 		return nil, err
 	}
@@ -1207,14 +1339,15 @@ func (c *Catalog) ListDrives(ctx context.Context) ([]*Drive, error) {
 	var out []*Drive
 	for rows.Next() {
 		d := &Drive{}
-		var credsStr, skipDirsStr, skipFileNameKeywordsStr string
+		var credsStr, skipDirsStr, scanDirsStr, skipFileNameKeywordsStr string
 		var teaserEnabled int
 		var createdAt, updatedAt int64
-		if err := rows.Scan(&d.ID, &d.Kind, &d.Name, &d.RootID, &d.ScanRootID, &credsStr, &d.Status, &d.LastError, &teaserEnabled, &skipDirsStr, &d.MinScanFileSizeBytes, &skipFileNameKeywordsStr, &createdAt, &updatedAt); err != nil {
+		if err := rows.Scan(&d.ID, &d.Kind, &d.Name, &d.RootID, &d.ScanRootID, &credsStr, &d.Status, &d.LastError, &teaserEnabled, &skipDirsStr, &scanDirsStr, &d.MinScanFileSizeBytes, &skipFileNameKeywordsStr, &createdAt, &updatedAt); err != nil {
 			return nil, err
 		}
 		_ = json.Unmarshal([]byte(credsStr), &d.Credentials)
 		_ = json.Unmarshal([]byte(skipDirsStr), &d.SkipDirIDs)
+		_ = json.Unmarshal([]byte(scanDirsStr), &d.ScanDirIDs)
 		_ = json.Unmarshal([]byte(skipFileNameKeywordsStr), &d.SkipFileNameKeywords)
 		d.TeaserEnabled = teaserEnabled != 0
 		d.CreatedAt = time.UnixMilli(createdAt)
@@ -1225,16 +1358,17 @@ func (c *Catalog) ListDrives(ctx context.Context) ([]*Drive, error) {
 }
 
 func (c *Catalog) GetDrive(ctx context.Context, id string) (*Drive, error) {
-	row := c.db.QueryRowContext(ctx, `SELECT id, kind, name, root_id, COALESCE(scan_root_id, ''), COALESCE(credentials, '{}'), status, COALESCE(last_error, ''), COALESCE(teaser_enabled, 1), COALESCE(skip_dir_ids, '[]'), COALESCE(min_scan_file_size_bytes, 0), COALESCE(skip_file_name_keywords, '[]'), created_at, updated_at FROM drives WHERE id = ?`, id)
+	row := c.db.QueryRowContext(ctx, `SELECT id, kind, name, root_id, COALESCE(scan_root_id, ''), COALESCE(credentials, '{}'), status, COALESCE(last_error, ''), COALESCE(teaser_enabled, 1), COALESCE(skip_dir_ids, '[]'), COALESCE(scan_dir_ids, '[]'), COALESCE(min_scan_file_size_bytes, 0), COALESCE(skip_file_name_keywords, '[]'), created_at, updated_at FROM drives WHERE id = ?`, id)
 	d := &Drive{}
-	var credsStr, skipDirsStr, skipFileNameKeywordsStr string
+	var credsStr, skipDirsStr, scanDirsStr, skipFileNameKeywordsStr string
 	var teaserEnabled int
 	var createdAt, updatedAt int64
-	if err := row.Scan(&d.ID, &d.Kind, &d.Name, &d.RootID, &d.ScanRootID, &credsStr, &d.Status, &d.LastError, &teaserEnabled, &skipDirsStr, &d.MinScanFileSizeBytes, &skipFileNameKeywordsStr, &createdAt, &updatedAt); err != nil {
+	if err := row.Scan(&d.ID, &d.Kind, &d.Name, &d.RootID, &d.ScanRootID, &credsStr, &d.Status, &d.LastError, &teaserEnabled, &skipDirsStr, &scanDirsStr, &d.MinScanFileSizeBytes, &skipFileNameKeywordsStr, &createdAt, &updatedAt); err != nil {
 		return nil, err
 	}
 	_ = json.Unmarshal([]byte(credsStr), &d.Credentials)
 	_ = json.Unmarshal([]byte(skipDirsStr), &d.SkipDirIDs)
+	_ = json.Unmarshal([]byte(scanDirsStr), &d.ScanDirIDs)
 	_ = json.Unmarshal([]byte(skipFileNameKeywordsStr), &d.SkipFileNameKeywords)
 	d.TeaserEnabled = teaserEnabled != 0
 	d.CreatedAt = time.UnixMilli(createdAt)
@@ -1243,8 +1377,75 @@ func (c *Catalog) GetDrive(ctx context.Context, id string) (*Drive, error) {
 }
 
 func (c *Catalog) DeleteDrive(ctx context.Context, id string) error {
-	_, err := c.db.ExecContext(ctx, `DELETE FROM drives WHERE id = ?`, id)
-	return err
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return fmt.Errorf("catalog: delete drive: empty id")
+	}
+	tx, err := c.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	var existingID string
+	err = tx.QueryRowContext(ctx, `SELECT id FROM drives WHERE id = ?`, id).Scan(&existingID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return tx.Commit()
+	}
+	if err != nil {
+		return err
+	}
+
+	if _, err := deleteVideosBySelector(ctx, tx, `SELECT id FROM videos WHERE drive_id = ?`, []any{id}); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM scans WHERE drive_id = ?`, id); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM drives WHERE id = ?`, id); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// DeleteVideosForMissingDrives 清理 drive 配置已不存在的历史视频记录。
+// keepDriveIDs 用于保留内置视频源（例如 local-upload），这些源不一定有 drives 表记录。
+func (c *Catalog) DeleteVideosForMissingDrives(ctx context.Context, keepDriveIDs []string) (int64, error) {
+	tx, err := c.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+
+	keepDriveIDs = cleanDriveStringList(keepDriveIDs)
+	videoSelector := `SELECT id FROM videos WHERE NOT EXISTS (
+		SELECT 1 FROM drives d WHERE d.id = videos.drive_id
+	)`
+	scanWhere := `NOT EXISTS (
+		SELECT 1 FROM drives d WHERE d.id = scans.drive_id
+	)`
+	args := make([]any, 0, len(keepDriveIDs))
+	if len(keepDriveIDs) > 0 {
+		placeholders := strings.Repeat("?,", len(keepDriveIDs))
+		placeholders = placeholders[:len(placeholders)-1]
+		videoSelector += ` AND drive_id NOT IN (` + placeholders + `)`
+		scanWhere += ` AND drive_id NOT IN (` + placeholders + `)`
+		for _, id := range keepDriveIDs {
+			args = append(args, id)
+		}
+	}
+
+	deleted, err := deleteVideosBySelector(ctx, tx, videoSelector, args)
+	if err != nil {
+		return 0, err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM scans WHERE `+scanWhere, args...); err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return deleted, nil
 }
 
 // SetDriveTeaserEnabled 切换某盘的 teaser/封面生成开关。
@@ -1282,15 +1483,37 @@ func (c *Catalog) SetDriveSkipDirIDs(ctx context.Context, id string, ids []strin
 	if id == "" {
 		return fmt.Errorf("catalog: set drive skip_dir_ids: empty id")
 	}
-	if ids == nil {
-		ids = []string{}
-	}
-	payload, err := json.Marshal(ids)
+	payload, err := json.Marshal(cleanDriveStringList(ids))
 	if err != nil {
 		return fmt.Errorf("catalog: marshal skip_dir_ids: %w", err)
 	}
 	res, err := c.db.ExecContext(ctx,
 		`UPDATE drives SET skip_dir_ids = ?, updated_at = ? WHERE id = ?`,
+		string(payload), time.Now().UnixMilli(), id)
+	if err != nil {
+		return err
+	}
+	if rows, err := res.RowsAffected(); err == nil && rows == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
+// SetDriveScanDirIDs 重写某盘的"需要扫描目录"集合（直接覆盖，不做增量合并）。
+//
+// ids 为空表示不限制扫描目录，按 scan_root_id/root_id 完整扫描。非空时 scanner
+// 只扫描这些目录及其子目录。调用新版接口时同步清空旧版 skip_dir_ids，避免旧规则
+// 在 UI 已切到"需要扫描目录"后继续隐式生效。
+func (c *Catalog) SetDriveScanDirIDs(ctx context.Context, id string, ids []string) error {
+	if id == "" {
+		return fmt.Errorf("catalog: set drive scan_dir_ids: empty id")
+	}
+	payload, err := json.Marshal(cleanDriveStringList(ids))
+	if err != nil {
+		return fmt.Errorf("catalog: marshal scan_dir_ids: %w", err)
+	}
+	res, err := c.db.ExecContext(ctx,
+		`UPDATE drives SET scan_dir_ids = ?, skip_dir_ids = '[]', updated_at = ? WHERE id = ?`,
 		string(payload), time.Now().UnixMilli(), id)
 	if err != nil {
 		return err
@@ -1449,6 +1672,7 @@ COALESCE(sampled_sha256, ''), COALESCE(fingerprint_status, 'pending'), COALESCE(
 COALESCE(parent_id, ''), title, COALESCE(author, ''), COALESCE(tags, '[]'),
 duration_seconds, size_bytes, COALESCE(ext, ''), COALESCE(quality, ''), COALESCE(thumbnail_url, ''),
 COALESCE(preview_file_id, ''), COALESCE(preview_local, ''), COALESCE(preview_status, 'pending'),
+COALESCE(hls_dir, ''), COALESCE(hls_status, 'pending'), COALESCE(hls_error, ''), COALESCE(hls_updated_at, 0),
 views, favorites, comments, likes, dislikes,
 COALESCE(category, ''), COALESCE(hidden, 0), COALESCE(badges, '[]'), COALESCE(description, ''),
 published_at, created_at, updated_at
@@ -1501,7 +1725,7 @@ type rowScanner interface {
 func scanVideo(row rowScanner) (*Video, error) {
 	v := &Video{}
 	var tagsJSON, badgesJSON string
-	var publishedAt, createdAt, updatedAt int64
+	var publishedAt, createdAt, updatedAt, hlsUpdatedAt int64
 	var hidden int
 	err := row.Scan(
 		&v.ID, &v.DriveID, &v.FileID, &v.FileName, &v.ContentHash,
@@ -1509,6 +1733,7 @@ func scanVideo(row rowScanner) (*Video, error) {
 		&v.ParentID, &v.Title, &v.Author, &tagsJSON,
 		&v.DurationSeconds, &v.Size, &v.Ext, &v.Quality, &v.ThumbnailURL,
 		&v.PreviewFileID, &v.PreviewLocal, &v.PreviewStatus,
+		&v.HLSDir, &v.HLSStatus, &v.HLSError, &hlsUpdatedAt,
 		&v.Views, &v.Favorites, &v.Comments, &v.Likes, &v.Dislikes,
 		&v.Category, &hidden, &badgesJSON, &v.Description,
 		&publishedAt, &createdAt, &updatedAt,
@@ -1522,6 +1747,9 @@ func scanVideo(row rowScanner) (*Video, error) {
 	v.PublishedAt = time.UnixMilli(publishedAt)
 	v.CreatedAt = time.UnixMilli(createdAt)
 	v.UpdatedAt = time.UnixMilli(updatedAt)
+	if hlsUpdatedAt > 0 {
+		v.HLSUpdatedAt = time.UnixMilli(hlsUpdatedAt)
+	}
 	return v, nil
 }
 

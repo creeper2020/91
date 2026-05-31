@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
+import Hls from "hls.js";
 import {
   ChevronLeft,
   Heart,
@@ -730,6 +731,100 @@ function ShortsSlide({
     [videoRef]
   );
 
+  useEffect(() => {
+    const video = localRef.current;
+    if (!video || !shouldMount) return;
+    const rawSrc = item.videoSrc;
+    const hlsSrc = item.hlsSrc;
+    const preferredSrc = hlsSrc || rawSrc;
+    let hls: Hls | null = null;
+    let didFallback = false;
+
+    setDuration(0);
+    setCurrentTime(0);
+
+    if (!preferredSrc) {
+      video.removeAttribute("src");
+      video.load();
+      return;
+    }
+
+    const fallbackToSource = () => {
+      if (didFallback || !rawSrc) return;
+      didFallback = true;
+      if (hls) {
+        hls.destroy();
+        hls = null;
+      }
+      video.src = rawSrc;
+      video.load();
+    };
+
+    if (hlsSrc && Hls.isSupported()) {
+      hls = new Hls({
+        enableWorker: true,
+        lowLatencyMode: false,
+        maxBufferLength: 60,
+        backBufferLength: 30,
+      });
+      hls.loadSource(hlsSrc);
+      hls.attachMedia(video);
+      hls.on(Hls.Events.ERROR, (_event, data) => {
+        if (data.fatal) {
+          fallbackToSource();
+        }
+      });
+    } else {
+      video.src = preferredSrc;
+      video.load();
+      if (hlsSrc) {
+        video.addEventListener("error", fallbackToSource);
+      }
+    }
+
+    return () => {
+      video.removeEventListener("error", fallbackToSource);
+      if (hls) {
+        hls.destroy();
+      }
+      video.removeAttribute("src");
+      video.load();
+    };
+  }, [item.id, item.videoSrc, item.hlsSrc, shouldMount]);
+
+  useEffect(() => {
+    const video = localRef.current;
+    if (!video || !shouldMount || !isActive || isMarkedHidden) return;
+
+    const playActive = () => {
+      video.muted = muted;
+      video.volume = volume;
+      if (video.paused) {
+        video.play().catch(() => undefined);
+      }
+    };
+
+    if (video.readyState >= 1) {
+      playActive();
+      return;
+    }
+    video.addEventListener("loadedmetadata", playActive);
+    video.addEventListener("canplay", playActive);
+    return () => {
+      video.removeEventListener("loadedmetadata", playActive);
+      video.removeEventListener("canplay", playActive);
+    };
+  }, [
+    item.id,
+    item.videoSrc,
+    item.hlsSrc,
+    shouldMount,
+    isActive,
+    isMarkedHidden,
+    muted,
+    volume,
+  ]);
+
   // 离开活跃后清掉本地的暂停状态，避免回来时 UI 还显示着 paused
   useEffect(() => {
     if (!isActive) {
@@ -1092,7 +1187,6 @@ function ShortsSlide({
         <video
           ref={setRef}
           className="shorts-slide__video"
-          src={item.videoSrc}
           poster={item.poster}
           preload="auto"
           playsInline
@@ -1286,6 +1380,7 @@ function getDriveShortName(source: string): string {
   if (s.includes("pikpak")) return "PikP";
   if (s.includes("quark") || s.includes("夸克")) return "Quak";
   if (s.includes("onedrive")) return "OneDrive";
+  if (s.includes("googledrive") || s.includes("google drive")) return "GDrive";
   if (s.includes("wopan") || s.includes("沃盘")) return "沃盘";
   if (s.includes("spider") || s.includes("爬虫")) return "爬虫";
   return source.substring(0, 4);
