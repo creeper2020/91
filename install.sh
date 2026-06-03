@@ -70,6 +70,7 @@ Options via environment:
   CONFIGURE_UFW=$CONFIGURE_UFW
   SELF_UPDATE=$SELF_UPDATE
   FORCE_UPDATE=$FORCE_UPDATE
+  UNINSTALL_DELETE_FILES=0      Set to 1 for non-interactive uninstall to delete $INSTALL_PATH
   INSTALL_SCRIPT_REF=$INSTALL_SCRIPT_REF
   INSTALL_SCRIPT_URL=$INSTALL_SCRIPT_URL
   SERVICE_READY_TIMEOUT=$SERVICE_READY_TIMEOUT
@@ -121,6 +122,27 @@ asset_name() {
   printf '%s-linux-%s.tar.gz' "$APP_NAME" "$ARCH"
 }
 
+verify_runtime_deps() {
+  local cmd
+  for cmd in curl tar ffmpeg ffprobe openssl python3; do
+    command -v "$cmd" >/dev/null 2>&1 || die "missing command: $cmd"
+  done
+
+  python3 - <<'PY' || die "missing Python modules for 91Spider: requests, bs4, lxml, socks"
+import importlib.util
+import sys
+
+missing = [
+    name
+    for name in ("requests", "bs4", "lxml", "socks")
+    if importlib.util.find_spec(name) is None
+]
+if missing:
+    print("missing Python modules: " + ", ".join(missing), file=sys.stderr)
+    sys.exit(1)
+PY
+}
+
 install_deps() {
   if [[ "$INSTALL_DEPS" != "1" ]]; then
     return
@@ -129,13 +151,12 @@ install_deps() {
     export DEBIAN_FRONTEND=noninteractive
     log "installing runtime dependencies"
     apt-get update
-    apt-get install -y ca-certificates curl tar ffmpeg openssl iproute2 python3 python3-requests python3-bs4 python3-lxml
+    apt-get install -y ca-certificates curl tar ffmpeg openssl iproute2 python3 python3-requests python3-bs4 python3-lxml python3-socks
+    verify_runtime_deps
     return
   fi
 
-  for cmd in curl tar ffmpeg ffprobe openssl; do
-    command -v "$cmd" >/dev/null 2>&1 || die "missing command: $cmd"
-  done
+  verify_runtime_deps
 }
 
 check_system() {
@@ -323,8 +344,8 @@ exec_latest_manager_update() {
 }
 
 open_firewall_port() {
-  [[ "$CONFIGURE_UFW" == "1" ]] || return
-  command -v ufw >/dev/null 2>&1 || return
+  [[ "$CONFIGURE_UFW" == "1" ]] || return 0
+  command -v ufw >/dev/null 2>&1 || return 0
   if ufw status 2>/dev/null | grep -qi "Status: active"; then
     log "allowing ${FRONTEND_PORT}/tcp in UFW"
     ufw allow "${FRONTEND_PORT}/tcp"
@@ -343,6 +364,171 @@ listen_port_from_config() {
     return
   fi
   printf '%s' "$FRONTEND_PORT"
+}
+
+append_unique() {
+  local value="$1"
+  shift
+  for existing in "$@"; do
+    [[ "$existing" == "$value" ]] && return 1
+  done
+  printf '%s' "$value"
+}
+
+app_service_names() {
+  local names=()
+  local name
+  for name in "$SERVICE_NAME" "$APP_NAME" video-site-91 video-site-backend video-site-frontend; do
+    [[ -n "$name" ]] || continue
+    if append_unique "$name" "${names[@]}" >/dev/null; then
+      names+=("$name")
+    fi
+  done
+  printf '%s\n' "${names[@]}"
+}
+
+stop_app_services() {
+  local name unit
+  while IFS= read -r name; do
+    [[ -n "$name" ]] || continue
+    unit="${name}.service"
+    systemctl disable --now "$unit" 2>/dev/null || systemctl stop "$unit" 2>/dev/null || true
+    rm -f "/etc/systemd/system/$unit"
+  done < <(app_service_names)
+  systemctl daemon-reload
+}
+
+remove_app_containers() {
+  command -v docker >/dev/null 2>&1 || return 0
+
+  local names=()
+  local name
+  for name in "$SERVICE_NAME" "$APP_NAME" video-site-91; do
+    [[ -n "$name" ]] || continue
+    if append_unique "$name" "${names[@]}" >/dev/null; then
+      names+=("$name")
+    fi
+  done
+
+  for name in "${names[@]}"; do
+    if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -Fxq "$name"; then
+      log "removing docker container $name"
+      docker rm -f "$name" >/dev/null 2>&1 || true
+    fi
+  done
+}
+
+pids_listening_on_port() {
+  local port="$1"
+  [[ "$port" =~ ^[0-9]+$ ]] || return 0
+  command -v ss >/dev/null 2>&1 || return 0
+
+  ss -ltnp 2>/dev/null \
+    | awk -v port="$port" '$4 ~ ":" port "$" {print}' \
+    | grep -oE 'pid=[0-9]+' \
+    | cut -d= -f2 \
+    | sort -u || true
+}
+
+process_looks_like_app() {
+  local pid="$1"
+  local exe="" cmd=""
+  exe="$(readlink "/proc/$pid/exe" 2>/dev/null || true)"
+  cmd="$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null || true)"
+
+  [[ "$exe" == "$INSTALL_PATH/server" ]] && return 0
+  [[ "$cmd" == *"$INSTALL_PATH"* ]] && return 0
+  [[ "$cmd" == *"VIDEO_FRONTEND_DIR=$INSTALL_PATH/dist"* ]] && return 0
+  [[ "$cmd" == *"VIDEO_CONFIG=$INSTALL_PATH/config.yaml"* ]] && return 0
+  [[ "$cmd" == *"video-site-91"* ]] && return 0
+  [[ "$cmd" == *"91VideoSpider"* ]] && return 0
+  return 1
+}
+
+stop_lingering_app_processes() {
+  local ports=("$@")
+  local port pid pids=()
+
+  for port in "${ports[@]}"; do
+    [[ "$port" =~ ^[0-9]+$ ]] || continue
+    while IFS= read -r pid; do
+      [[ -n "$pid" ]] || continue
+      process_looks_like_app "$pid" || continue
+      if append_unique "$pid" "${pids[@]}" >/dev/null; then
+        pids+=("$pid")
+      fi
+    done < <(pids_listening_on_port "$port")
+  done
+
+  if (( ${#pids[@]} == 0 )); then
+    return
+  fi
+
+  warn "stopping lingering app process(es): ${pids[*]}"
+  kill "${pids[@]}" 2>/dev/null || true
+  sleep 1
+
+  local alive=()
+  for pid in "${pids[@]}"; do
+    if kill -0 "$pid" 2>/dev/null; then
+      alive+=("$pid")
+    fi
+  done
+  if (( ${#alive[@]} > 0 )); then
+    warn "force killing lingering app process(es): ${alive[*]}"
+    kill -9 "${alive[@]}" 2>/dev/null || true
+  fi
+}
+
+warn_remaining_listeners() {
+  local ports=("$@")
+  local port pid cmd
+  for port in "${ports[@]}"; do
+    [[ "$port" =~ ^[0-9]+$ ]] || continue
+    while IFS= read -r pid; do
+      [[ -n "$pid" ]] || continue
+      cmd="$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null || true)"
+      warn "port $port is still listening after uninstall: pid=$pid ${cmd:-unknown}"
+    done < <(pids_listening_on_port "$port")
+  done
+}
+
+has_interactive_tty() {
+  [[ -t 0 ]]
+}
+
+confirm_uninstall_app() {
+  if ! has_interactive_tty; then
+    return 0
+  fi
+
+  local confirm=""
+  printf '确认卸载 91 吗？这会停止服务、移除管理命令，并可选择是否删除项目文件。[y/N]: ' >/dev/tty
+  IFS= read -r confirm </dev/tty || confirm=""
+  case "$confirm" in
+    [yY]) return 0 ;;
+    *)
+      log "uninstall cancelled"
+      return 1
+      ;;
+  esac
+}
+
+delete_install_path_requested() {
+  if [[ "${UNINSTALL_DELETE_FILES:-0}" == "1" ]]; then
+    return 0
+  fi
+  if ! has_interactive_tty; then
+    return 1
+  fi
+
+  local confirm=""
+  printf '删除 %s 里的程序、配置和数据吗？[y/N]: ' "$INSTALL_PATH" >/dev/tty
+  IFS= read -r confirm </dev/tty || confirm=""
+  case "$confirm" in
+    [yY]) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 service_health_url() {
@@ -523,13 +709,14 @@ update_app() {
     exec_latest_manager_update
   fi
 
+  install_deps
+
   if should_skip_update; then
     log "already up to date; skipped app update"
     return 0
   fi
 
   check_disk_space
-  install_deps
 
   local backup
   backup="$(mktemp -d)"
@@ -557,20 +744,30 @@ update_app() {
 }
 
 uninstall_app() {
-  systemctl disable --now "${SERVICE_NAME}.service" 2>/dev/null || true
-  rm -f "/etc/systemd/system/${SERVICE_NAME}.service"
-  systemctl daemon-reload
+  local listen_port port ports=()
+  confirm_uninstall_app || return 1
+
+  listen_port="$(listen_port_from_config)"
+  for port in "$listen_port" "$FRONTEND_PORT" 9191 9192; do
+    [[ "$port" =~ ^[0-9]+$ ]] || continue
+    if append_unique "$port" "${ports[@]}" >/dev/null; then
+      ports+=("$port")
+    fi
+  done
+
+  stop_app_services
+  remove_app_containers
+  stop_lingering_app_processes "${ports[@]}"
   rm -f "$COMMAND_LINK" "$APP_COMMAND_LINK" "$MANAGER_PATH"
 
-  if [[ -t 0 ]]; then
-    read -r -p "删除 $INSTALL_PATH 里的程序、配置和数据吗？[y/N]: " confirm
-    case "$confirm" in
-      [yY]) rm -rf "$INSTALL_PATH" ;;
-      *) log "kept $INSTALL_PATH" ;;
-    esac
+  if delete_install_path_requested; then
+    rm -rf "$INSTALL_PATH"
+    log "removed $INSTALL_PATH"
   else
-    log "removed service; kept $INSTALL_PATH"
+    log "kept $INSTALL_PATH"
   fi
+
+  warn_remaining_listeners "${ports[@]}"
 }
 
 show_menu() {
@@ -600,7 +797,11 @@ show_menu() {
       3) main update ;;
       4) main restart ;;
       5) main stop ;;
-      6) main uninstall ;;
+      6)
+        if main uninstall; then
+          exit 0
+        fi
+        ;;
       0) exit 0 ;;
       *) echo "无效的选项" ;;
     esac

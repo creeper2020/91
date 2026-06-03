@@ -47,7 +47,7 @@ func (d *Driver) Init(context.Context) error {
 	}
 	info, err := os.Stat(root)
 	if err != nil {
-		return fmt.Errorf("localstorage: stat root: %w", err)
+		return fmt.Errorf("localstorage: stat root %q: %w%s", root, err, localStoragePathHint(d.rootPath))
 	}
 	if !info.IsDir() {
 		return fmt.Errorf("localstorage: root is not a directory: %s", root)
@@ -174,10 +174,36 @@ func (d *Driver) pathForID(id string) (string, string, error) {
 	if err != nil {
 		return "", "", err
 	}
-	if p != root && !strings.HasPrefix(p, root+string(os.PathSeparator)) {
+	if !pathWithinRoot(root, p) {
 		return "", "", errors.New("localstorage: path escapes root")
 	}
 	return p, rel, nil
+}
+
+func pathWithinRoot(root, path string) bool {
+	rel, err := filepath.Rel(root, path)
+	if err != nil {
+		return false
+	}
+	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator)))
+}
+
+func localStoragePathHint(configured string) string {
+	cwd, _ := os.Getwd()
+	parts := []string{}
+	if strings.TrimSpace(configured) != "" {
+		parts = append(parts, fmt.Sprintf("configured=%q", strings.TrimSpace(configured)))
+	}
+	if cwd != "" {
+		parts = append(parts, fmt.Sprintf("cwd=%q", cwd))
+	}
+	if _, err := os.Stat("/.dockerenv"); err == nil {
+		parts = append(parts, "docker=host paths must be bind-mounted into the container")
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return " (" + strings.Join(parts, ", ") + ")"
 }
 
 func decodeRel(id string) (string, error) {

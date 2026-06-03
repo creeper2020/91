@@ -16,13 +16,12 @@
   border: 1px solid var(--border-default);
   border-radius: var(--radius-xl);
   box-shadow: 0 8px 30px rgba(0, 0, 0, 0.4), var(--shadow-inset);
-  transition: border-color var(--transition-fast), box-shadow var(--transition-fast), transform var(--transition-fast);
+  transition: border-color var(--transition-fast), box-shadow var(--transition-fast);
 }
 
 .search-panel__form:focus-within {
   border-color: var(--border-accent);
   box-shadow: 0 0 0 1px var(--border-accent), 0 8px 24px var(--accent-glow);
-  transform: translateY(-1px);
 }
 
 .search-panel__input-wrapper {
@@ -83,7 +82,6 @@
 
 .search-panel__submit:hover {
   filter: brightness(1.05);
-  transform: translateY(-1px);
   box-shadow: 0 8px 20px var(--accent-glow), var(--shadow-inset);
 }
 

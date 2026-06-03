@@ -99,6 +99,27 @@ func TestPreviewURLFallsBackWithoutUpdatedAt(t *testing.T) {
 	}
 }
 
+func TestThumbnailURLVersionsLocalGeneratedThumbnails(t *testing.T) {
+	got := thumbnailURL(&catalog.Video{
+		ID:           "video-1",
+		ThumbnailURL: "/p/thumb/video-1",
+		UpdatedAt:    time.UnixMilli(1778863000123),
+	})
+	if got != "/p/thumb/video-1?v=1778863000123" {
+		t.Fatalf("thumbnail URL = %q, want versioned local URL", got)
+	}
+
+	remote := "https://thumb.example/video-1.jpg"
+	got = thumbnailURL(&catalog.Video{
+		ID:           "video-1",
+		ThumbnailURL: remote,
+		UpdatedAt:    time.UnixMilli(1778863000123),
+	})
+	if got != remote {
+		t.Fatalf("remote thumbnail URL = %q, want unchanged %q", got, remote)
+	}
+}
+
 func TestHandleHomePrioritizesVideosWithReadyThumbnails(t *testing.T) {
 	ctx := context.Background()
 	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
@@ -162,6 +183,59 @@ func TestHandleHomePrioritizesVideosWithReadyThumbnails(t *testing.T) {
 		}
 		if !strings.HasPrefix(item.Thumbnail, "https://thumb.example/") {
 			t.Fatalf("thumbnail for %q = %q, want ready thumbnail URL", item.ID, item.Thumbnail)
+		}
+	}
+}
+
+func TestHandleHomeExcludesRecentlyShownVideos(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cat.Close(); err != nil {
+			t.Fatalf("close catalog: %v", err)
+		}
+	})
+
+	now := time.Now()
+	for i := 0; i < homePageSize+4; i++ {
+		id := "ready-video-" + strconv.Itoa(i)
+		if err := cat.UpsertVideo(ctx, &catalog.Video{
+			ID:           id,
+			DriveID:      "drive",
+			FileID:       id,
+			Title:        id,
+			ThumbnailURL: "https://thumb.example/" + id + ".jpg",
+			PublishedAt:  now.Add(time.Duration(i) * time.Minute),
+			CreatedAt:    now.Add(time.Duration(i) * time.Minute),
+			UpdatedAt:    now.Add(time.Duration(i) * time.Minute),
+		}); err != nil {
+			t.Fatalf("seed ready video %s: %v", id, err)
+		}
+	}
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/home?exclude=ready-video-0&exclude=ready-video-1", nil)
+	(&Server{Catalog: cat}).handleHome(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	var got []VideoDTO
+	if err := json.NewDecoder(rr.Body).Decode(&got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(got) != homePageSize {
+		t.Fatalf("home items = %d, want %d", len(got), homePageSize)
+	}
+	for _, item := range got {
+		if item.ID == "ready-video-0" || item.ID == "ready-video-1" {
+			t.Fatalf("home returned excluded video %q; items=%#v", item.ID, got)
+		}
+		if !strings.HasPrefix(item.ID, "ready-video-") {
+			t.Fatalf("home returned %q without a ready thumbnail; items=%#v", item.ID, got)
 		}
 	}
 }
@@ -237,6 +311,26 @@ func TestHandleListLatestPrefersReadyThumbnails(t *testing.T) {
 			t.Fatalf("thumbnail for %q = %q, want ready thumbnail URL", item.ID, item.Thumbnail)
 		}
 	}
+
+	rr = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/api/list?page=1&size=12&sort=latest&count=false", nil)
+	(&Server{Catalog: cat}).handleList(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("count=false status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	got = struct {
+		Items []VideoDTO `json:"items"`
+		Total int        `json:"total"`
+	}{}
+	if err := json.NewDecoder(rr.Body).Decode(&got); err != nil {
+		t.Fatalf("decode count=false response: %v", err)
+	}
+	if got.Total != 0 {
+		t.Fatalf("count=false total = %d, want 0", got.Total)
+	}
+	if len(got.Items) != 12 {
+		t.Fatalf("count=false items = %d, want 12", len(got.Items))
+	}
 }
 
 func TestHandleUploadVideoSavesFileVideoTagsAndQueuesPreview(t *testing.T) {
@@ -261,7 +355,7 @@ func TestHandleUploadVideoSavesFileVideoTagsAndQueuesPreview(t *testing.T) {
 	}
 	req := multipartUploadRequest(t, map[string]string{
 		"title": "用户上传标题",
-		"tags":  "奶子,AV,女大",
+		"tags":  "奶子,口交,AV,女大",
 	}, "clip.mp4", "video-bytes")
 	rr := httptest.NewRecorder()
 
@@ -287,7 +381,7 @@ func TestHandleUploadVideoSavesFileVideoTagsAndQueuesPreview(t *testing.T) {
 	if got.Title != "用户上传标题" {
 		t.Fatalf("title = %q, want submitted title", got.Title)
 	}
-	if !sameStringSet(got.Tags, []string{"奶子", "AV", "女大"}) {
+	if !sameStringSet(got.Tags, []string{"奶子", "口交", "AV", "女大"}) {
 		t.Fatalf("tags = %#v, want selected tags", got.Tags)
 	}
 	if got.PreviewStatus != "pending" {
@@ -520,6 +614,66 @@ func TestHandleTagsReturnsUnifiedTagPool(t *testing.T) {
 	}
 	if qingchunCount != 1 {
 		t.Fatalf("清纯 count = %d, want 1; tags = %#v", qingchunCount, got)
+	}
+}
+
+func TestHandleShortsNextUsesPreferredVideoLeastPopulatedTag(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cat.Close(); err != nil {
+			t.Fatalf("close catalog: %v", err)
+		}
+	})
+
+	now := time.Now()
+	for _, v := range []*catalog.Video{
+		{ID: "current", DriveID: "drive", FileID: "f-current", Title: "current", Tags: []string{"common", "rare"}, PublishedAt: now, CreatedAt: now, UpdatedAt: now},
+		{ID: "common-1", DriveID: "drive", FileID: "f-common-1", Title: "common 1", Tags: []string{"common"}, PublishedAt: now, CreatedAt: now, UpdatedAt: now},
+		{ID: "common-2", DriveID: "drive", FileID: "f-common-2", Title: "common 2", Tags: []string{"common"}, PublishedAt: now, CreatedAt: now, UpdatedAt: now},
+		{ID: "rare-1", DriveID: "drive", FileID: "f-rare-1", Title: "rare 1", Tags: []string{"rare"}, PublishedAt: now, CreatedAt: now, UpdatedAt: now},
+	} {
+		if err := cat.UpsertVideo(ctx, v); err != nil {
+			t.Fatalf("seed %s: %v", v.ID, err)
+		}
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/shorts/next", strings.NewReader(`{"seenIds":["current"],"count":3,"preferredFromVideoId":"current"}`))
+	rr := httptest.NewRecorder()
+	(&Server{Catalog: cat}).handleShortsNext(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	var got struct {
+		Items         []ShortsItemDTO `json:"items"`
+		Total         int             `json:"total"`
+		RoundComplete bool            `json:"roundComplete"`
+	}
+	if err := json.NewDecoder(rr.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	ids := make([]string, 0, len(got.Items))
+	for _, item := range got.Items {
+		ids = append(ids, item.ID)
+	}
+	if got.Total != 4 {
+		t.Fatalf("total = %d, want 4", got.Total)
+	}
+	if got.RoundComplete {
+		t.Fatalf("roundComplete = true, want false with fallback-filled batch")
+	}
+	if !containsString(ids, "rare-1") {
+		t.Fatalf("ids = %#v, want rare-1 from least populated tag", ids)
+	}
+	if containsString(ids, "current") {
+		t.Fatalf("ids = %#v, should exclude current", ids)
+	}
+	if len(ids) != 3 {
+		t.Fatalf("ids = %#v, want 3 items", ids)
 	}
 }
 

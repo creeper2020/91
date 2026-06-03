@@ -10,11 +10,14 @@ export function TagCloud() {
 
   useEffect(() => {
     let active = true;
-    fetchTags().then((list) => {
-      if (active) setTags(list);
-    });
+    const timer = window.setTimeout(() => {
+      fetchTags().then((list) => {
+        if (active) setTags(list);
+      });
+    }, 500);
     return () => {
       active = false;
+      window.clearTimeout(timer);
     };
   }, []);
 

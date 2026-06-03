@@ -25,10 +25,12 @@ import (
 	"github.com/video-site/backend/internal/catalog"
 	"github.com/video-site/backend/internal/config"
 	"github.com/video-site/backend/internal/drives"
+	"github.com/video-site/backend/internal/drives/googledrive"
 	"github.com/video-site/backend/internal/drives/localstorage"
 	"github.com/video-site/backend/internal/drives/localupload"
 	"github.com/video-site/backend/internal/drives/onedrive"
 	"github.com/video-site/backend/internal/drives/p115"
+	"github.com/video-site/backend/internal/drives/p123"
 	"github.com/video-site/backend/internal/drives/pikpak"
 	"github.com/video-site/backend/internal/drives/quark"
 	"github.com/video-site/backend/internal/drives/spider91"
@@ -80,6 +82,7 @@ func main() {
 		Catalog:          cat,
 		Registry:         app.registry,
 		GetTargetDriveID: func() string { return app.Spider91UploadDriveID() },
+		CommonThumbDir:   app.commonThumbsDir(),
 	})
 
 	// 初始化本地内置盘；外部云盘放到 HTTP 服务启动后异步挂载，避免上游
@@ -89,6 +92,11 @@ func main() {
 
 	app.loadTheme(ctx)
 	app.loadSpider91UploadDriveID(ctx)
+	if removed, err := app.cleanupOrphanDriveVideos(ctx); err != nil {
+		log.Printf("[cleanup] orphan drive videos: %v", err)
+	} else if removed > 0 {
+		log.Printf("[cleanup] removed %d orphan drive videos", removed)
+	}
 	if err := app.attachLocalUpload(ctx); err != nil {
 		log.Printf("[local-upload] attach failed: %v", err)
 	}
@@ -125,6 +133,7 @@ func main() {
 		Catalog:         cat,
 		Auth:            authr,
 		VersionFilePath: versionFilePath,
+		ImageVersion:    strings.TrimSpace(os.Getenv("VIDEO_IMAGE_VERSION")),
 		GitHubRepo:      githubRepo,
 		SetupRequired: func() bool {
 			setupMu.Lock()
@@ -154,6 +163,9 @@ func main() {
 			}
 			return app.attachDrive(ctx, d)
 		},
+		OnDriveDeleteCleanup: func(cleanupCtx context.Context, driveID string) (int, error) {
+			return app.cleanupDriveVideosForDelete(cleanupCtx, driveID)
+		},
 		OnDriveRemoved: func(driveID string) {
 			app.detachDrive(driveID)
 		},
@@ -180,6 +192,9 @@ func main() {
 		OnRegenFailedThumbnails: func(driveID string) {
 			go app.regenFailedThumbnails(ctx, driveID)
 		},
+		OnRegenFailedFingerprints: func(driveID string) {
+			go app.regenFailedFingerprints(ctx, driveID)
+		},
 		GetDriveGenerationStatuses: func() map[string]api.DriveGenerationStatuses {
 			return app.driveGenerationStatuses()
 		},
@@ -203,10 +218,14 @@ func main() {
 		SetSpider91UploadDriveID: func(id string) error {
 			return app.SetSpider91UploadDriveID(ctx, id)
 		},
-		OnRunNightlyJob: func() {
+		OnRunNightlyJob: func() bool {
 			if app.nightlyRunner != nil {
-				app.nightlyRunner.TriggerNow()
+				return app.nightlyRunner.TriggerNow()
 			}
+			return false
+		},
+		GetNightlyJobStatus: func() api.NightlyJobStatus {
+			return app.nightlyJobStatus()
 		},
 		ListDriveDirChildren: func(reqCtx context.Context, driveID, parentID string) ([]api.DriveDirEntry, error) {
 			return app.listDriveDirChildren(reqCtx, driveID, parentID)
@@ -415,6 +434,27 @@ func (a *App) SetSpider91UploadDriveID(ctx context.Context, driveID string) erro
 	return a.cat.SetSetting(ctx, "spider91.upload_drive_id", driveID)
 }
 
+func (a *App) nightlyJobStatus() api.NightlyJobStatus {
+	if a.nightlyRunner == nil {
+		return api.NightlyJobStatus{State: "idle"}
+	}
+	status := a.nightlyRunner.Status()
+	return api.NightlyJobStatus{
+		State:          status.State,
+		Running:        status.Running,
+		Queued:         status.Queued,
+		StartedAt:      formatOptionalRFC3339(status.StartedAt),
+		LastFinishedAt: formatOptionalRFC3339(status.LastFinishedAt),
+	}
+}
+
+func formatOptionalRFC3339(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	return t.Format(time.RFC3339)
+}
+
 // isSpider91UploadKind 是 spider91 迁移目标盘的 allowlist。
 // 与 spider91migrate.adaptUploadTarget 的支持范围保持一致。
 func isSpider91UploadKind(kind string) bool {
@@ -581,6 +621,22 @@ func (a *App) attachDriveUnlocked(ctx context.Context, d *catalog.Drive) error {
 			Cookie: d.Credentials["cookie"],
 			RootID: d.RootID,
 		})
+	case p123.Kind:
+		drv = p123.New(p123.Config{
+			ID:          d.ID,
+			Username:    d.Credentials["username"],
+			Password:    d.Credentials["password"],
+			AccessToken: d.Credentials["access_token"],
+			Platform:    d.Credentials["platform"],
+			RootID:      d.RootID,
+			OnTokenUpdate: func(access string) {
+				if d.Credentials == nil {
+					d.Credentials = make(map[string]string)
+				}
+				d.Credentials["access_token"] = access
+				_ = a.cat.UpsertDrive(ctx, d)
+			},
+		})
 	case "pikpak":
 		drv = pikpak.New(pikpak.Config{
 			ID:               d.ID,
@@ -624,6 +680,27 @@ func (a *App) attachDriveUnlocked(ctx context.Context, d *catalog.Drive) error {
 			IsSharePoint: parseBoolDefault(d.Credentials["is_sharepoint"], false),
 			SiteID:       d.Credentials["site_id"],
 			RenewAPIURL:  d.Credentials["api_url_address"],
+			OnTokenUpdate: func(access, refresh string) {
+				if d.Credentials == nil {
+					d.Credentials = make(map[string]string)
+				}
+				d.Credentials["access_token"] = access
+				d.Credentials["refresh_token"] = refresh
+				_ = a.cat.UpsertDrive(ctx, d)
+			},
+		})
+	case googledrive.Kind:
+		drv = googledrive.New(googledrive.Config{
+			ID:           d.ID,
+			RootID:       d.RootID,
+			AccessToken:  d.Credentials["access_token"],
+			RefreshToken: d.Credentials["refresh_token"],
+			ClientID:     d.Credentials["client_id"],
+			ClientSecret: d.Credentials["client_secret"],
+			UseOnlineAPI: parseBoolDefault(d.Credentials["use_online_api"], true),
+			RenewAPIURL:  d.Credentials["api_url_address"],
+			OAuthURL:     d.Credentials["oauth_url"],
+			APIBaseURL:   d.Credentials["api_base_url"],
 			OnTokenUpdate: func(access, refresh string) {
 				if d.Credentials == nil {
 					d.Credentials = make(map[string]string)
@@ -726,7 +803,7 @@ func fingerprintConfigForDrive(drv drives.Drive) fingerprint.Config {
 		return cfg
 	}
 	switch strings.ToLower(drv.Kind()) {
-	case "p115", "onedrive":
+	case "p115", "p123", "onedrive":
 		cfg.RateLimitCooldown = 10 * time.Minute
 	case "pikpak":
 		cfg.RateLimitCooldown = 5 * time.Minute
@@ -806,13 +883,14 @@ func (a *App) attachSpider91Crawler(d *catalog.Drive, drv *spider91.Driver) {
 	a.spider91Crawlers[driveID] = c
 	a.mu.Unlock()
 
-	// 确保 "91porn" 系统标签存在，并把已入库的 spider91 视频按 author 字段
-	// 匹配补打这个标签（CreateTagAndClassify 内部对所有视频走一遍 classify）。
-	// 重复调用是幂等的：tags 用 INSERT OR IGNORE，video_tags 也是 INSERT OR IGNORE。
+	// 确保 "91porn" 系统标签存在，并按 spider91 来源前缀给历史视频补打。
+	// 不能只靠文本匹配：老版本入库的视频可能没有 author/tags 字段，但 id 前缀
+	// "spider91-<driveID>-" 会一直保留，即使后续迁移到 PikPak/115 也不变。
 	bgCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	go func() {
 		defer cancel()
-		if _, err := a.cat.CreateTagAndClassify(bgCtx, spider91.DefaultTag, nil, "system"); err != nil {
+		prefix := "spider91-" + driveID + "-"
+		if _, err := a.cat.EnsureTagForVideoIDPrefix(bgCtx, prefix, spider91.DefaultTag, nil, "system"); err != nil {
 			log.Printf("[spider91] ensure %q tag: %v", spider91.DefaultTag, err)
 		}
 	}()
@@ -1000,9 +1078,8 @@ func (a *App) detachDrive(id string) {
 // listDriveDirChildren 实现 AdminServer.ListDriveDirChildren：
 // 列指定 drive 在 parentID 下的直接子目录，仅返回目录条目（IsDir=true），文件忽略。
 //
-// parentID 为空时使用 drive 实例的 RootID()，与扫描起点保持一致 —— 但有意不
-// 用 ScanRootID：用户在"设置跳过目录"弹窗里浏览的是整个网盘逻辑根，方便从 0
-// 起逐层挑跳过点；ScanRootID 仅用于实际扫描起点。
+// parentID 为空时使用 drive 实例的 RootID()。用户在"设置跳过目录"弹窗里
+// 浏览的是整个网盘逻辑根，方便从根目录起逐层挑跳过点。
 //
 // 性能优化：p115 的 Driver.List 走 SDK 的 ListWithLimit，会把目录里全部文件 +
 // 目录分页拉完才返回；某些 115 根目录累积了几万个视频，单次列目录可能卡几十
@@ -1112,7 +1189,7 @@ func (a *App) runScan(ctx context.Context, driveID string) {
 		}
 	}
 
-	// 使用 drive 的 scan_root_id，否则 root_id；同时把 admin 配置的 SkipDirIDs
+	// 扫描入口固定使用 drive 的 root_id；同时把 admin 配置的 SkipDirIDs
 	// 传给 scanner（命中即不递归）。
 	d, err := a.cat.GetDrive(ctx, driveID)
 	if err != nil {
@@ -1121,10 +1198,7 @@ func (a *App) runScan(ctx context.Context, driveID string) {
 	}
 	sc := scanner.New(a.cat, drv, a.cfg.Scanner.VideoExtensions, d.SkipDirIDs, onNew)
 
-	startID := d.ScanRootID
-	if startID == "" {
-		startID = d.RootID
-	}
+	startID := d.RootID
 
 	log.Printf("[scan] drive=%s start=%s skip_dirs=%d", driveID, startID, len(d.SkipDirIDs))
 	stats, err := sc.Run(ctx, startID)
@@ -1185,6 +1259,160 @@ func (a *App) cleanupMissingDriveVideos(ctx context.Context, driveID string, liv
 		removed++
 	}
 	return removed, nil
+}
+
+func (a *App) cleanupDriveVideosForDelete(ctx context.Context, driveID string) (int, error) {
+	if a == nil || a.cat == nil {
+		return 0, nil
+	}
+	d, err := a.cat.GetDrive(ctx, driveID)
+	if err != nil {
+		return 0, err
+	}
+
+	// Stop generation/crawl workers before deleting assets so they do not keep
+	// writing files for a drive that is being removed.
+	a.detachDrive(driveID)
+
+	items, err := a.videosForDriveDelete(ctx, d)
+	if err != nil {
+		return 0, err
+	}
+
+	localDir := ""
+	if a.cfg != nil {
+		localDir = a.cfg.Storage.LocalPreviewDir
+	}
+	for _, v := range items {
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
+		if err := removeLocalVideoAssets(localDir, v); err != nil {
+			return 0, fmt.Errorf("remove local assets for %s: %w", v.ID, err)
+		}
+	}
+
+	if strings.EqualFold(d.Kind, spider91.Kind) {
+		if err := a.removeSpider91DriveDir(driveID); err != nil {
+			return 0, err
+		}
+	}
+
+	removed := 0
+	for _, v := range items {
+		if err := ctx.Err(); err != nil {
+			return removed, err
+		}
+		if err := a.cat.DeleteVideo(ctx, v.ID); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				continue
+			}
+			return removed, fmt.Errorf("delete catalog video %s: %w", v.ID, err)
+		}
+		removed++
+	}
+	return removed, nil
+}
+
+func (a *App) cleanupOrphanDriveVideos(ctx context.Context) (int, error) {
+	if a == nil || a.cat == nil {
+		return 0, nil
+	}
+	items, err := a.cat.ListVideosWithMissingDrive(ctx)
+	if err != nil {
+		return 0, err
+	}
+	if len(items) == 0 {
+		return 0, nil
+	}
+
+	localDir := ""
+	if a.cfg != nil {
+		localDir = a.cfg.Storage.LocalPreviewDir
+	}
+	spider91Dirs := map[string]struct{}{}
+	for _, v := range items {
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
+		if err := removeLocalVideoAssets(localDir, v); err != nil {
+			return 0, fmt.Errorf("remove local assets for orphan %s: %w", v.ID, err)
+		}
+		if strings.HasPrefix(v.ID, "spider91-"+v.DriveID+"-") {
+			spider91Dirs[v.DriveID] = struct{}{}
+		}
+	}
+	for driveID := range spider91Dirs {
+		if err := a.removeSpider91DriveDir(driveID); err != nil {
+			return 0, err
+		}
+	}
+
+	removed := 0
+	for _, v := range items {
+		if err := ctx.Err(); err != nil {
+			return removed, err
+		}
+		if err := a.cat.DeleteVideo(ctx, v.ID); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				continue
+			}
+			return removed, fmt.Errorf("delete orphan catalog video %s: %w", v.ID, err)
+		}
+		removed++
+	}
+	return removed, nil
+}
+
+func (a *App) videosForDriveDelete(ctx context.Context, d *catalog.Drive) ([]*catalog.Video, error) {
+	if d == nil {
+		return nil, nil
+	}
+	items, err := a.cat.ListVideosByDrive(ctx, d.ID)
+	if err != nil {
+		return nil, err
+	}
+	byID := make(map[string]*catalog.Video, len(items))
+	for _, v := range items {
+		byID[v.ID] = v
+	}
+
+	if strings.EqualFold(d.Kind, spider91.Kind) {
+		prefix := "spider91-" + d.ID + "-"
+		originItems, err := a.cat.ListVideosByIDPrefix(ctx, prefix)
+		if err != nil {
+			return nil, err
+		}
+		for _, v := range originItems {
+			byID[v.ID] = v
+		}
+	}
+
+	out := make([]*catalog.Video, 0, len(byID))
+	for _, v := range byID {
+		out = append(out, v)
+	}
+	return out, nil
+}
+
+func (a *App) removeSpider91DriveDir(driveID string) error {
+	if strings.TrimSpace(driveID) == "" {
+		return errors.New("remove spider91 drive dir: empty drive id")
+	}
+	root := a.spider91RootDir()
+	dir := a.spider91DriveDir(driveID)
+	clean, ok := localPathWithin(root, dir)
+	if !ok {
+		return fmt.Errorf("remove spider91 drive dir: unsafe path %s", dir)
+	}
+	rootClean, ok := localPathWithin(root, root)
+	if !ok || clean == rootClean {
+		return fmt.Errorf("remove spider91 drive dir: refusing to remove root %s", root)
+	}
+	if err := os.RemoveAll(clean); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("remove spider91 drive dir %s: %w", clean, err)
+	}
+	return nil
 }
 
 func removeLocalVideoAssets(localDir string, v *catalog.Video) error {
@@ -1490,8 +1718,9 @@ func (a *App) regenFailedThumbnails(ctx context.Context, driveID string) {
 		// 来判断是否真的要再生）。但既然之前是 failed 说明 url 没写过，所以这里
 		// 把 url 一并清空更稳。
 		if err := a.cat.UpdateVideoMeta(ctx, v.ID, catalog.VideoMetaPatch{
-			ThumbnailURL:    "",
-			ThumbnailStatus: "pending",
+			ThumbnailURL:           "",
+			ThumbnailStatus:        "pending",
+			ResetThumbnailFailures: true,
 		}); err != nil {
 			log.Printf("[thumb] reset failed video %s drive=%s: %v", v.ID, driveID, err)
 			continue
@@ -1504,6 +1733,42 @@ func (a *App) regenFailedThumbnails(ctx context.Context, driveID string) {
 		queued++
 	}
 	log.Printf("[thumb] enqueued failed thumbnails for regen drive=%s queued=%d", driveID, queued)
+}
+
+func (a *App) regenFailedFingerprints(ctx context.Context, driveID string) {
+	items, err := a.cat.ListVideosByFingerprintStatus(ctx, driveID, "failed", 0)
+	if err != nil {
+		log.Printf("[fingerprint] list failed videos for regen drive=%s: %v", driveID, err)
+		return
+	}
+	a.mu.Lock()
+	fingerprintWorker := a.fingerprintWorkers[driveID]
+	a.mu.Unlock()
+	if fingerprintWorker == nil {
+		log.Printf("[fingerprint] regen failed drive=%s skipped: fingerprint worker not found", driveID)
+		return
+	}
+	log.Printf("[fingerprint] enqueue failed videos for regen drive=%s count=%d", driveID, len(items))
+	queued := 0
+	for _, v := range items {
+		if err := ctx.Err(); err != nil {
+			log.Printf("[fingerprint] enqueue failed canceled drive=%s queued=%d: %v", driveID, queued, err)
+			return
+		}
+		if err := a.cat.UpdateVideoFingerprint(ctx, v.ID, "", "pending", ""); err != nil {
+			log.Printf("[fingerprint] reset failed video %s drive=%s: %v", v.ID, driveID, err)
+			continue
+		}
+		v.SampledSHA256 = ""
+		v.FingerprintStatus = "pending"
+		v.FingerprintError = ""
+		if !fingerprintWorker.EnqueueBlocking(ctx, v) {
+			log.Printf("[fingerprint] enqueue failed canceled drive=%s queued=%d", driveID, queued)
+			return
+		}
+		queued++
+	}
+	log.Printf("[fingerprint] enqueued failed videos for regen drive=%s queued=%d", driveID, queued)
 }
 
 // listScanTargetIDs 返回 nightly Phase 1 应扫描的所有 drive ID
@@ -1742,20 +2007,32 @@ func corsMiddleware(allowedOrigins []string) func(http.Handler) http.Handler {
 }
 
 func mountFrontend(r chi.Router) {
-	dir := strings.TrimSpace(os.Getenv("VIDEO_FRONTEND_DIR"))
-	if dir == "" {
-		dir = "./dist"
-	}
-	info, err := os.Stat(dir)
-	if err != nil || !info.IsDir() {
-		return
-	}
-	indexPath := filepath.Join(dir, "index.html")
-	if st, err := os.Stat(indexPath); err != nil || st.IsDir() {
+	dir, ok := resolveFrontendDir()
+	if !ok {
 		return
 	}
 	log.Printf("serving frontend from %s", dir)
 	r.NotFound(frontendHandler(dir))
+}
+
+func resolveFrontendDir() (string, bool) {
+	candidates := []string{}
+	if dir := strings.TrimSpace(os.Getenv("VIDEO_FRONTEND_DIR")); dir != "" {
+		candidates = append(candidates, dir)
+	} else {
+		candidates = append(candidates, "./dist", "../dist")
+	}
+	for _, dir := range candidates {
+		info, err := os.Stat(dir)
+		if err != nil || !info.IsDir() {
+			continue
+		}
+		indexPath := filepath.Join(dir, "index.html")
+		if st, err := os.Stat(indexPath); err == nil && !st.IsDir() {
+			return dir, true
+		}
+	}
+	return "", false
 }
 
 func frontendHandler(dir string) http.HandlerFunc {

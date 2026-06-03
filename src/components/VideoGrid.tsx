@@ -6,6 +6,7 @@ type Props = {
   loading?: boolean;
   compact?: boolean;
   emptyText?: string;
+  priorityCount?: number;
   skeletonCount?: number;
 };
 
@@ -14,6 +15,7 @@ export function VideoGrid({
   loading,
   compact,
   emptyText = "暂时没有视频",
+  priorityCount = 0,
   skeletonCount = 8,
 }: Props) {
   if (loading) {
@@ -32,8 +34,8 @@ export function VideoGrid({
 
   return (
     <div className={`video-grid ${compact ? "is-compact" : ""}`}>
-      {(videos ?? []).map((v) => (
-        <VideoCard key={v.id} video={v} />
+      {(videos ?? []).map((v, index) => (
+        <VideoCard key={v.id} video={v} priority={index < priorityCount} />
       ))}
     </div>
   );

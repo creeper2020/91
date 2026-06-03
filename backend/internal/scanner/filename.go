@@ -16,11 +16,11 @@ type ParsedName struct {
 }
 
 var (
-	reTags   = regexp.MustCompile(`^\s*\[([^\]]+)\]\s*`) // [tag1,tag2]
+	reTags   = regexp.MustCompile(`^\s*\[([^\]]+)\]\s*`) // [前缀]
 	reAuthor = regexp.MustCompile(`\s*-\s*([^-]+?)\s*$`) // - author
 )
 
-// Parse 按约定解析：[tag1,tag2] 标题 - 作者.ext
+// Parse 按约定解析：[前缀] 标题 - 作者.ext
 // 任何字段缺失都能降级
 func Parse(filename string) ParsedName {
 	name := strings.TrimSuffix(filename, path.Ext(filename))

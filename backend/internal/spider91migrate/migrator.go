@@ -4,7 +4,8 @@
 //   - 改写 catalog 行：drive_id / file_id / content_hash 改成目标盘的；
 //     视频自身的 id 不变（仍是 spider91-<driveID>-<viewkey>），video_tags、
 //     收藏、点赞、views 等关联数据全部保留
-//   - 删除本地 mp4（spider91/<id>/videos/<viewkey>.<ext>）和 thumb（spider91/<id>/thumbs/<viewkey>.jpg）
+//   - 删除本地 mp4（spider91/<id>/videos/<viewkey>.<ext>）和源 thumb
+//     （spider91/<id>/thumbs/<viewkey>.jpg）；公共 /p/thumb/<videoID> 副本会保留
 //
 // 之后回放时，videoSource() 自动落到 /p/stream/<target>/<file_id>，
 // proxy 层走对应盘的直链 / 302 直连。
@@ -175,6 +176,7 @@ type Config struct {
 	// 4002 / 9）后整体进入冷却的时长。冷却期间 runOnce 直接返回，不再发起任何
 	// PikPak API 请求，避免被进一步风控。0 时默认 5 分钟；< 0 关闭冷却（仅用于测试）。
 	CaptchaCooldown time.Duration
+	CommonThumbDir  string
 	OnMigrated      func(videoID string)
 }
 
@@ -571,16 +573,96 @@ func (m *Migrator) migrateOne(ctx context.Context, v *catalog.Video, src *spider
 	if err := m.cfg.Catalog.MigrateVideoToDrive(ctx, v.ID, targetDriveID, res.FileID, res.Hash); err != nil {
 		return false, fmt.Errorf("catalog migrate: %w", err)
 	}
+	m.preserveCrawledThumbnail(ctx, src, v)
 	// 同步 catalog 里的 file_name，让下次目标盘扫盘时 (file_name, size) 也能匹配上
 	if err := m.cfg.Catalog.UpdateVideoMeta(ctx, v.ID, catalog.VideoMetaPatch{FileName: uploadName}); err != nil {
 		log.Printf("[spider91migrate] %s update file_name after migrate: %v", v.ID, err)
 	}
 
-	// 删除本地 mp4 和 thumb（thumb 在 previews/thumbs/ 还有副本，不影响展示）
+	// 删除本地 mp4 和源 thumb（公共 /p/thumb 副本已在 preserveCrawledThumbnail 中保留）。
 	CleanupSpider91Local(src, v.FileID)
 
 	log.Printf("[spider91migrate] %s migrated to drive=%s(kind=%s) file=%s name=%q", v.ID, targetDriveID, pp.Kind(), res.FileID, uploadName)
 	return true, nil
+}
+
+func (m *Migrator) preserveCrawledThumbnail(ctx context.Context, src *spider91.Driver, v *catalog.Video) {
+	if m == nil || m.cfg.Catalog == nil || src == nil || v == nil || v.ID == "" || v.FileID == "" {
+		return
+	}
+	commonDir := strings.TrimSpace(m.cfg.CommonThumbDir)
+	if commonDir == "" {
+		return
+	}
+	thumbPath, ok := findSpider91ThumbPath(src, v.FileID)
+	if !ok {
+		if v.ThumbnailURL == "" {
+			log.Printf("[spider91migrate] %s crawled thumbnail missing before migration cleanup", v.ID)
+		}
+		return
+	}
+	if err := os.MkdirAll(commonDir, 0o755); err != nil {
+		log.Printf("[spider91migrate] %s mkdir common thumbs: %v", v.ID, err)
+		return
+	}
+	dst := filepath.Join(commonDir, v.ID+".jpg")
+	if _, err := os.Stat(dst); err != nil {
+		if !os.IsNotExist(err) {
+			log.Printf("[spider91migrate] %s stat common thumb: %v", v.ID, err)
+			return
+		}
+		if err := copyFileAtomic(thumbPath, dst); err != nil {
+			log.Printf("[spider91migrate] %s preserve crawled thumbnail: %v", v.ID, err)
+			return
+		}
+	}
+	if err := m.cfg.Catalog.UpdateVideoMeta(ctx, v.ID, catalog.VideoMetaPatch{
+		ThumbnailURL: "/p/thumb/" + v.ID,
+	}); err != nil {
+		log.Printf("[spider91migrate] %s update crawled thumbnail url: %v", v.ID, err)
+		return
+	}
+	v.ThumbnailURL = "/p/thumb/" + v.ID
+}
+
+func findSpider91ThumbPath(src *spider91.Driver, fileID string) (string, bool) {
+	thumbBase := stripExt(fileID)
+	for _, ext := range []string{".jpg", ".jpeg", ".png", ".webp"} {
+		thumbPath, err := src.ThumbPath(thumbBase + ext)
+		if err != nil {
+			continue
+		}
+		info, statErr := os.Stat(thumbPath)
+		if statErr == nil && info.Mode().IsRegular() && info.Size() > 0 {
+			return thumbPath, true
+		}
+	}
+	return "", false
+}
+
+func copyFileAtomic(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	tmp := dst + ".part"
+	out, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+	_, copyErr := io.Copy(out, in)
+	closeErr := out.Close()
+	if copyErr != nil {
+		_ = os.Remove(tmp)
+		return copyErr
+	}
+	if closeErr != nil {
+		_ = os.Remove(tmp)
+		return closeErr
+	}
+	return os.Rename(tmp, dst)
 }
 
 // CleanupSpider91Local 删除已迁移视频的本地 mp4 和 thumb。

@@ -12,6 +12,7 @@ import { PreviewVideo } from "./PreviewVideo";
 
 type Props = {
   video: VideoItem;
+  priority?: boolean;
 };
 
 const HOVER_DELAY_MS = 300;
@@ -24,7 +25,7 @@ function useActivePreviewId(): string | null {
   );
 }
 
-export function VideoCard({ video }: Props) {
+export function VideoCard({ video, priority = false }: Props) {
   const [previewState, setPreviewState] = useState<PreviewState>("idle");
   const [shouldRenderPreview, setShouldRenderPreview] = useState(false);
   const [progress, setProgress] = useState(0); // 0~1
@@ -204,7 +205,7 @@ export function VideoCard({ video }: Props) {
             className="thumb-image"
             src={thumbnailSrc}
             alt={video.title}
-            loading="lazy"
+            loading={priority ? "eager" : "lazy"}
             onError={handleThumbnailError}
           />
 
@@ -291,6 +292,7 @@ function sourceKindFromLabel(label: string): string {
   const value = label.toLowerCase();
   if (value.includes("夸克") || value.includes("quark")) return "quark";
   if (value.includes("115") || value.includes("p115")) return "p115";
+  if (value.includes("123") || value.includes("p123")) return "p123";
   if (value.includes("pikpak")) return "pikpak";
   if (value.includes("沃盘") || value.includes("wopan") || value.includes("联通")) return "wopan";
   if (value.includes("onedrive") || value.includes("one drive")) return "onedrive";

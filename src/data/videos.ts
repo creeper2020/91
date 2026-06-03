@@ -1,14 +1,19 @@
 import type { VideoDetail, VideoItem } from "@/types";
 
 // 真实后端接口调用。未配置网盘时，各接口返回空数据。
-export function fetchHomeVideos(): Promise<VideoItem[]> {
-  return apiGet<VideoItem[]>("/api/home").catch(() => []);
+export function fetchHomeVideos(excludeIds?: string[]): Promise<VideoItem[]> {
+  const qs = new URLSearchParams();
+  for (const id of excludeIds ?? []) {
+    if (id.trim()) qs.append("exclude", id.trim());
+  }
+  const suffix = qs.toString() ? `?${qs.toString()}` : "";
+  return apiGet<VideoItem[]>(`/api/home${suffix}`).catch(() => []);
 }
 
 export function fetchListing(
   page: number,
   pageSize: number,
-  params?: { q?: string; tag?: string; cat?: string; sort?: string }
+  params?: { q?: string; tag?: string; cat?: string; sort?: string; includeTotal?: boolean }
 ): Promise<{ items: VideoItem[]; total: number }> {
   const qs = new URLSearchParams({
     page: String(page),
@@ -18,6 +23,7 @@ export function fetchListing(
   if (params?.tag) qs.set("tag", params.tag);
   if (params?.cat) qs.set("cat", params.cat);
   if (params?.sort) qs.set("sort", params.sort);
+  if (params?.includeTotal === false) qs.set("count", "false");
   return apiGet<{ items: VideoItem[]; total: number }>(
     `/api/list?${qs.toString()}`
   ).catch(() => ({ items: [], total: 0 }));
@@ -73,8 +79,28 @@ export function uploadVideo(input: UploadVideoInput): Promise<VideoItem> {
 
 export type TagItem = { id: string; label: string; count?: number };
 
+const TAG_CACHE_TTL_MS = 30_000;
+let cachedTags: TagItem[] | null = null;
+let cachedTagsAt = 0;
+let pendingTags: Promise<TagItem[]> | null = null;
+
 export function fetchTags(): Promise<TagItem[]> {
-  return apiGet<TagItem[]>("/api/tags").catch(() => []);
+  const now = Date.now();
+  if (cachedTags && now - cachedTagsAt < TAG_CACHE_TTL_MS) {
+    return Promise.resolve(cachedTags);
+  }
+  if (pendingTags) return pendingTags;
+  pendingTags = apiGet<TagItem[]>("/api/tags")
+    .then((tags) => {
+      cachedTags = tags;
+      cachedTagsAt = Date.now();
+      return tags;
+    })
+    .catch(() => cachedTags ?? [])
+    .finally(() => {
+      pendingTags = null;
+    });
+  return pendingTags;
 }
 
 /** 短视频模式单条记录。比 VideoItem 多 videoSrc / poster。 */
@@ -93,17 +119,19 @@ export type ShortsNextResponse = {
 
 /**
  * 拉取短视频流的下一批候选。把当前轮已看过的 video id 列表传给后端，
- * 服务器从未在列表中的视频里随机抽 count 条返回。
+ * 服务器从未在列表中的视频里随机抽 count 条返回。preferredFromVideoId
+ * 来自用户最近一次点赞成功的视频，用于按相似标签优先推荐。
  *
  * 失败时返回空批 + roundComplete=false，由调用方决定是否重试。
  */
 export function fetchShortsNext(
   seenIds: string[],
-  count: number
+  count: number,
+  preferredFromVideoId?: string
 ): Promise<ShortsNextResponse> {
   return apiJSON<ShortsNextResponse>("/api/shorts/next", {
     method: "POST",
-    body: JSON.stringify({ seenIds, count }),
+    body: JSON.stringify({ seenIds, count, preferredFromVideoId }),
   }).catch(() => ({ items: [], total: 0, roundComplete: false }));
 }
 

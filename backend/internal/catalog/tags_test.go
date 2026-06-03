@@ -3,6 +3,7 @@ package catalog
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"testing"
 	"time"
 )
@@ -89,6 +90,32 @@ func TestListVideosNeedingThumbnailIncludesExistingThumbnailMissingDuration(t *t
 	if count != 2 {
 		t.Fatalf("count = %d, want 2", count)
 	}
+
+	counts, err := cat.CountThumbnailsByDrive(ctx)
+	if err != nil {
+		t.Fatalf("count thumbnails by drive: %v", err)
+	}
+	if got := counts["drive"]; got.Ready != 2 || got.Pending != 1 || got.Failed != 1 || got.DurationPending != 1 {
+		t.Fatalf("thumbnail counts = %#v, want ready=2 pending=1 failed=1 durationPending=1", got)
+	}
+
+	if err := cat.UpdateVideoMeta(ctx, "duration-only", VideoMetaPatch{ThumbnailStatus: "skipped"}); err != nil {
+		t.Fatalf("mark duration-only skipped: %v", err)
+	}
+	count, err = cat.CountVideosNeedingThumbnail(ctx, "drive")
+	if err != nil {
+		t.Fatalf("count videos needing thumbnail after skip: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("count after skip = %d, want 1", count)
+	}
+	counts, err = cat.CountThumbnailsByDrive(ctx)
+	if err != nil {
+		t.Fatalf("count thumbnails by drive after skip: %v", err)
+	}
+	if got := counts["drive"]; got.Ready != 2 || got.Pending != 1 || got.Failed != 1 || got.DurationPending != 0 {
+		t.Fatalf("thumbnail counts after skip = %#v, want ready=2 pending=1 failed=1 durationPending=0", got)
+	}
 }
 
 func TestCreateTagAndClassifyAddsTagToMatchingExistingVideos(t *testing.T) {
@@ -154,6 +181,242 @@ func TestCreateTagAndClassifyAddsTagToMatchingExistingVideos(t *testing.T) {
 	}
 }
 
+func TestDeleteTagRemovesTagFromVideos(t *testing.T) {
+	ctx := context.Background()
+	cat, err := Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cat.Close(); err != nil {
+			t.Fatalf("close catalog: %v", err)
+		}
+	})
+
+	now := time.Now()
+	if err := cat.UpsertVideo(ctx, &Video{
+		ID:          "video-1",
+		DriveID:     "drive",
+		FileID:      "file-1",
+		Title:       "清纯短发",
+		PublishedAt: now,
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}); err != nil {
+		t.Fatalf("seed video: %v", err)
+	}
+	if _, err := cat.CreateTagAndClassify(ctx, "清纯", nil, "user"); err != nil {
+		t.Fatalf("create tag: %v", err)
+	}
+
+	tag := mustTagByLabel(t, ctx, cat, "清纯")
+	removed, err := cat.DeleteTag(ctx, tag.ID)
+	if err != nil {
+		t.Fatalf("delete tag: %v", err)
+	}
+	if removed != 1 {
+		t.Fatalf("removed = %d, want 1", removed)
+	}
+
+	got, err := cat.GetVideo(ctx, "video-1")
+	if err != nil {
+		t.Fatalf("get video: %v", err)
+	}
+	if len(got.Tags) != 0 {
+		t.Fatalf("video tags = %#v, want none", got.Tags)
+	}
+	for _, tag := range mustListTags(t, ctx, cat) {
+		if tag.Label == "清纯" {
+			t.Fatal("deleted tag still appears in ListTags")
+		}
+	}
+}
+
+func TestDeleteTagSuppressesAutomaticCollectionRecreation(t *testing.T) {
+	ctx := context.Background()
+	cat, err := Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cat.Close(); err != nil {
+			t.Fatalf("close catalog: %v", err)
+		}
+	})
+
+	now := time.Now()
+	for _, id := range []string{"video-1", "video-2"} {
+		if err := cat.UpsertVideo(ctx, &Video{
+			ID:          id,
+			DriveID:     "drive",
+			FileID:      id,
+			Title:       "合集视频",
+			Category:    "sunny",
+			PublishedAt: now,
+			CreatedAt:   now,
+			UpdatedAt:   now,
+		}); err != nil {
+			t.Fatalf("seed video %s: %v", id, err)
+		}
+	}
+
+	if label, ok, err := cat.EnsureCollectionTag(ctx, "sunny"); err != nil || !ok || label != "sunny" {
+		t.Fatalf("ensure collection = %q, %v, %v; want sunny true nil", label, ok, err)
+	}
+	tag := mustTagByLabel(t, ctx, cat, "sunny")
+	if _, err := cat.DeleteTag(ctx, tag.ID); err != nil {
+		t.Fatalf("delete tag: %v", err)
+	}
+
+	if label, ok, err := cat.EnsureCollectionTag(ctx, "sunny"); err != nil || ok || label != "" {
+		t.Fatalf("ensure deleted collection = %q, %v, %v; want empty false nil", label, ok, err)
+	}
+	for _, tag := range mustListTags(t, ctx, cat) {
+		if tag.Label == "sunny" {
+			t.Fatal("deleted collection tag was recreated automatically")
+		}
+	}
+}
+
+func TestCreateTagAndClassifyRestoresDeletedTag(t *testing.T) {
+	ctx := context.Background()
+	cat, err := Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cat.Close(); err != nil {
+			t.Fatalf("close catalog: %v", err)
+		}
+	})
+
+	now := time.Now()
+	if err := cat.UpsertVideo(ctx, &Video{
+		ID:          "video-1",
+		DriveID:     "drive",
+		FileID:      "file-1",
+		Title:       "清纯短发",
+		PublishedAt: now,
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}); err != nil {
+		t.Fatalf("seed video: %v", err)
+	}
+	if _, err := cat.CreateTagAndClassify(ctx, "清纯", nil, "user"); err != nil {
+		t.Fatalf("create tag: %v", err)
+	}
+	tag := mustTagByLabel(t, ctx, cat, "清纯")
+	if _, err := cat.DeleteTag(ctx, tag.ID); err != nil {
+		t.Fatalf("delete tag: %v", err)
+	}
+
+	classified, err := cat.CreateTagAndClassify(ctx, "清纯", nil, "user")
+	if err != nil {
+		t.Fatalf("recreate tag: %v", err)
+	}
+	if classified != 1 {
+		t.Fatalf("classified = %d, want 1", classified)
+	}
+	got, err := cat.GetVideo(ctx, "video-1")
+	if err != nil {
+		t.Fatalf("get video: %v", err)
+	}
+	if !sameStrings(got.Tags, []string{"清纯"}) {
+		t.Fatalf("video tags = %#v, want 清纯", got.Tags)
+	}
+}
+
+func TestEnsureTagForVideoIDPrefixBackfillsSourceTag(t *testing.T) {
+	ctx := context.Background()
+	cat, err := Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cat.Close(); err != nil {
+			t.Fatalf("close catalog: %v", err)
+		}
+	})
+
+	now := time.Now()
+	for _, seed := range []struct {
+		id     string
+		manual bool
+	}{
+		{id: "spider91-91-spider-1200001"},
+		{id: "spider91-91-spider-1200002", manual: true},
+		{id: "spider91-other-1200003"},
+	} {
+		if err := cat.UpsertVideo(ctx, &Video{
+			ID:          seed.id,
+			DriveID:     "91-spider",
+			FileID:      seed.id + ".mp4",
+			Title:       "legacy title without source text",
+			PublishedAt: now,
+			CreatedAt:   now,
+			UpdatedAt:   now,
+		}); err != nil {
+			t.Fatalf("seed %s: %v", seed.id, err)
+		}
+		if seed.manual {
+			if err := cat.SetManualVideoTags(ctx, seed.id, nil); err != nil {
+				t.Fatalf("mark %s manual: %v", seed.id, err)
+			}
+		}
+	}
+
+	added, err := cat.EnsureTagForVideoIDPrefix(ctx, "spider91-91-spider-", "91porn", nil, "system")
+	if err != nil {
+		t.Fatalf("ensure prefix tag: %v", err)
+	}
+	if added != 1 {
+		t.Fatalf("added = %d, want 1", added)
+	}
+	got, err := cat.GetVideo(ctx, "spider91-91-spider-1200001")
+	if err != nil {
+		t.Fatalf("get tagged video: %v", err)
+	}
+	if !sameStrings(got.Tags, []string{"91porn"}) {
+		t.Fatalf("tagged video tags = %#v, want 91porn", got.Tags)
+	}
+	manual, err := cat.GetVideo(ctx, "spider91-91-spider-1200002")
+	if err != nil {
+		t.Fatalf("get manual video: %v", err)
+	}
+	if len(manual.Tags) != 0 {
+		t.Fatalf("manual video tags = %#v, want unchanged", manual.Tags)
+	}
+	other, err := cat.GetVideo(ctx, "spider91-other-1200003")
+	if err != nil {
+		t.Fatalf("get other prefix video: %v", err)
+	}
+	if len(other.Tags) != 0 {
+		t.Fatalf("other prefix video tags = %#v, want unchanged", other.Tags)
+	}
+}
+
+func TestDeleteTagRejectsSystemTags(t *testing.T) {
+	ctx := context.Background()
+	cat, err := Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cat.Close(); err != nil {
+			t.Fatalf("close catalog: %v", err)
+		}
+	})
+
+	tag := mustTagByLabel(t, ctx, cat, "AV")
+	if _, err := cat.DeleteTag(ctx, tag.ID); !errors.Is(err, ErrSystemTag) {
+		t.Fatalf("delete system tag err = %v, want ErrSystemTag", err)
+	}
+
+	if tag := mustTagByLabel(t, ctx, cat, "AV"); tag.Source != "system" {
+		t.Fatalf("AV source = %q, want system", tag.Source)
+	}
+}
+
 func TestOpenClassifiesSystemTagsForExistingVideos(t *testing.T) {
 	path := t.TempDir() + "/catalog.db"
 	db, err := sql.Open("sqlite", path)
@@ -201,6 +464,84 @@ VALUES
 	}
 	if len(manual.Tags) != 0 {
 		t.Fatalf("manual tags = %#v, want unchanged", manual.Tags)
+	}
+}
+
+func TestMigrateDoesNotRewriteAlreadySyncedVideoTags(t *testing.T) {
+	ctx := context.Background()
+	cat, err := Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cat.Close(); err != nil {
+			t.Fatalf("close catalog: %v", err)
+		}
+	})
+
+	now := time.Now()
+	for _, id := range []string{"video-1", "video-2", "video-3"} {
+		if err := cat.UpsertVideo(ctx, &Video{
+			ID:          id,
+			DriveID:     "drive",
+			FileID:      id,
+			Title:       "巨乳后入合集",
+			Category:    "Better Call Saul S03",
+			PublishedAt: now,
+			CreatedAt:   now,
+			UpdatedAt:   now,
+		}); err != nil {
+			t.Fatalf("seed %s: %v", id, err)
+		}
+	}
+	if err := cat.migrate(ctx); err != nil {
+		t.Fatalf("first migrate: %v", err)
+	}
+
+	before := videoUpdatedAtByID(t, ctx, cat, "video-1", "video-2", "video-3")
+	time.Sleep(5 * time.Millisecond)
+	if err := cat.migrate(ctx); err != nil {
+		t.Fatalf("second migrate: %v", err)
+	}
+	after := videoUpdatedAtByID(t, ctx, cat, "video-1", "video-2", "video-3")
+	for id, want := range before {
+		if got := after[id]; got != want {
+			t.Fatalf("%s updated_at changed on no-op migrate: got %d, want %d", id, got, want)
+		}
+	}
+}
+
+func TestMigrateBackfillsLegacyTagsWithoutRelations(t *testing.T) {
+	ctx := context.Background()
+	cat, err := Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cat.Close(); err != nil {
+			t.Fatalf("close catalog: %v", err)
+		}
+	})
+
+	now := time.Now().UnixMilli()
+	if _, err := cat.db.ExecContext(ctx, `
+INSERT INTO videos (id, drive_id, file_id, title, tags, tags_manual, published_at, created_at, updated_at)
+VALUES ('legacy-video', 'drive', 'file-legacy', 'legacy title', '["legacy-tag"]', 0, ?, ?, ?)`,
+		now, now, now); err != nil {
+		t.Fatalf("seed legacy video: %v", err)
+	}
+	if err := cat.migrate(ctx); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+
+	tag := mustTagByLabel(t, ctx, cat, "legacy-tag")
+	var count int
+	if err := cat.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM video_tags WHERE video_id = 'legacy-video' AND tag_id = ?`, tag.ID).Scan(&count); err != nil {
+		t.Fatalf("count video tag: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("legacy video tag relation count = %d, want 1", count)
 	}
 }
 
@@ -463,7 +804,7 @@ func TestMigrateCollapsesAVCodeTagsIntoAV(t *testing.T) {
 	}
 }
 
-func TestMigrateClearsVolatileOneDriveThumbnailURLs(t *testing.T) {
+func TestMigrateClearsRemoteNonSpiderThumbnailURLs(t *testing.T) {
 	ctx := context.Background()
 	cat, err := Open(t.TempDir() + "/catalog.db")
 	if err != nil {
@@ -485,6 +826,36 @@ func TestMigrateClearsVolatileOneDriveThumbnailURLs(t *testing.T) {
 		UpdatedAt: now,
 	}); err != nil {
 		t.Fatalf("seed onedrive: %v", err)
+	}
+	if err := cat.UpsertDrive(ctx, &Drive{
+		ID:        "p123-main",
+		Kind:      "p123",
+		Name:      "123Pan",
+		RootID:    "root",
+		CreatedAt: now,
+		UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("seed p123: %v", err)
+	}
+	if err := cat.UpsertDrive(ctx, &Drive{
+		ID:        "pikpak-main",
+		Kind:      "pikpak",
+		Name:      "PikPak",
+		RootID:    "root",
+		CreatedAt: now,
+		UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("seed pikpak: %v", err)
+	}
+	if err := cat.UpsertDrive(ctx, &Drive{
+		ID:        "spider91-main",
+		Kind:      "spider91",
+		Name:      "91Spider",
+		RootID:    "root",
+		CreatedAt: now,
+		UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("seed spider91: %v", err)
 	}
 
 	videos := []*Video{
@@ -508,6 +879,27 @@ func TestMigrateClearsVolatileOneDriveThumbnailURLs(t *testing.T) {
 			FileID:       "file-3",
 			Title:        "PikPak",
 			ThumbnailURL: "https://sg-thumbnail-drive.mypikpak.net/v0/screenshot-thumbnails/demo",
+		},
+		{
+			ID:           "p123-remote-thumb-video",
+			DriveID:      "p123-main",
+			FileID:       "file-4",
+			Title:        "123Pan remote thumb",
+			ThumbnailURL: "https://download.123pan.com/thumb/file_70_70?w=70&h=70",
+		},
+		{
+			ID:           "p123-local-thumb-video",
+			DriveID:      "p123-main",
+			FileID:       "file-5",
+			Title:        "123Pan local thumb",
+			ThumbnailURL: "/p/thumb/p123-local-thumb-video",
+		},
+		{
+			ID:           "spider91-local-thumb-video",
+			DriveID:      "spider91-main",
+			FileID:       "file-6",
+			Title:        "91Spider local thumb",
+			ThumbnailURL: "/p/thumb/spider91-local-thumb-video",
 		},
 	}
 	for _, v := range videos {
@@ -543,8 +935,39 @@ func TestMigrateClearsVolatileOneDriveThumbnailURLs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get pikpak video: %v", err)
 	}
-	if pikpak.ThumbnailURL == "" {
-		t.Fatal("pikpak thumbnail was cleared")
+	if pikpak.ThumbnailURL != "" {
+		t.Fatalf("pikpak thumbnail = %q, want cleared", pikpak.ThumbnailURL)
+	}
+
+	p123Remote, err := cat.GetVideo(ctx, "p123-remote-thumb-video")
+	if err != nil {
+		t.Fatalf("get p123 remote thumb video: %v", err)
+	}
+	if p123Remote.ThumbnailURL != "" {
+		t.Fatalf("p123 remote thumbnail = %q, want cleared", p123Remote.ThumbnailURL)
+	}
+	var p123Status string
+	if err := cat.db.QueryRowContext(ctx, `SELECT thumbnail_status FROM videos WHERE id = ?`, "p123-remote-thumb-video").Scan(&p123Status); err != nil {
+		t.Fatalf("read p123 thumbnail status: %v", err)
+	}
+	if p123Status != "pending" {
+		t.Fatalf("p123 remote thumbnail_status = %q, want pending", p123Status)
+	}
+
+	p123Local, err := cat.GetVideo(ctx, "p123-local-thumb-video")
+	if err != nil {
+		t.Fatalf("get p123 local thumb video: %v", err)
+	}
+	if p123Local.ThumbnailURL != "/p/thumb/p123-local-thumb-video" {
+		t.Fatalf("p123 local thumbnail = %q, want preserved", p123Local.ThumbnailURL)
+	}
+
+	spider91Local, err := cat.GetVideo(ctx, "spider91-local-thumb-video")
+	if err != nil {
+		t.Fatalf("get spider91 local thumb video: %v", err)
+	}
+	if spider91Local.ThumbnailURL != "/p/thumb/spider91-local-thumb-video" {
+		t.Fatalf("spider91 local thumbnail = %q, want preserved", spider91Local.ThumbnailURL)
 	}
 }
 
@@ -665,6 +1088,98 @@ func TestListVideosHidesDuplicateContentHashes(t *testing.T) {
 	}
 }
 
+func TestTagFilterMatchesCanonicalDuplicateVideo(t *testing.T) {
+	ctx := context.Background()
+	cat, err := Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cat.Close(); err != nil {
+			t.Fatalf("close catalog: %v", err)
+		}
+	})
+
+	now := time.Now()
+	for _, v := range []*Video{
+		{
+			ID:          "pikpak-canonical",
+			DriveID:     "pikpak",
+			FileID:      "canonical.mp4",
+			Title:       "Canonical",
+			Size:        1024,
+			PublishedAt: now,
+			CreatedAt:   now,
+			UpdatedAt:   now,
+		},
+		{
+			ID:          "spider91-dup-1",
+			DriveID:     "91-spider",
+			FileID:      "dup-1.mp4",
+			Title:       "Spider duplicate 1",
+			Tags:        []string{"91porn"},
+			Size:        1024,
+			PublishedAt: now.Add(time.Second),
+			CreatedAt:   now.Add(time.Second),
+			UpdatedAt:   now.Add(time.Second),
+		},
+		{
+			ID:          "spider91-dup-2",
+			DriveID:     "91-spider",
+			FileID:      "dup-2.mp4",
+			Title:       "Spider duplicate 2",
+			Tags:        []string{"91porn"},
+			Size:        1024,
+			PublishedAt: now.Add(2 * time.Second),
+			CreatedAt:   now.Add(2 * time.Second),
+			UpdatedAt:   now.Add(2 * time.Second),
+		},
+		{
+			ID:          "spider91-visible",
+			DriveID:     "91-spider",
+			FileID:      "visible.mp4",
+			Title:       "Spider visible",
+			Tags:        []string{"91porn"},
+			Size:        2048,
+			PublishedAt: now.Add(3 * time.Second),
+			CreatedAt:   now.Add(3 * time.Second),
+			UpdatedAt:   now.Add(3 * time.Second),
+		},
+	} {
+		if err := cat.UpsertVideo(ctx, v); err != nil {
+			t.Fatalf("seed %s: %v", v.ID, err)
+		}
+	}
+	for _, id := range []string{"pikpak-canonical", "spider91-dup-1", "spider91-dup-2"} {
+		if err := cat.UpdateVideoFingerprint(ctx, id, "same-sampled-sha256", "ready", ""); err != nil {
+			t.Fatalf("fingerprint %s: %v", id, err)
+		}
+	}
+	if err := cat.UpdateVideoFingerprint(ctx, "spider91-visible", "unique-sampled-sha256", "ready", ""); err != nil {
+		t.Fatalf("fingerprint visible: %v", err)
+	}
+
+	items, total, err := cat.ListVideos(ctx, ListParams{Tag: "91porn", Page: 1, PageSize: 10})
+	if err != nil {
+		t.Fatalf("list videos by tag: %v", err)
+	}
+	if total != 2 || len(items) != 2 {
+		t.Fatalf("tagged videos total=%d len=%d, want 2", total, len(items))
+	}
+	gotIDs := map[string]bool{}
+	for _, item := range items {
+		gotIDs[item.ID] = true
+	}
+	for _, want := range []string{"pikpak-canonical", "spider91-visible"} {
+		if !gotIDs[want] {
+			t.Fatalf("tagged video ids = %#v, want %s", gotIDs, want)
+		}
+	}
+	if got := mustTagByLabel(t, ctx, cat, "91porn").Count; got != 2 {
+		t.Fatalf("91porn count = %d, want 2 visible canonical videos", got)
+	}
+}
+
 func TestListVideosCanFilterReadyThumbnails(t *testing.T) {
 	ctx := context.Background()
 	cat, err := Open(t.TempDir() + "/catalog.db")
@@ -728,6 +1243,39 @@ func sameStrings(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+func mustListTags(t *testing.T, ctx context.Context, cat *Catalog) []Tag {
+	t.Helper()
+	tags, err := cat.ListTags(ctx)
+	if err != nil {
+		t.Fatalf("list tags: %v", err)
+	}
+	return tags
+}
+
+func mustTagByLabel(t *testing.T, ctx context.Context, cat *Catalog, label string) Tag {
+	t.Helper()
+	for _, tag := range mustListTags(t, ctx, cat) {
+		if tag.Label == label {
+			return tag
+		}
+	}
+	t.Fatalf("tag %q not found", label)
+	return Tag{}
+}
+
+func videoUpdatedAtByID(t *testing.T, ctx context.Context, cat *Catalog, ids ...string) map[string]int64 {
+	t.Helper()
+	out := make(map[string]int64, len(ids))
+	for _, id := range ids {
+		var updatedAt int64
+		if err := cat.db.QueryRowContext(ctx, `SELECT updated_at FROM videos WHERE id = ?`, id).Scan(&updatedAt); err != nil {
+			t.Fatalf("read updated_at for %s: %v", id, err)
+		}
+		out[id] = updatedAt
+	}
+	return out
 }
 
 // 删除 collection 标签的最后一个引用视频后，标签应当自动从 tags 表里消失。
@@ -923,11 +1471,12 @@ func TestReconcileThumbnailStatusOnce(t *testing.T) {
 		id, url, status string
 		wantStatus      string
 	}{
-		{"v-pending-url", "/p/thumb/v-pending-url", "pending", "ready"},         // 主要修复目标
-		{"v-empty-url-pending", "", "pending", "pending"},                       // 没 url 不动
-		{"v-failed-with-url", "/p/thumb/v-failed-with-url", "failed", "failed"}, // 显式失败保留
-		{"v-empty-url-failed", "", "failed", "failed"},                          // 失败 + 没 url 也保留
-		{"v-already-ready", "/p/thumb/v-already-ready", "ready", "ready"},       // 幂等
+		{"v-pending-url", "/p/thumb/v-pending-url", "pending", "ready"},             // 主要修复目标
+		{"v-empty-url-pending", "", "pending", "pending"},                           // 没 url 不动
+		{"v-failed-with-url", "/p/thumb/v-failed-with-url", "failed", "failed"},     // 显式失败保留
+		{"v-empty-url-failed", "", "failed", "failed"},                              // 失败 + 没 url 也保留
+		{"v-skipped-with-url", "/p/thumb/v-skipped-with-url", "skipped", "skipped"}, // 已跳过的时长补全保留
+		{"v-already-ready", "/p/thumb/v-already-ready", "ready", "ready"},           // 幂等
 	}
 	for _, c := range cases {
 		if err := cat.UpsertVideo(ctx, &Video{

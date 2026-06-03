@@ -176,6 +176,31 @@ func TestServeStreamRedirectsOneDrive(t *testing.T) {
 	}
 }
 
+func TestServeStreamRedirectsP123(t *testing.T) {
+	reg := NewRegistry()
+	drv := &proxyFakeSimpleDrive{
+		kind: "p123",
+		url:  "https://cdn.123pan.example/video.mp4",
+	}
+	reg.Set("p123", drv)
+
+	p := New(reg)
+	req := httptest.NewRequest(http.MethodGet, "/p/stream/p123/file-1", nil)
+	rr := httptest.NewRecorder()
+
+	p.ServeStream(rr, req, "p123", "file-1")
+
+	if rr.Code != http.StatusFound {
+		t.Fatalf("status = %d, want %d", rr.Code, http.StatusFound)
+	}
+	if got := rr.Header().Get("Location"); got != "https://cdn.123pan.example/video.mp4" {
+		t.Fatalf("Location = %q", got)
+	}
+	if drv.calls != 1 {
+		t.Fatalf("link calls = %d, want 1", drv.calls)
+	}
+}
+
 func TestServeStreamServesLocalFilePath(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "video.mp4")
 	if err := os.WriteFile(path, []byte("0123456789"), 0o644); err != nil {

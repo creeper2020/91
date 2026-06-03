@@ -68,6 +68,7 @@ function sourceKindFromLabel(label: string): string {
   const value = label.toLowerCase();
   if (value.includes("夸克") || value.includes("quark")) return "quark";
   if (value.includes("115") || value.includes("p115")) return "p115";
+  if (value.includes("123") || value.includes("p123")) return "p123";
   if (value.includes("pikpak")) return "pikpak";
   if (value.includes("沃盘") || value.includes("wopan") || value.includes("联通"))
     return "wopan";

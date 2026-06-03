@@ -333,6 +333,12 @@
   color: var(--drive-p115);
 }
 
+.vd-meta__chip[data-tone="p123"] {
+  background: rgba(34, 184, 200, 0.14);
+  border-color: rgba(34, 184, 200, 0.3);
+  color: var(--drive-p123);
+}
+
 .vd-meta__chip[data-tone="pikpak"] {
   background: rgba(138, 109, 255, 0.14);
   border-color: rgba(138, 109, 255, 0.3);
@@ -883,7 +889,6 @@
 
 .vd-rail__link:hover {
   background: rgba(255, 255, 255, 0.04);
-  transform: translateY(-1px);
 }
 
 .vd-rail__link:focus-visible {

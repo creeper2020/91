@@ -120,12 +120,16 @@ export default function ShortsPage() {
 
   // seenIds 用 ref 维护，方便在异步 callback 里读到最新值
   const seenIdsRef = useRef<string[]>(loadSeenIds());
+  const preferredFromVideoIdRef = useRef<string | null>(null);
 
   const containerRef = useRef<HTMLDivElement | null>(null);
   // 整个页面根元素，用于 requestFullscreen
   const pageRef = useRef<HTMLDivElement | null>(null);
   // index → video element，用来精确控制播放/暂停
   const videoRefs = useRef<Map<number, HTMLVideoElement>>(new Map());
+  const activeIndexRef = useRef(0);
+  const ignoreIntersectionUntilRef = useRef(0);
+  const fullscreenRestoreTimersRef = useRef<number[]>([]);
 
   // 当前是否处在浏览器全屏（Fullscreen API）状态。
   // iOS Safari 不支持元素级 Fullscreen API，这里会一直保持 false，
@@ -138,6 +142,10 @@ export default function ShortsPage() {
   // 与后端的真实 likes 字段同步——后端是单纯计数器，前端在这里防重避免连发。
   // 用户在操作栏点取消时会从这里移除，允许之后再次点赞。
   const likedIdsRef = useRef<Set<string>>(new Set());
+
+  useEffect(() => {
+    activeIndexRef.current = activeIndex;
+  }, [activeIndex]);
 
   /**
    * 切换点赞状态。
@@ -163,6 +171,11 @@ export default function ShortsPage() {
         );
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const data = (await res.json()) as { likes?: number };
+        if (liked) {
+          preferredFromVideoIdRef.current = videoId;
+        } else if (preferredFromVideoIdRef.current === videoId) {
+          preferredFromVideoIdRef.current = null;
+        }
         return typeof data.likes === "number" ? data.likes : null;
       } catch {
         // 请求失败：回滚集合，让 Slide 自己回滚 UI
@@ -191,7 +204,11 @@ export default function ShortsPage() {
     setLoading(true);
     try {
       const seen = seenIdsRef.current;
-      const resp = await fetchShortsNext(seen, BATCH_SIZE);
+      const resp = await fetchShortsNext(
+        seen,
+        BATCH_SIZE,
+        preferredFromVideoIdRef.current ?? undefined
+      );
       if (resp.items.length === 0) {
         setEmpty((prev) => prev || true /* 维持 true 即可 */);
         setRoundComplete(true);
@@ -250,6 +267,8 @@ export default function ShortsPage() {
 
     const observer = new IntersectionObserver(
       (entries) => {
+        if (Date.now() < ignoreIntersectionUntilRef.current) return;
+
         let bestIndex = -1;
         let bestRatio = 0.6;
         for (const entry of entries) {
@@ -437,11 +456,37 @@ export default function ShortsPage() {
     };
   }, []);
 
+  function clearFullscreenRestoreTimers() {
+    for (const timer of fullscreenRestoreTimersRef.current) {
+      window.clearTimeout(timer);
+    }
+    fullscreenRestoreTimersRef.current = [];
+  }
+
+  function restoreActiveSlideIntoView() {
+    const idx = activeIndexRef.current;
+    const slide = containerRef.current?.querySelector<HTMLElement>(
+      `[data-index="${idx}"]`
+    );
+    if (!slide) return;
+    slide.scrollIntoView({ block: "start", inline: "nearest", behavior: "auto" });
+  }
+
+  function scheduleFullscreenActiveRestore() {
+    ignoreIntersectionUntilRef.current = Date.now() + 700;
+    clearFullscreenRestoreTimers();
+    restoreActiveSlideIntoView();
+    fullscreenRestoreTimersRef.current = [80, 220, 520].map((delay) =>
+      window.setTimeout(restoreActiveSlideIntoView, delay)
+    );
+  }
+
   // ---- 浏览器全屏（Fullscreen API） ----
   // 监听全屏状态变化，保持 React state 同步。
   // 用户按 ESC / 系统返回 / 浏览器退出全屏按钮 时也会走这里。
   useEffect(() => {
     function handleChange() {
+      scheduleFullscreenActiveRestore();
       setIsFullscreen(
         document.fullscreenElement !== null ||
           // Safari (desktop) 旧前缀
@@ -454,6 +499,7 @@ export default function ShortsPage() {
     return () => {
       document.removeEventListener("fullscreenchange", handleChange);
       document.removeEventListener("webkitfullscreenchange", handleChange);
+      clearFullscreenRestoreTimers();
     };
   }, []);
 
@@ -530,6 +576,7 @@ export default function ShortsPage() {
   }
 
   function toggleFullscreen() {
+    scheduleFullscreenActiveRestore();
     if (isFullscreen) exitPageFullscreen();
     else requestPageFullscreen();
   }
@@ -695,6 +742,7 @@ function ShortsSlide({
   const [duration, setDuration] = useState(0);
   const [currentTime, setCurrentTime] = useState(0);
   const [scrubbing, setScrubbing] = useState(false);
+  const scrubbingRef = useRef(false);
   // 拖动开始时是否在播：用于拖完后判断要不要 resume
   const wasPlayingRef = useRef(true);
 
@@ -735,6 +783,7 @@ function ShortsSlide({
     if (!isActive) {
       setPaused(false);
       setScrubbing(false);
+      scrubbingRef.current = false;
       setIsBuffering(false);
       setPlayPauseHud(null);
     }
@@ -769,7 +818,7 @@ function ShortsSlide({
     };
     const handleTime = () => {
       // 拖动期间不要被 timeupdate 覆盖 UI
-      if (!scrubbing) setCurrentTime(video.currentTime);
+      if (!scrubbingRef.current) setCurrentTime(video.currentTime);
     };
     const handleWaiting = () => {
       setIsBuffering(true);
@@ -811,7 +860,7 @@ function ShortsSlide({
       video.removeEventListener("canplay", handlePlayingOrCanPlay);
       video.removeEventListener("volumechange", handleVolumeChange);
     };
-  }, [shouldMount, scrubbing, muted, volume, setMuted, setVolume]);
+  }, [muted, volume, setMuted, setVolume]);
 
   // 长按 2 倍速：直接绑原生事件
   useEffect(() => {
@@ -1021,11 +1070,16 @@ function ShortsSlide({
   // ---- 进度条拖动 ----
   // 触摸进度条时：暂停 → 跟随手指更新 currentTime → 松手 resume
   function handleProgressPointerDown(e: React.PointerEvent<HTMLDivElement>) {
-    const video = localRef.current;
-    if (!video || !duration) return;
     e.preventDefault();
     e.stopPropagation();
-    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+    const video = localRef.current;
+    const seekDuration = getSeekDuration(video);
+    if (!video || !seekDuration) return;
+    try {
+      (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+    } catch {
+      // ignore
+    }
     wasPlayingRef.current = !video.paused;
     if (!video.paused) {
       try {
@@ -1034,17 +1088,19 @@ function ShortsSlide({
         // ignore
       }
     }
+    scrubbingRef.current = true;
     setScrubbing(true);
-    applyProgressFromEvent(e);
+    applyProgressFromEvent(e, seekDuration);
   }
   function handleProgressPointerMove(e: React.PointerEvent<HTMLDivElement>) {
-    if (!scrubbing) return;
+    if (!scrubbingRef.current) return;
     e.preventDefault();
     e.stopPropagation();
     applyProgressFromEvent(e);
   }
   function handleProgressPointerEnd(e: React.PointerEvent<HTMLDivElement>) {
-    if (!scrubbing) return;
+    if (!scrubbingRef.current) return;
+    e.preventDefault();
     e.stopPropagation();
     try {
       (e.currentTarget as HTMLElement).releasePointerCapture(e.pointerId);
@@ -1052,17 +1108,30 @@ function ShortsSlide({
       // ignore
     }
     const video = localRef.current;
+    scrubbingRef.current = false;
     setScrubbing(false);
     if (video && wasPlayingRef.current) {
       video.play().catch(() => undefined);
     }
   }
-  function applyProgressFromEvent(e: React.PointerEvent<HTMLDivElement>) {
+  function getSeekDuration(video: HTMLVideoElement | null) {
+    if (duration > 0) return duration;
+    if (video && Number.isFinite(video.duration) && video.duration > 0) {
+      setDuration(video.duration);
+      return video.duration;
+    }
+    return 0;
+  }
+  function applyProgressFromEvent(
+    e: React.PointerEvent<HTMLDivElement>,
+    knownDuration?: number
+  ) {
     const video = localRef.current;
-    if (!video || !duration) return;
+    const seekDuration = knownDuration ?? getSeekDuration(video);
+    if (!video || !seekDuration) return;
     const rect = e.currentTarget.getBoundingClientRect();
     const ratio = clamp((e.clientX - rect.left) / rect.width, 0, 1);
-    const next = ratio * duration;
+    const next = ratio * seekDuration;
     setCurrentTime(next);
     try {
       video.currentTime = next;
@@ -1235,6 +1304,7 @@ function ShortsSlide({
           onPointerMove={handleProgressPointerMove}
           onPointerUp={handleProgressPointerEnd}
           onPointerCancel={handleProgressPointerEnd}
+          onLostPointerCapture={handleProgressPointerEnd}
           onClick={(e) => e.stopPropagation()}
         >
           <div
@@ -1283,6 +1353,7 @@ function formatCount(n: number) {
 function getDriveShortName(source: string): string {
   const s = source.toLowerCase();
   if (s.includes("115")) return "115";
+  if (s.includes("123")) return "123";
   if (s.includes("pikpak")) return "PikP";
   if (s.includes("quark") || s.includes("夸克")) return "Quak";
   if (s.includes("onedrive")) return "OneDrive";

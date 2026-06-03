@@ -1441,7 +1441,7 @@ VideoProject/
 | 项 | 决定 |
 |---|---|
 | 登录方式 | **B**：管理后台做完整登录流程。115 扫码、夸克扫码或 Cookie 导入、沃盘手机号 + 短信验证。Token 持久化到 SQLite 并自动刷新。 |
-| 元数据来源 | **默认文件名解析**：`标题.mp4` 或 `[tag1,tag2] 标题 - 作者.mp4`；同时提供后台录入 API 覆盖字段 |
+| 元数据来源 | **默认文件名解析**：`标题.mp4`、`标题 - 作者.mp4`，或带前缀的 `[前缀] 标题 - 作者.mp4`；前缀只用于标题清理，不作为任意标签列表入库。标签来自系统 / 用户标签匹配和目录合集规则；同时提供后台录入 API 覆盖字段 |
 | Hover teaser | **C 预生成**：scanner 发现新视频时异步生成 10s teaser 并存回网盘的 `previews/` 目录，详情页和列表页 hover 都秒开 |
 | 部署目标 | Linux 服务器；本地 Windows 开发 |
 | 扫描策略 | 启动时全量 + 每 6 小时增量 + 支持手动触发 |
@@ -1485,14 +1485,14 @@ type StreamLink struct {
 
 ### 15.5 文件名解析规则
 
-默认解析顺序（取第一个匹配）：
+默认解析顺序（取第一个匹配），用于提取 `title` / `author`：
 
-1. 完整格式：`[tag1,tag2] 标题 - 作者.ext`
-2. 去作者：`[tag1,tag2] 标题.ext`
-3. 去标签：`标题 - 作者.ext`
+1. 带前缀和作者：`[前缀] 标题 - 作者.ext`
+2. 带前缀：`[前缀] 标题.ext`
+3. 带作者：`标题 - 作者.ext`
 4. 最简单：`标题.ext`
 
-解析出的字段：`title` / `author` / `tags[]`。其余字段（`duration` / `views` / `favorites` 等）由 scanner 读取文件元数据或置默认值。
+开头的 `[前缀]` 只会从标题里剥离，不会按 `,` / `，` / `、` / 空格拆成任意标签入库。`tags[]` 由 scanner 另行生成：文件名、作者和目录名命中系统标签或已有标签的标签名 / 别名时自动打标；符合条件的目录名会创建 `collection` 合集标签；常见番号类文本会归并为 `AV`。当前内置系统标签是 `后入`、`奶子`、`口交`、`臀`、`人妻`、`女大`、`AV`。其余字段（`duration` / `views` / `favorites` 等）由 scanner 读取文件元数据或置默认值。
 
 后台录入接口可用来覆盖解析结果：
 
@@ -1570,6 +1570,10 @@ POST /admin/api/videos             # 手动新建
 PUT  /admin/api/videos/:id         # 修改元数据
 DELETE /admin/api/videos/:id
 POST /admin/api/videos/:id/regen-preview
+
+GET  /admin/api/tags               # 标签列表
+POST /admin/api/tags               # 新增标签并自动归类历史视频
+DELETE /admin/api/tags/:id         # 删除非系统标签，并从所有视频上移除
 ```
 
 登录流程三家各不相同：
@@ -1684,9 +1688,10 @@ Teaser 不再是"固定从第 10 秒抽 10 秒"，改为按视频时长分段挑
 - `backend/internal/catalog/tags.go` `migrate` / `pruneOrphanCollectionTags` / `pruneOrphanCollectionTagsByID` / `collectVideoTagIDs`
 - 测试：`backend/internal/catalog/tags_test.go` `TestDeleteVideoPrunesOrphanCollectionTag` / `TestMigratePrunesPreexistingOrphanCollectionTags`
 
-**已知不在本次范围**：
-- `/admin/api/tags` 仍只有 `GET` / `POST`，没有 `DELETE`。如果将来要让管理员手动删 `user` 标签，再加 endpoint。
-- 数据迁移：上线时对运行中数据库一次性执行同样的 `DELETE` 即可（已对当前实例执行：清掉 10 条 `Season N` / `Better Call Saul SXX` / `东京爱情故事（1991）`，`tags` 总数 153 → 143）。
+**手动删除标签**：
+- `/admin/api/tags/{id}` 支持 `DELETE`。管理员可手动删除非系统标签，删除时同步清理 `video_tags` 并刷新相关视频的 `videos.tags` JSON。
+- `system` 标签由固定标签池维护，不开放删除；`user` / `collection` / `legacy` 标签可由管理员按需删除。
+- 历史孤儿 `collection` 标签仍由迁移自愈逻辑自动清理。
 
 ### 14.7 取消浏览器内本机转码，全部走 302 直链 + VLC 外部播放器按钮（2026-05-21）
 

@@ -1,4 +1,4 @@
-import { ReactNode } from "react";
+import { useEffect, useId, useRef, ReactNode } from "react";
 import { X } from "lucide-react";
 
 type Props = {
@@ -10,6 +10,62 @@ type Props = {
 };
 
 export function Modal({ open, title, onClose, children, footer }: Props) {
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const titleId = useId();
+
+  useEffect(() => {
+    if (!open) return;
+    const previousFocus =
+      document.activeElement instanceof HTMLElement ? document.activeElement : null;
+
+    function onKeyDown(e: KeyboardEvent) {
+      const dialog = dialogRef.current;
+      if (!dialog || !isTopDialog(dialog)) return;
+
+      if (e.key === "Escape") {
+        e.preventDefault();
+        onClose();
+        return;
+      }
+
+      if (e.key !== "Tab") return;
+
+      const focusable = getFocusableElements(dialog);
+      if (focusable.length === 0) {
+        e.preventDefault();
+        dialog.focus();
+        return;
+      }
+
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      const current = document.activeElement;
+
+      if (e.shiftKey && current === first) {
+        e.preventDefault();
+        last.focus();
+      } else if (!e.shiftKey && current === last) {
+        e.preventDefault();
+        first.focus();
+      }
+    }
+
+    window.setTimeout(() => {
+      const dialog = dialogRef.current;
+      if (!dialog || !isTopDialog(dialog)) return;
+      const first = getFocusableElements(dialog)[0];
+      (first ?? dialog).focus();
+    }, 0);
+
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("keydown", onKeyDown);
+      if (previousFocus?.isConnected) {
+        previousFocus.focus();
+      }
+    };
+  }, [open, onClose]);
+
   if (!open) return null;
   return (
     <div
@@ -18,10 +74,18 @@ export function Modal({ open, title, onClose, children, footer }: Props) {
         if (e.target === e.currentTarget) onClose();
       }}
     >
-      <div className="admin-modal" role="dialog" aria-modal="true">
+      <div
+        ref={dialogRef}
+        className="admin-modal"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={titleId}
+        tabIndex={-1}
+      >
         <div className="admin-modal__header">
-          <span>{title}</span>
+          <span id={titleId}>{title}</span>
           <button
+            type="button"
             className="admin-btn"
             onClick={onClose}
             aria-label="关闭"
@@ -35,4 +99,26 @@ export function Modal({ open, title, onClose, children, footer }: Props) {
       </div>
     </div>
   );
+}
+
+function getFocusableElements(root: HTMLElement): HTMLElement[] {
+  const selectors = [
+    "a[href]",
+    "button:not([disabled])",
+    "textarea:not([disabled])",
+    "input:not([disabled])",
+    "select:not([disabled])",
+    "[tabindex]:not([tabindex='-1'])",
+  ].join(",");
+
+  return Array.from(root.querySelectorAll<HTMLElement>(selectors)).filter(
+    (el) => !el.hasAttribute("disabled") && el.getAttribute("aria-hidden") !== "true"
+  );
+}
+
+function isTopDialog(dialog: HTMLElement): boolean {
+  const dialogs = Array.from(
+    document.querySelectorAll<HTMLElement>('[role="dialog"][aria-modal="true"]')
+  );
+  return dialogs[dialogs.length - 1] === dialog;
 }

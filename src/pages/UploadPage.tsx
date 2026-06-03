@@ -7,7 +7,7 @@ import { uploadVideo } from "@/data/videos";
 import { defaultUploadTitleFromFileName } from "@/lib/uploadTitle";
 import type { VideoItem } from "@/types";
 
-const UPLOAD_TAGS = ["奶子", "臀", "口角", "女大", "人妻", "AV"];
+const UPLOAD_TAGS = ["奶子", "臀", "口交", "女大", "人妻", "AV"];
 
 export default function UploadPage() {
   const [file, setFile] = useState<File | null>(null);

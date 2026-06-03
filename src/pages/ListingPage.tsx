@@ -33,6 +33,7 @@ export default function ListingPage() {
   );
   const initialState = useMemo(() => readListingState(listKey), [listKey]);
   const activeListKeyRef = useRef(listKey);
+  const hasLoadedListingRef = useRef(false);
   const pendingScrollYRef = useRef<number | null>(
     initialState ? initialState.scrollY : null
   );
@@ -40,9 +41,11 @@ export default function ListingPage() {
   const [sort, setSort] = useState<SortKey>(initialState?.sort ?? "latest");
   const [view, setView] = useState<ViewMode>(initialState?.view ?? "grid");
   const [page, setPage] = useState(initialState?.page ?? 1);
-  const [loading, setLoading] = useState(true);
+  const [initialLoading, setInitialLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
   const [items, setItems] = useState<VideoItem[]>([]);
   const [total, setTotal] = useState(0);
+  const isFetching = initialLoading || refreshing;
 
   useEffect(() => {
     if (activeListKeyRef.current === listKey) return;
@@ -64,12 +67,19 @@ export default function ListingPage() {
       : "视频列表 · 91";
 
     let active = true;
-    setLoading(true);
+    const isInitialLoad = !hasLoadedListingRef.current;
+    if (isInitialLoad) {
+      setInitialLoading(true);
+    } else {
+      setRefreshing(true);
+    }
     fetchListing(page, tag ? PAGE_SIZE_TAG : PAGE_SIZE_DEFAULT, { q: keyword, tag, cat, sort }).then((r) => {
       if (!active) return;
       setItems(r.items ?? []);
       setTotal(r.total ?? 0);
-      setLoading(false);
+      hasLoadedListingRef.current = true;
+      setInitialLoading(false);
+      setRefreshing(false);
     });
     return () => {
       active = false;
@@ -109,7 +119,7 @@ export default function ListingPage() {
   }, [listKey, sort, view, page]);
 
   useEffect(() => {
-    if (loading) return;
+    if (isFetching) return;
     const scrollY = pendingScrollYRef.current;
     if (scrollY === null) return;
     pendingScrollYRef.current = null;
@@ -118,7 +128,7 @@ export default function ListingPage() {
         window.scrollTo({ top: scrollY, behavior: "auto" });
       });
     });
-  }, [loading, items.length, listKey]);
+  }, [isFetching, items.length, listKey]);
 
   const title = keyword
     ? `搜索结果：${keyword}`
@@ -153,7 +163,7 @@ export default function ListingPage() {
         />
         <VideoGrid
           videos={items}
-          loading={loading}
+          loading={initialLoading}
           compact={view === "compact"}
           skeletonCount={12}
           emptyText="没有找到匹配的视频"

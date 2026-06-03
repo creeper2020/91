@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -40,7 +41,7 @@ var allowedUploadExtensions = map[string]struct{}{
 var allowedUploadTags = map[string]struct{}{
 	"奶子": {},
 	"臀":  {},
-	"口角": {},
+	"口交": {},
 	"女大": {},
 	"人妻": {},
 	"AV": {},
@@ -52,6 +53,10 @@ type Server struct {
 	LocalDir        string
 	UploadDir       string
 	OnVideoUploaded func(*catalog.Video)
+
+	tagCacheMu    sync.Mutex
+	tagCacheUntil time.Time
+	tagCache      []TagDTO
 
 	// GetTheme 返回当前生效的主题（"dark" | "pink"）。前台 /api/settings/theme 用，
 	// 不需要登录。无注入时返回 "dark"。
@@ -84,6 +89,12 @@ type VideoDTO struct {
 	PublishedAt     string   `json:"publishedAt"`
 	Tags            []string `json:"tags,omitempty"`
 	Category        string   `json:"category,omitempty"`
+}
+
+type TagDTO struct {
+	ID    string `json:"id"`
+	Label string `json:"label"`
+	Count int    `json:"count"`
 }
 
 type VideoDetailDTO struct {
@@ -156,39 +167,58 @@ func (s *Server) handleGetTheme(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleHome(w http.ResponseWriter, r *http.Request) {
-	// 首页优先展示封面已经生成好的视频，避免新盘扫盘时大量黑封面占满首页。
-	// 候选仍按发布时间覆盖最近 200 个，随后随机洗牌；封面不足时再用普通可见视频补齐。
-	const candidatePool = 200
-	readyItems, _, err := s.Catalog.ListVideos(r.Context(), catalog.ListParams{
-		Sort: "latest", Page: 1, PageSize: candidatePool, ThumbnailReadyOnly: true,
-	})
+	// 首页优先从全量已有封面的视频里随机抽取，避免只在最近一小段候选中反复出现。
+	excludeIDs := parseVideoIDQuery(r, "exclude", 120)
+	items, err := s.Catalog.RandomVideosWithReadyThumbnailsExcluding(r.Context(), excludeIDs, homePageSize)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
 	}
-	rand.Shuffle(len(readyItems), func(i, j int) {
-		readyItems[i], readyItems[j] = readyItems[j], readyItems[i]
-	})
-
-	items := appendUniqueVideos(nil, readyItems, homePageSize)
-	if len(items) > homePageSize {
-		items = items[:homePageSize]
-	}
 	if len(items) < homePageSize {
-		fallback, _, err := s.Catalog.ListVideos(r.Context(), catalog.ListParams{
-			Sort: "latest", Page: 1, PageSize: candidatePool,
-		})
+		fallbackExclude := append([]string{}, excludeIDs...)
+		for _, item := range items {
+			if item != nil {
+				fallbackExclude = append(fallbackExclude, item.ID)
+			}
+		}
+		fallback, err := s.Catalog.RandomVideosExcluding(r.Context(), fallbackExclude, homePageSize-len(items))
 		if err != nil {
 			writeErr(w, http.StatusInternalServerError, err)
 			return
 		}
-		rand.Shuffle(len(fallback), func(i, j int) {
-			fallback[i], fallback[j] = fallback[j], fallback[i]
-		})
 		items = appendUniqueVideos(items, fallback, homePageSize)
 	}
 	w.Header().Set("Cache-Control", "no-store")
 	writeJSON(w, http.StatusOK, mapVideos(items))
+}
+
+func parseVideoIDQuery(r *http.Request, key string, limit int) []string {
+	if r == nil {
+		return nil
+	}
+	values := r.URL.Query()[key]
+	if len(values) == 0 {
+		return nil
+	}
+	seen := map[string]struct{}{}
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		for _, id := range strings.Split(value, ",") {
+			id = strings.TrimSpace(id)
+			if id == "" {
+				continue
+			}
+			if _, ok := seen[id]; ok {
+				continue
+			}
+			seen[id] = struct{}{}
+			out = append(out, id)
+			if limit > 0 && len(out) >= limit {
+				return out
+			}
+		}
+	}
+	return out
 }
 
 func appendUniqueVideos(dst []*catalog.Video, candidates []*catalog.Video, limit int) []*catalog.Video {
@@ -226,12 +256,13 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
 	}
 	sort := q.Get("sort")
 	params := catalog.ListParams{
-		Keyword:  q.Get("q"),
-		Tag:      q.Get("tag"),
-		Category: q.Get("cat"),
-		Sort:     sort,
-		Page:     page,
-		PageSize: size,
+		Keyword:   q.Get("q"),
+		Tag:       q.Get("tag"),
+		Category:  q.Get("cat"),
+		Sort:      sort,
+		Page:      page,
+		PageSize:  size,
+		SkipTotal: strings.EqualFold(q.Get("count"), "false"),
 	}
 	if sort == "" || sort == "latest" {
 		params.PreferReadyThumbnails = true
@@ -259,6 +290,15 @@ func (s *Server) handleVideoDetail(w http.ResponseWriter, r *http.Request) {
 	if v.Hidden {
 		writeErr(w, http.StatusNotFound, sql.ErrNoRows)
 		return
+	}
+	if v.DriveID != localUploadDriveID {
+		if _, err := s.Catalog.GetDrive(r.Context(), v.DriveID); err != nil {
+			drives, listErr := s.Catalog.ListDrives(r.Context())
+			if listErr != nil || len(drives) > 0 {
+				writeErr(w, http.StatusNotFound, sql.ErrNoRows)
+				return
+			}
+		}
 	}
 	related := s.pickRelatedVideos(r.Context(), v, 6)
 	dto := mapVideo(v)
@@ -423,28 +463,41 @@ func appendRandomRelated(picked []*catalog.Video, pool []*catalog.Video, targetL
 }
 
 func (s *Server) handleTags(w http.ResponseWriter, r *http.Request) {
+	now := time.Now()
+	s.tagCacheMu.Lock()
+	if s.tagCache != nil && now.Before(s.tagCacheUntil) {
+		out := append([]TagDTO(nil), s.tagCache...)
+		s.tagCacheMu.Unlock()
+		w.Header().Set("Cache-Control", "private, max-age=15")
+		writeJSON(w, http.StatusOK, out)
+		return
+	}
+	s.tagCacheMu.Unlock()
+
 	stats, err := s.Catalog.ListTags(r.Context())
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
 	}
-	type tag struct {
-		ID    string `json:"id"`
-		Label string `json:"label"`
-		Count int    `json:"count"`
-	}
-	out := make([]tag, 0, len(stats))
+	out := make([]TagDTO, 0, len(stats))
 	for _, stat := range stats {
-		out = append(out, tag{ID: stat.Label, Label: stat.Label, Count: stat.Count})
+		out = append(out, TagDTO{ID: stat.Label, Label: stat.Label, Count: stat.Count})
 	}
+	s.tagCacheMu.Lock()
+	s.tagCache = append([]TagDTO(nil), out...)
+	s.tagCacheUntil = now.Add(30 * time.Second)
+	s.tagCacheMu.Unlock()
+
+	w.Header().Set("Cache-Control", "private, max-age=15")
 	writeJSON(w, http.StatusOK, out)
 }
 
-// shortsNextReq 客户端把当前轮已看过的 video id 列表传上来，
-// 服务器从未在列表中的视频里随机抽 count 个返回。
+// shortsNextReq 客户端把当前轮已看过的 video id 列表传上来。
+// PreferredFromVideoID 来自短视频页最近一次点赞成功的视频，用于优先推荐相似标签。
 type shortsNextReq struct {
-	SeenIDs []string `json:"seenIds"`
-	Count   int      `json:"count"`
+	SeenIDs              []string `json:"seenIds"`
+	Count                int      `json:"count"`
+	PreferredFromVideoID string   `json:"preferredFromVideoId"`
 }
 
 // ShortsItemDTO 是短视频流单条的精简结构。比 VideoDTO 多 videoSrc / poster，
@@ -490,7 +543,12 @@ func (s *Server) handleShortsNext(w http.ResponseWriter, r *http.Request) {
 		exclude = nil
 	}
 
-	items, err := s.Catalog.RandomVideosExcluding(r.Context(), exclude, count)
+	var items []*catalog.Video
+	if strings.TrimSpace(body.PreferredFromVideoID) != "" {
+		items, err = s.Catalog.RandomVideosForPreferredVideoExcluding(r.Context(), body.PreferredFromVideoID, exclude, count)
+	} else {
+		items, err = s.Catalog.RandomVideosExcluding(r.Context(), exclude, count)
+	}
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
@@ -861,10 +919,14 @@ func previewURL(v *catalog.Video) string {
 }
 
 func thumbnailURL(v *catalog.Video) string {
+	base := "/p/thumb/" + v.ID
 	if v.ThumbnailURL != "" {
-		return v.ThumbnailURL
+		base = v.ThumbnailURL
 	}
-	return "/p/thumb/" + v.ID
+	if !strings.HasPrefix(base, "/p/thumb/") || v.UpdatedAt.IsZero() {
+		return base
+	}
+	return base + "?v=" + strconv.FormatInt(v.UpdatedAt.UnixMilli(), 10)
 }
 
 func (s *Server) videoSource(v *catalog.Video) string {
@@ -894,12 +956,16 @@ func driveKindLabel(kind string) string {
 		return "夸克网盘"
 	case "p115":
 		return "115 网盘"
+	case "p123":
+		return "123 云盘"
 	case "pikpak":
 		return "PikPak"
 	case "wopan":
 		return "联通沃盘"
 	case "onedrive":
 		return "OneDrive"
+	case "googledrive":
+		return "Google Drive"
 	case localstorage.Kind:
 		return "本地存储"
 	case spider91.Kind:

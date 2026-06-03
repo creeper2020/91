@@ -13,6 +13,7 @@ import (
 	"github.com/video-site/backend/internal/catalog"
 	"github.com/video-site/backend/internal/config"
 	"github.com/video-site/backend/internal/drives"
+	"github.com/video-site/backend/internal/drives/spider91"
 	"github.com/video-site/backend/internal/fingerprint"
 	"github.com/video-site/backend/internal/preview"
 	"github.com/video-site/backend/internal/proxy"
@@ -668,6 +669,309 @@ func TestCleanupMissingPikPakVideosRemovesDatabaseRowsAndLocalAssets(t *testing.
 	}
 	if _, err := os.Stat(keptPreview); err != nil {
 		t.Fatalf("kept preview missing: %v", err)
+	}
+}
+
+func TestCleanupDriveVideosForDeleteRemovesRowsAndGeneratedAssetsOnly(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	localDir := filepath.Join(root, "previews")
+	originalDir := filepath.Join(root, "local-videos")
+	originalVideo := filepath.Join(originalDir, "clip.mp4")
+	cat, err := catalog.Open(filepath.Join(t.TempDir(), "catalog.db"))
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cat.Close(); err != nil {
+			t.Fatalf("close catalog: %v", err)
+		}
+	})
+
+	for _, path := range []string{originalVideo} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", path, err)
+		}
+		if err := os.WriteFile(path, []byte("original"), 0o644); err != nil {
+			t.Fatalf("write %s: %v", path, err)
+		}
+	}
+
+	if err := cat.UpsertDrive(ctx, &catalog.Drive{
+		ID:            "local-main",
+		Kind:          "localstorage",
+		Name:          "Local",
+		RootID:        "/",
+		Credentials:   map[string]string{"path": originalDir},
+		TeaserEnabled: true,
+	}); err != nil {
+		t.Fatalf("seed drive: %v", err)
+	}
+
+	previewPath := filepath.Join(localDir, "localstorage-local-main-file.mp4")
+	thumbPath := filepath.Join(localDir, "thumbs", "localstorage-local-main-file.jpg")
+	for _, path := range []string{previewPath, thumbPath} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", path, err)
+		}
+		if err := os.WriteFile(path, []byte("generated"), 0o644); err != nil {
+			t.Fatalf("write %s: %v", path, err)
+		}
+	}
+
+	now := time.Now()
+	if err := cat.UpsertVideo(ctx, &catalog.Video{
+		ID:            "localstorage-local-main-file",
+		DriveID:       "local-main",
+		FileID:        "encoded-local-file",
+		Title:         "Local File",
+		PreviewLocal:  previewPath,
+		PreviewStatus: "ready",
+		ThumbnailURL:  "/p/thumb/localstorage-local-main-file",
+		PublishedAt:   now,
+		CreatedAt:     now,
+		UpdatedAt:     now,
+	}); err != nil {
+		t.Fatalf("seed local video: %v", err)
+	}
+	if err := cat.UpsertVideo(ctx, &catalog.Video{
+		ID:            "pikpak-other",
+		DriveID:       "PikPak",
+		FileID:        "other",
+		Title:         "Other",
+		PreviewStatus: "ready",
+		PublishedAt:   now,
+		CreatedAt:     now,
+		UpdatedAt:     now,
+	}); err != nil {
+		t.Fatalf("seed other video: %v", err)
+	}
+
+	app := &App{
+		cfg:                &config.Config{Storage: config.Storage{LocalPreviewDir: localDir}},
+		cat:                cat,
+		registry:           proxy.NewRegistry(),
+		workers:            make(map[string]*preview.Worker),
+		thumbWorkers:       make(map[string]*preview.ThumbWorker),
+		fingerprintWorkers: make(map[string]*fingerprint.Worker),
+		spider91Crawlers:   make(map[string]*spider91.Crawler),
+	}
+	removed, err := app.cleanupDriveVideosForDelete(ctx, "local-main")
+	if err != nil {
+		t.Fatalf("cleanup drive videos: %v", err)
+	}
+	if removed != 1 {
+		t.Fatalf("removed = %d, want 1", removed)
+	}
+	if _, err := cat.GetVideo(ctx, "localstorage-local-main-file"); err != sql.ErrNoRows {
+		t.Fatalf("deleted video lookup error = %v, want sql.ErrNoRows", err)
+	}
+	if _, err := cat.GetVideo(ctx, "pikpak-other"); err != nil {
+		t.Fatalf("other drive video missing: %v", err)
+	}
+	for _, path := range []string{previewPath, thumbPath} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("generated asset %s still exists, stat err=%v", path, err)
+		}
+	}
+	if _, err := os.Stat(originalVideo); err != nil {
+		t.Fatalf("original local video should remain, stat err=%v", err)
+	}
+}
+
+func TestCleanupDriveVideosForDeleteSpider91RemovesCrawledDirAndOriginRecords(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	localDir := filepath.Join(root, "previews")
+	driveID := "spider-main"
+	cat, err := catalog.Open(filepath.Join(t.TempDir(), "catalog.db"))
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cat.Close(); err != nil {
+			t.Fatalf("close catalog: %v", err)
+		}
+	})
+
+	if err := cat.UpsertDrive(ctx, &catalog.Drive{
+		ID:            driveID,
+		Kind:          "spider91",
+		Name:          "91 Spider",
+		RootID:        "/",
+		TeaserEnabled: true,
+	}); err != nil {
+		t.Fatalf("seed spider91 drive: %v", err)
+	}
+
+	spiderDriveDir := filepath.Join(root, "spider91", driveID)
+	sourceVideo := filepath.Join(spiderDriveDir, "videos", "source.mp4")
+	sourceThumb := filepath.Join(spiderDriveDir, "thumbs", "source.jpg")
+	localPreview := filepath.Join(localDir, "spider91-spider-main-source.mp4")
+	localThumb := filepath.Join(localDir, "thumbs", "spider91-spider-main-source.jpg")
+	migratedPreview := filepath.Join(localDir, "spider91-spider-main-migrated.mp4")
+	migratedThumb := filepath.Join(localDir, "thumbs", "spider91-spider-main-migrated.jpg")
+	for _, path := range []string{sourceVideo, sourceThumb, localPreview, localThumb, migratedPreview, migratedThumb} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", path, err)
+		}
+		if err := os.WriteFile(path, []byte("asset"), 0o644); err != nil {
+			t.Fatalf("write %s: %v", path, err)
+		}
+	}
+
+	now := time.Now()
+	for _, v := range []*catalog.Video{
+		{
+			ID:            "spider91-spider-main-source",
+			DriveID:       driveID,
+			FileID:        "source.mp4",
+			Title:         "Source",
+			PreviewLocal:  localPreview,
+			PreviewStatus: "ready",
+			ThumbnailURL:  "/p/thumb/spider91-spider-main-source",
+		},
+		{
+			ID:            "spider91-spider-main-migrated",
+			DriveID:       "PikPak",
+			FileID:        "pikpak-file-id",
+			Title:         "Migrated",
+			PreviewLocal:  migratedPreview,
+			PreviewStatus: "ready",
+			ThumbnailURL:  "/p/thumb/spider91-spider-main-migrated",
+		},
+		{
+			ID:            "pikpak-PikPak-other",
+			DriveID:       "PikPak",
+			FileID:        "other",
+			Title:         "Other",
+			PreviewStatus: "ready",
+		},
+	} {
+		v.PublishedAt = now
+		v.CreatedAt = now
+		v.UpdatedAt = now
+		if err := cat.UpsertVideo(ctx, v); err != nil {
+			t.Fatalf("seed video %s: %v", v.ID, err)
+		}
+	}
+
+	app := &App{
+		cfg:                &config.Config{Storage: config.Storage{LocalPreviewDir: localDir}},
+		cat:                cat,
+		registry:           proxy.NewRegistry(),
+		workers:            make(map[string]*preview.Worker),
+		thumbWorkers:       make(map[string]*preview.ThumbWorker),
+		fingerprintWorkers: make(map[string]*fingerprint.Worker),
+		spider91Crawlers:   make(map[string]*spider91.Crawler),
+	}
+	removed, err := app.cleanupDriveVideosForDelete(ctx, driveID)
+	if err != nil {
+		t.Fatalf("cleanup spider91 videos: %v", err)
+	}
+	if removed != 2 {
+		t.Fatalf("removed = %d, want 2", removed)
+	}
+	for _, id := range []string{"spider91-spider-main-source", "spider91-spider-main-migrated"} {
+		if _, err := cat.GetVideo(ctx, id); err != sql.ErrNoRows {
+			t.Fatalf("%s lookup error = %v, want sql.ErrNoRows", id, err)
+		}
+	}
+	if _, err := cat.GetVideo(ctx, "pikpak-PikPak-other"); err != nil {
+		t.Fatalf("unrelated pikpak video missing: %v", err)
+	}
+	for _, path := range []string{spiderDriveDir, localPreview, localThumb, migratedPreview, migratedThumb} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("%s still exists, stat err=%v", path, err)
+		}
+	}
+}
+
+func TestCleanupOrphanDriveVideosRemovesRowsAndGeneratedAssets(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	localDir := filepath.Join(root, "previews")
+	cat, err := catalog.Open(filepath.Join(t.TempDir(), "catalog.db"))
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cat.Close(); err != nil {
+			t.Fatalf("close catalog: %v", err)
+		}
+	})
+
+	if err := cat.UpsertDrive(ctx, &catalog.Drive{
+		ID:            "active-drive",
+		Kind:          "pikpak",
+		Name:          "Active",
+		RootID:        "root",
+		TeaserEnabled: true,
+	}); err != nil {
+		t.Fatalf("seed active drive: %v", err)
+	}
+
+	previewPath := filepath.Join(localDir, "p123-123-orphan.mp4")
+	thumbPath := filepath.Join(localDir, "thumbs", "p123-123-orphan.jpg")
+	for _, path := range []string{previewPath, thumbPath} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", path, err)
+		}
+		if err := os.WriteFile(path, []byte("generated"), 0o644); err != nil {
+			t.Fatalf("write %s: %v", path, err)
+		}
+	}
+
+	now := time.Now()
+	for _, v := range []*catalog.Video{
+		{
+			ID:            "p123-123-orphan",
+			DriveID:       "123",
+			FileID:        "orphan-file",
+			Title:         "Orphan",
+			PreviewLocal:  previewPath,
+			PreviewStatus: "ready",
+			ThumbnailURL:  "/p/thumb/p123-123-orphan",
+			PublishedAt:   now,
+			CreatedAt:     now,
+			UpdatedAt:     now,
+		},
+		{
+			ID:          "pikpak-active",
+			DriveID:     "active-drive",
+			FileID:      "active-file",
+			Title:       "Active",
+			PublishedAt: now,
+			CreatedAt:   now,
+			UpdatedAt:   now,
+		},
+	} {
+		if err := cat.UpsertVideo(ctx, v); err != nil {
+			t.Fatalf("seed video %s: %v", v.ID, err)
+		}
+	}
+
+	app := &App{
+		cfg: &config.Config{Storage: config.Storage{LocalPreviewDir: localDir}},
+		cat: cat,
+	}
+	removed, err := app.cleanupOrphanDriveVideos(ctx)
+	if err != nil {
+		t.Fatalf("cleanup orphan videos: %v", err)
+	}
+	if removed != 1 {
+		t.Fatalf("removed = %d, want 1", removed)
+	}
+	if _, err := cat.GetVideo(ctx, "p123-123-orphan"); err != sql.ErrNoRows {
+		t.Fatalf("orphan video lookup error = %v, want sql.ErrNoRows", err)
+	}
+	if _, err := cat.GetVideo(ctx, "pikpak-active"); err != nil {
+		t.Fatalf("active video missing: %v", err)
+	}
+	for _, path := range []string{previewPath, thumbPath} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("orphan asset %s still exists, stat err=%v", path, err)
+		}
 	}
 }
 

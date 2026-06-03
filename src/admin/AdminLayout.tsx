@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { NavLink, Outlet, useNavigate } from "react-router-dom";
 import {
   HardDrive,
@@ -9,6 +9,7 @@ import {
   Tags,
   Palette,
   RefreshCw,
+  MoreVertical,
 } from "lucide-react";
 import * as api from "./api";
 import { useAuth } from "./AuthContext";
@@ -19,6 +20,18 @@ export function AdminLayout() {
   const navigate = useNavigate();
   const { show } = useToast();
   const [checkingUpdate, setCheckingUpdate] = useState(false);
+  const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+
+  useEffect(() => {
+    if (!mobileMenuOpen) return;
+    function onKeyDown(e: KeyboardEvent) {
+      if (e.key === "Escape") {
+        setMobileMenuOpen(false);
+      }
+    }
+    document.addEventListener("keydown", onKeyDown);
+    return () => document.removeEventListener("keydown", onKeyDown);
+  }, [mobileMenuOpen]);
 
   async function handleCheckUpdate() {
     if (checkingUpdate) return;
@@ -110,11 +123,35 @@ export function AdminLayout() {
             {checkingUpdate ? "检查中" : "检查更新"}
           </button>
           <button className="admin-sidebar__logout" onClick={handleLogout}>
-            <LogOut size={14} style={{ verticalAlign: -2, marginRight: 4 }} />
+            <LogOut size={14} />
             退出登录
           </button>
         </div>
+        <button
+          className="admin-sidebar__mobile-menu"
+          onClick={() => setMobileMenuOpen((v) => !v)}
+          aria-label="更多操作"
+        >
+          <MoreVertical size={18} />
+        </button>
       </aside>
+      {mobileMenuOpen && (
+        <div className="admin-sidebar__mobile-overlay" onClick={() => setMobileMenuOpen(false)} />
+      )}
+      <div className={`admin-sidebar__mobile-panel${mobileMenuOpen ? " is-open" : ""}`}>
+        <button
+          className="admin-sidebar__check-update"
+          onClick={() => { handleCheckUpdate(); setMobileMenuOpen(false); }}
+          disabled={checkingUpdate}
+        >
+          <RefreshCw size={14} />
+          {checkingUpdate ? "检查中" : "检查更新"}
+        </button>
+        <button className="admin-sidebar__logout" onClick={() => { handleLogout(); setMobileMenuOpen(false); }}>
+          <LogOut size={14} />
+          退出登录
+        </button>
+      </div>
       <main className="admin-main">
         <Outlet />
       </main>

@@ -70,12 +70,33 @@ func TestStreamURLRejectsEscapingID(t *testing.T) {
 }
 
 func TestInitRequiresExistingDirectory(t *testing.T) {
-	drv := New(Config{ID: "local", RootPath: filepath.Join(t.TempDir(), "missing")})
+	missing := filepath.Join(t.TempDir(), "missing")
+	drv := New(Config{ID: "local", RootPath: missing})
 
 	err := drv.Init(context.Background())
 
 	if err == nil || !strings.Contains(err.Error(), "stat root") {
 		t.Fatalf("error = %v, want stat root failure", err)
+	}
+	if !strings.Contains(err.Error(), missing) || !strings.Contains(err.Error(), "configured=") {
+		t.Fatalf("error = %v, want diagnostic path details", err)
+	}
+}
+
+func TestPathForIDAllowsRootPathSlash(t *testing.T) {
+	drv := New(Config{ID: "local", RootPath: string(os.PathSeparator)})
+	childID := encodeRel("tmp")
+
+	path, rel, err := drv.pathForID(childID)
+
+	if err != nil {
+		t.Fatalf("pathForID: %v", err)
+	}
+	if rel != "tmp" {
+		t.Fatalf("rel = %q, want tmp", rel)
+	}
+	if path != filepath.Join(string(os.PathSeparator), "tmp") {
+		t.Fatalf("path = %q, want /tmp", path)
 	}
 }
 

@@ -17,6 +17,8 @@ import (
 )
 
 var ErrUnknownTag = errors.New("unknown tag")
+var ErrSystemTag = errors.New("system tag cannot be deleted")
+var ErrDeletedTag = errors.New("tag was previously deleted")
 
 const avTagLabel = "AV"
 
@@ -61,6 +63,9 @@ func (c *Catalog) migrate(ctx context.Context) error {
 	if err := c.addColumnIfMissing(ctx, "videos", "thumbnail_status", "TEXT DEFAULT 'pending'"); err != nil {
 		return err
 	}
+	if err := c.addColumnIfMissing(ctx, "videos", "thumbnail_failures", "INTEGER DEFAULT 0"); err != nil {
+		return err
+	}
 	// drives.teaser_enabled：每盘 teaser 开关，替代旧的全局 preview.enabled。
 	// 升级路径：直接让 ALTER TABLE 的 DEFAULT 1 兜底 —— 每个现存 drive 都默认开启，
 	// 不读旧的 settings.preview.enabled 字段。这样老用户即便之前关过全局开关，
@@ -72,6 +77,9 @@ func (c *Catalog) migrate(ctx context.Context) error {
 	// 其中任意一个的目录及其全部子目录都不会被递归扫描。替代旧版硬编码"影视"
 	// 目录例外分支；旧 drive 升级后默认空数组 → 行为等同于以前未启用跳过。
 	if err := c.addColumnIfMissing(ctx, "drives", "skip_dir_ids", "TEXT NOT NULL DEFAULT '[]'"); err != nil {
+		return err
+	}
+	if err := c.syncDriveScanRootIDToRootID(ctx); err != nil {
 		return err
 	}
 	// 一次性修正：早期版本（短暂存在过）会把现存 drive 的 teaser_enabled 同步成
@@ -92,13 +100,25 @@ func (c *Catalog) migrate(ctx context.Context) error {
 	if _, err := c.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_videos_content_hash ON videos(content_hash)`); err != nil {
 		return err
 	}
+	if _, err := c.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_videos_content_hash_created ON videos(content_hash, created_at, id)`); err != nil {
+		return err
+	}
 	if _, err := c.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_videos_sampled_sha256 ON videos(size_bytes, sampled_sha256)`); err != nil {
+		return err
+	}
+	if _, err := c.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_videos_sampled_sha256_created ON videos(size_bytes, sampled_sha256, created_at, id)`); err != nil {
 		return err
 	}
 	if _, err := c.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_videos_hidden ON videos(hidden)`); err != nil {
 		return err
 	}
+	if _, err := c.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_videos_visible_pub ON videos(COALESCE(hidden, 0), published_at DESC)`); err != nil {
+		return err
+	}
 	if _, err := c.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_videos_file_name_size ON videos(file_name, size_bytes)`); err != nil {
+		return err
+	}
+	if _, err := c.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_videos_file_name_size_created ON videos(file_name, size_bytes, created_at, id)`); err != nil {
 		return err
 	}
 	if err := c.seedSystemTags(ctx); err != nil {
@@ -117,6 +137,12 @@ func (c *Catalog) migrate(ctx context.Context) error {
 		return err
 	}
 	if err := c.clearVolatileOneDriveThumbnails(ctx); err != nil {
+		return err
+	}
+	if err := c.clearRemoteP123ThumbnailsOnce(ctx); err != nil {
+		return err
+	}
+	if err := c.clearRemoteNonSpider91Thumbnails(ctx); err != nil {
 		return err
 	}
 	if err := c.hideZeroSizeVideosFromKnownDrives(ctx); err != nil {
@@ -201,8 +227,9 @@ func (c *Catalog) resetDriveTeaserEnabledToDefaultOnce(ctx context.Context) erro
 //   - 管理员凭直觉认知字段名时会被误导
 //
 // 修正策略：
-//   - thumbnail_url 非空 + status 非 'ready' + status 非 'failed' → 改成 'ready'
+//   - thumbnail_url 非空 + status 非 'ready' + status 非 'failed' + status 非 'skipped' → 改成 'ready'
 //   - status='failed' 不动（这是 worker 显式标的失败，要保留以便管理员手动重生）
+//   - status='skipped' 不动（已有封面但时长探测不可用，避免重启后重复排队）
 //
 // 幂等保证：marker setting 写过就不再跑，避免每次重启都 update 一遍。
 func (c *Catalog) reconcileThumbnailStatusOnce(ctx context.Context) error {
@@ -219,7 +246,7 @@ UPDATE videos
    SET thumbnail_status = 'ready',
        updated_at = ?
  WHERE COALESCE(thumbnail_url, '') != ''
-   AND COALESCE(thumbnail_status, 'pending') NOT IN ('ready', 'failed')
+   AND COALESCE(thumbnail_status, 'pending') NOT IN ('ready', 'failed', 'skipped')
 `, time.Now().UnixMilli())
 	if err != nil {
 		return fmt.Errorf("reconcile thumbnail_status: %w", err)
@@ -246,6 +273,85 @@ UPDATE videos
  WHERE lower(COALESCE(thumbnail_url, '')) LIKE 'https://%mediap.svc.ms/transform/thumbnail%'
 `, time.Now().UnixMilli())
 	return err
+}
+
+func (c *Catalog) clearRemoteP123ThumbnailsOnce(ctx context.Context) error {
+	// 123 云盘列表返回的缩略图尺寸和稳定性都不适合作为站内封面；清空历史写入的
+	// 远程 URL，让封面 worker 统一从视频直链抽帧生成本地 /p/thumb/<id>。
+	const markerKey = "videos.p123.remote_thumbnails_cleared"
+	marker, err := c.GetSetting(ctx, markerKey, "")
+	if err != nil {
+		return fmt.Errorf("read %s marker: %w", markerKey, err)
+	}
+	if strings.TrimSpace(marker) == "1" {
+		return nil
+	}
+
+	var p123Drives int
+	if err := c.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM drives WHERE kind = 'p123'`).Scan(&p123Drives); err != nil {
+		return fmt.Errorf("count p123 drives: %w", err)
+	}
+	if p123Drives == 0 {
+		return nil
+	}
+
+	res, err := c.db.ExecContext(ctx, `
+	UPDATE videos
+	   SET thumbnail_url = '',
+	       thumbnail_status = 'pending',
+	       thumbnail_failures = 0,
+	       updated_at = ?
+	 WHERE EXISTS (
+	       SELECT 1
+	         FROM drives
+	        WHERE drives.id = videos.drive_id
+	          AND drives.kind = 'p123'
+	   )
+	   AND (
+	       lower(COALESCE(thumbnail_url, '')) LIKE 'http://%'
+	       OR lower(COALESCE(thumbnail_url, '')) LIKE 'https://%'
+	   )
+	`, time.Now().UnixMilli())
+	if err != nil {
+		return err
+	}
+	if affected, err := res.RowsAffected(); err == nil && affected > 0 {
+		log.Printf("[catalog] cleared %d remote 123pan thumbnail(s) for local regeneration", affected)
+	}
+	if err := c.SetSetting(ctx, markerKey, "1"); err != nil {
+		return fmt.Errorf("write %s marker: %w", markerKey, err)
+	}
+	return nil
+}
+
+func (c *Catalog) clearRemoteNonSpider91Thumbnails(ctx context.Context) error {
+	// 非 91Spider 视频不再使用网盘侧返回的远程缩略图。清空历史 http/https
+	// thumbnail_url 后，封面 worker 会重新从视频中间帧生成本地 /p/thumb/<id>。
+	// 91Spider 的封面是爬虫下载后保存到本地 /p/thumb/<id>，不受这条规则影响。
+	res, err := c.db.ExecContext(ctx, `
+UPDATE videos
+   SET thumbnail_url = '',
+       thumbnail_status = 'pending',
+       thumbnail_failures = 0,
+       updated_at = ?
+ WHERE (
+       lower(COALESCE(thumbnail_url, '')) LIKE 'http://%'
+       OR lower(COALESCE(thumbnail_url, '')) LIKE 'https://%'
+   )
+   AND NOT EXISTS (
+       SELECT 1
+         FROM drives
+        WHERE drives.id = videos.drive_id
+          AND drives.kind = 'spider91'
+   )
+`, time.Now().UnixMilli())
+	if err != nil {
+		return err
+	}
+	if affected, err := res.RowsAffected(); err == nil && affected > 0 {
+		log.Printf("[catalog] cleared %d remote non-91Spider thumbnail(s) for local regeneration", affected)
+	}
+	return nil
 }
 
 func (c *Catalog) hideZeroSizeVideosFromKnownDrives(ctx context.Context) error {
@@ -293,7 +399,15 @@ func (c *Catalog) classifySystemTags(ctx context.Context) error {
 }
 
 func (c *Catalog) backfillVideoTags(ctx context.Context) error {
-	rows, err := c.db.QueryContext(ctx, `SELECT id, COALESCE(tags, '[]') FROM videos`)
+	rows, err := c.db.QueryContext(ctx, `
+SELECT id, COALESCE(tags, '[]')
+FROM videos
+WHERE COALESCE(tags, '') NOT IN ('', '[]', 'null')
+  AND NOT EXISTS (
+	SELECT 1
+	  FROM video_tags vt
+	 WHERE vt.video_id = videos.id
+  )`)
 	if err != nil {
 		return err
 	}
@@ -310,11 +424,14 @@ func (c *Catalog) backfillVideoTags(ctx context.Context) error {
 		if len(labels) == 0 {
 			continue
 		}
-		if err := c.addVideoTags(ctx, videoID, labels, "legacy", true); err != nil {
+		added, err := c.addVideoTags(ctx, videoID, labels, "legacy", true)
+		if err != nil {
 			return err
 		}
-		if err := c.syncVideoTagsJSON(ctx, videoID, false); err != nil {
-			return err
+		if added {
+			if err := c.syncVideoTagsJSON(ctx, videoID, false); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -362,6 +479,9 @@ GROUP BY category`)
 		if !LooksLikeCollectionTag(stat.category) {
 			continue
 		}
+		if c.tagDeleted(ctx, stat.category) {
+			continue
+		}
 		if _, err := c.ensureTag(ctx, stat.category, nil, "collection"); err != nil {
 			return err
 		}
@@ -380,12 +500,178 @@ func (c *Catalog) CreateTagAndClassify(ctx context.Context, label string, aliase
 	return c.classifyTag(ctx, tag)
 }
 
+func (c *Catalog) EnsureTagForVideoIDPrefix(ctx context.Context, prefix, label string, aliases []string, source string) (int, error) {
+	prefix = strings.TrimSpace(prefix)
+	if prefix == "" {
+		return 0, errors.New("video id prefix is required")
+	}
+	tag, err := c.ensureTag(ctx, label, aliases, source)
+	if err != nil {
+		return 0, err
+	}
+	rows, err := c.db.QueryContext(ctx, `
+SELECT v.id
+  FROM videos v
+ WHERE v.id LIKE ? || '%'
+   AND COALESCE(v.tags_manual, 0) = 0
+   AND NOT EXISTS (
+	 SELECT 1
+	   FROM video_tags vt
+	  WHERE vt.video_id = v.id
+	    AND vt.tag_id = ?
+   )
+ ORDER BY v.id ASC`, prefix, tag.ID)
+	if err != nil {
+		return 0, err
+	}
+	var videoIDs []string
+	for rows.Next() {
+		var videoID string
+		if err := rows.Scan(&videoID); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		videoIDs = append(videoIDs, videoID)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return 0, err
+	}
+	if err := rows.Close(); err != nil {
+		return 0, err
+	}
+	for _, videoID := range videoIDs {
+		if err := c.insertVideoTag(ctx, videoID, tag.ID, "auto"); err != nil {
+			return 0, err
+		}
+		if err := c.syncVideoTagsJSON(ctx, videoID, false); err != nil {
+			return 0, err
+		}
+	}
+	return len(videoIDs), nil
+}
+
+func (c *Catalog) DeleteTag(ctx context.Context, tagID int64) (int, error) {
+	tx, err := c.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+
+	tag, err := c.getTagByIDTx(ctx, tx, tagID)
+	if err != nil {
+		return 0, err
+	}
+	if tag.Source == "system" {
+		return 0, ErrSystemTag
+	}
+
+	rows, err := tx.QueryContext(ctx, `SELECT video_id FROM video_tags WHERE tag_id = ?`, tagID)
+	if err != nil {
+		return 0, err
+	}
+	var videoIDs []string
+	for rows.Next() {
+		var videoID string
+		if err := rows.Scan(&videoID); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		videoIDs = append(videoIDs, videoID)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return 0, err
+	}
+	if err := rows.Close(); err != nil {
+		return 0, err
+	}
+
+	if _, err := tx.ExecContext(ctx, `DELETE FROM video_tags WHERE tag_id = ?`, tagID); err != nil {
+		return 0, err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM tags WHERE id = ?`, tagID); err != nil {
+		return 0, err
+	}
+	if err := markDeletedTagTx(ctx, tx, tag); err != nil {
+		return 0, err
+	}
+
+	for _, videoID := range videoIDs {
+		manual := hasManualTagsTx(ctx, tx, videoID)
+		if err := syncVideoTagsJSONTx(ctx, tx, videoID, manual); err != nil {
+			return 0, err
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return len(videoIDs), nil
+}
+
 func (c *Catalog) ListTags(ctx context.Context) ([]Tag, error) {
 	rows, err := c.db.QueryContext(ctx, `
-SELECT t.id, t.label, t.aliases, t.source, COUNT(v.id) AS cnt
+WITH tagged_tags AS (
+	SELECT vt.tag_id,
+	       tagged.id,
+	       COALESCE(tagged.content_hash, '') AS content_hash,
+	       COALESCE(tagged.sampled_sha256, '') AS sampled_sha256,
+	       tagged.size_bytes,
+	       COALESCE(tagged.file_name, '') AS file_name
+	  FROM video_tags vt
+	  JOIN videos tagged ON tagged.id = vt.video_id
+	 WHERE COALESCE(tagged.hidden, 0) = 0
+),
+tag_candidates AS (
+	SELECT tag_id, id AS video_id
+	  FROM tagged_tags
+	UNION ALL
+	SELECT tag_id,
+	       (SELECT canonical.id
+	          FROM videos canonical
+	         WHERE tagged_tags.content_hash != ''
+	           AND canonical.content_hash = tagged_tags.content_hash
+	           AND COALESCE(canonical.content_hash, '') != ''
+	         ORDER BY canonical.created_at ASC, canonical.id ASC
+	         LIMIT 1) AS video_id
+	  FROM tagged_tags
+	 WHERE content_hash != ''
+	UNION ALL
+	SELECT tag_id,
+	       (SELECT canonical.id
+	          FROM videos canonical
+	         WHERE tagged_tags.sampled_sha256 != ''
+	           AND tagged_tags.size_bytes > 0
+	           AND canonical.sampled_sha256 = tagged_tags.sampled_sha256
+	           AND canonical.size_bytes = tagged_tags.size_bytes
+	           AND COALESCE(canonical.sampled_sha256, '') != ''
+	           AND canonical.size_bytes > 0
+	         ORDER BY canonical.created_at ASC, canonical.id ASC
+	         LIMIT 1) AS video_id
+	  FROM tagged_tags
+	 WHERE sampled_sha256 != '' AND size_bytes > 0
+	UNION ALL
+	SELECT tag_id,
+	       (SELECT canonical.id
+	          FROM videos canonical
+	         WHERE tagged_tags.file_name != ''
+	           AND tagged_tags.size_bytes > 0
+	           AND canonical.file_name = tagged_tags.file_name
+	           AND canonical.size_bytes = tagged_tags.size_bytes
+	           AND COALESCE(canonical.file_name, '') != ''
+	           AND canonical.size_bytes > 0
+	         ORDER BY canonical.created_at ASC, canonical.id ASC
+	         LIMIT 1) AS video_id
+	  FROM tagged_tags
+	 WHERE file_name != '' AND size_bytes > 0
+)
+SELECT t.id, t.label, t.aliases, t.source, COUNT(DISTINCT videos.id) AS cnt
 FROM tags t
-LEFT JOIN video_tags vt ON vt.tag_id = t.id
-LEFT JOIN videos v ON v.id = vt.video_id AND COALESCE(v.hidden, 0) = 0
+LEFT JOIN tag_candidates tc ON tc.tag_id = t.id AND tc.video_id IS NOT NULL
+LEFT JOIN videos ON videos.id = tc.video_id
+	AND COALESCE(videos.hidden, 0) = 0
+	AND `+uniqueVideoWhereSQL+`
 GROUP BY t.id, t.label, t.aliases, t.source
 ORDER BY cnt DESC, t.label ASC`)
 	if err != nil {
@@ -401,6 +687,66 @@ ORDER BY cnt DESC, t.label ASC`)
 		out = append(out, tag)
 	}
 	return out, nil
+}
+
+func videoMatchesTagLabelSQL(videoAlias string) string {
+	return fmt.Sprintf(`%s.id IN (
+			WITH tagged_videos AS (
+				SELECT tagged.id,
+				       COALESCE(tagged.content_hash, '') AS content_hash,
+				       COALESCE(tagged.sampled_sha256, '') AS sampled_sha256,
+				       tagged.size_bytes,
+				       COALESCE(tagged.file_name, '') AS file_name
+				  FROM video_tags vt
+				  JOIN tags tag_filter ON tag_filter.id = vt.tag_id
+				  JOIN videos tagged ON tagged.id = vt.video_id
+				 WHERE tag_filter.label = ? COLLATE NOCASE
+				   AND COALESCE(tagged.hidden, 0) = 0
+			),
+			tag_candidates AS (
+				SELECT id AS video_id
+				  FROM tagged_videos
+				UNION ALL
+				SELECT (SELECT canonical.id
+				          FROM videos canonical
+				         WHERE tagged_videos.content_hash != ''
+				           AND canonical.content_hash = tagged_videos.content_hash
+				           AND COALESCE(canonical.content_hash, '') != ''
+				         ORDER BY canonical.created_at ASC, canonical.id ASC
+				         LIMIT 1) AS video_id
+				  FROM tagged_videos
+				 WHERE content_hash != ''
+				UNION ALL
+				SELECT (SELECT canonical.id
+				          FROM videos canonical
+				         WHERE tagged_videos.sampled_sha256 != ''
+				           AND tagged_videos.size_bytes > 0
+				           AND canonical.sampled_sha256 = tagged_videos.sampled_sha256
+				           AND canonical.size_bytes = tagged_videos.size_bytes
+				           AND COALESCE(canonical.sampled_sha256, '') != ''
+				           AND canonical.size_bytes > 0
+				         ORDER BY canonical.created_at ASC, canonical.id ASC
+				         LIMIT 1) AS video_id
+				  FROM tagged_videos
+				 WHERE sampled_sha256 != '' AND size_bytes > 0
+				UNION ALL
+				SELECT (SELECT canonical.id
+				          FROM videos canonical
+				         WHERE tagged_videos.file_name != ''
+				           AND tagged_videos.size_bytes > 0
+				           AND canonical.file_name = tagged_videos.file_name
+				           AND canonical.size_bytes = tagged_videos.size_bytes
+				           AND COALESCE(canonical.file_name, '') != ''
+				           AND canonical.size_bytes > 0
+				         ORDER BY canonical.created_at ASC, canonical.id ASC
+				         LIMIT 1) AS video_id
+				  FROM tagged_videos
+				 WHERE file_name != '' AND size_bytes > 0
+			)
+			SELECT video_id
+			  FROM tag_candidates
+			 WHERE video_id IS NOT NULL
+		)`, videoAlias)
 }
 
 func (c *Catalog) SetManualVideoTags(ctx context.Context, videoID string, labels []string) error {
@@ -453,6 +799,9 @@ func (c *Catalog) EnsureCollectionTag(ctx context.Context, label string) (string
 	if !LooksLikeCollectionTag(label) {
 		return "", false, nil
 	}
+	if c.tagDeleted(ctx, label) {
+		return "", false, nil
+	}
 	if !c.tagExists(ctx, label) {
 		count, err := c.categoryVideoCount(ctx, label)
 		if err != nil {
@@ -484,6 +833,14 @@ func (c *Catalog) ensureTag(ctx context.Context, label string, aliases []string,
 	if source == "" {
 		source = "user"
 	}
+	if source != "system" && source != "user" && c.tagDeleted(ctx, label) {
+		return Tag{}, ErrDeletedTag
+	}
+	if source == "system" || source == "user" {
+		if err := c.restoreDeletedTag(ctx, label); err != nil {
+			return Tag{}, err
+		}
+	}
 	aliases = cleanAliases(aliases, label)
 	aliasesJSON, _ := json.Marshal(aliases)
 	now := time.Now().UnixMilli()
@@ -510,6 +867,10 @@ func (c *Catalog) getTagByLabel(ctx context.Context, label string) (Tag, error) 
 }
 
 func (c *Catalog) classifyTag(ctx context.Context, tag Tag) (int, error) {
+	existingIDs, err := c.videoIDSetForTagID(ctx, tag.ID)
+	if err != nil {
+		return 0, err
+	}
 	rows, err := c.db.QueryContext(ctx, `
 SELECT id, title, COALESCE(author, ''), COALESCE(category, ''), COALESCE(tags_manual, 0)
 FROM videos`)
@@ -541,13 +902,14 @@ FROM videos`)
 				continue
 			}
 		}
-		added, err := c.addVideoTag(ctx, videoID, tag.Label, "auto", false)
-		if err != nil {
+		if existingIDs[videoID] {
+			continue
+		}
+		if err := c.insertVideoTag(ctx, videoID, tag.ID, "auto"); err != nil {
 			return 0, err
 		}
-		if added {
-			classified++
-		}
+		existingIDs[videoID] = true
+		classified++
 		if err := c.syncVideoTagsJSON(ctx, videoID, false); err != nil {
 			return 0, err
 		}
@@ -557,9 +919,15 @@ FROM videos`)
 
 func (c *Catalog) replaceVideoTags(ctx context.Context, videoID string, labels []string, source string, manual bool, createMissing bool) error {
 	labels = uniqueStrings(cleanLabels(labels))
+	if source != "manual" {
+		labels = c.filterDeletedTagLabels(ctx, labels)
+	}
 	if createMissing {
 		for _, label := range labels {
 			if _, err := c.ensureTag(ctx, label, nil, "legacy"); err != nil {
+				if errors.Is(err, ErrDeletedTag) {
+					continue
+				}
 				return err
 			}
 		}
@@ -601,18 +969,33 @@ func (c *Catalog) replaceVideoTags(ctx context.Context, videoID string, labels [
 	return c.syncVideoTagsJSON(ctx, videoID, manual)
 }
 
-func (c *Catalog) addVideoTags(ctx context.Context, videoID string, labels []string, source string, createMissing bool) error {
-	for _, label := range uniqueStrings(cleanLabels(labels)) {
-		if _, err := c.addVideoTag(ctx, videoID, label, source, createMissing); err != nil {
-			return err
+func (c *Catalog) addVideoTags(ctx context.Context, videoID string, labels []string, source string, createMissing bool) (bool, error) {
+	labels = uniqueStrings(cleanLabels(labels))
+	if source != "manual" {
+		labels = c.filterDeletedTagLabels(ctx, labels)
+	}
+	changed := false
+	for _, label := range labels {
+		added, err := c.addVideoTag(ctx, videoID, label, source, createMissing)
+		if err != nil {
+			return false, err
+		}
+		if added {
+			changed = true
 		}
 	}
-	return nil
+	return changed, nil
 }
 
 func (c *Catalog) addVideoTag(ctx context.Context, videoID, label, source string, createMissing bool) (bool, error) {
+	if source != "manual" && c.tagDeleted(ctx, label) {
+		return false, nil
+	}
 	if createMissing {
 		if _, err := c.ensureTag(ctx, label, nil, "legacy"); err != nil {
+			if errors.Is(err, ErrDeletedTag) {
+				return false, nil
+			}
 			return false, err
 		}
 	}
@@ -631,12 +1014,33 @@ func (c *Catalog) addVideoTag(ctx context.Context, videoID, label, source string
 	return n > 0, nil
 }
 
+func (c *Catalog) insertVideoTag(ctx context.Context, videoID string, tagID int64, source string) error {
+	_, err := c.db.ExecContext(ctx,
+		`INSERT OR IGNORE INTO video_tags (video_id, tag_id, source, created_at) VALUES (?, ?, ?, ?)`,
+		videoID, tagID, source, time.Now().UnixMilli())
+	return err
+}
+
 func (c *Catalog) addCollectionTagToVideos(ctx context.Context, category string) error {
 	return c.addTagToVideosByCategory(ctx, category, category, "auto")
 }
 
 func (c *Catalog) addTagToVideosByCategory(ctx context.Context, category, label, source string) error {
-	rows, err := c.db.QueryContext(ctx, `SELECT id FROM videos WHERE category = ? AND COALESCE(tags_manual, 0) = 0`, category)
+	tag, err := c.getTagByLabel(ctx, label)
+	if err != nil {
+		return err
+	}
+	rows, err := c.db.QueryContext(ctx, `
+SELECT v.id
+  FROM videos v
+ WHERE v.category = ?
+   AND COALESCE(v.tags_manual, 0) = 0
+   AND NOT EXISTS (
+	 SELECT 1
+	   FROM video_tags vt
+	  WHERE vt.video_id = v.id
+	    AND vt.tag_id = ?
+   )`, category, tag.ID)
 	if err != nil {
 		return err
 	}
@@ -655,7 +1059,7 @@ func (c *Catalog) addTagToVideosByCategory(ctx context.Context, category, label,
 		return err
 	}
 	for _, videoID := range videoIDs {
-		if _, err := c.addVideoTag(ctx, videoID, label, source, false); err != nil {
+		if err := c.insertVideoTag(ctx, videoID, tag.ID, source); err != nil {
 			return err
 		}
 		if err := c.syncVideoTagsJSON(ctx, videoID, false); err != nil {
@@ -739,6 +1143,23 @@ func (c *Catalog) videoIDsForTagID(ctx context.Context, tagID int64) ([]string, 
 	return videoIDs, rows.Err()
 }
 
+func (c *Catalog) videoIDSetForTagID(ctx context.Context, tagID int64) (map[string]bool, error) {
+	rows, err := c.db.QueryContext(ctx, `SELECT video_id FROM video_tags WHERE tag_id = ?`, tagID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]bool{}
+	for rows.Next() {
+		var videoID string
+		if err := rows.Scan(&videoID); err != nil {
+			return nil, err
+		}
+		out[videoID] = true
+	}
+	return out, rows.Err()
+}
+
 func (c *Catalog) validateTagsExist(ctx context.Context, labels []string) error {
 	for _, label := range labels {
 		if _, err := c.getTagByLabel(ctx, label); err != nil {
@@ -804,6 +1225,39 @@ func (c *Catalog) tagExists(ctx context.Context, label string) bool {
 	return err == nil
 }
 
+func (c *Catalog) tagDeleted(ctx context.Context, label string) bool {
+	label = cleanTagLabel(label)
+	if label == "" {
+		return false
+	}
+	var exists int
+	err := c.db.QueryRowContext(ctx, `SELECT 1 FROM deleted_tags WHERE label = ? COLLATE NOCASE`, label).Scan(&exists)
+	return err == nil
+}
+
+func (c *Catalog) filterDeletedTagLabels(ctx context.Context, labels []string) []string {
+	if len(labels) == 0 {
+		return labels
+	}
+	out := labels[:0]
+	for _, label := range labels {
+		if c.tagDeleted(ctx, label) {
+			continue
+		}
+		out = append(out, label)
+	}
+	return out
+}
+
+func (c *Catalog) restoreDeletedTag(ctx context.Context, label string) error {
+	label = cleanTagLabel(label)
+	if label == "" {
+		return nil
+	}
+	_, err := c.db.ExecContext(ctx, `DELETE FROM deleted_tags WHERE label = ? COLLATE NOCASE`, label)
+	return err
+}
+
 func (c *Catalog) categoryVideoCount(ctx context.Context, category string) (int, error) {
 	var count int
 	err := c.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM videos WHERE category = ?`, category).Scan(&count)
@@ -815,6 +1269,71 @@ func (c *Catalog) getTagByLabelTx(ctx context.Context, tx *sql.Tx, label string)
 		`SELECT id, label, aliases, source, 0 FROM tags WHERE label = ? COLLATE NOCASE`,
 		label)
 	return scanTag(row)
+}
+
+func (c *Catalog) getTagByIDTx(ctx context.Context, tx *sql.Tx, id int64) (Tag, error) {
+	row := tx.QueryRowContext(ctx,
+		`SELECT id, label, aliases, source, 0 FROM tags WHERE id = ?`,
+		id)
+	return scanTag(row)
+}
+
+func hasManualTagsTx(ctx context.Context, tx *sql.Tx, videoID string) bool {
+	var manual int
+	err := tx.QueryRowContext(ctx, `SELECT COALESCE(tags_manual, 0) FROM videos WHERE id = ?`, videoID).Scan(&manual)
+	return err == nil && manual == 1
+}
+
+func markDeletedTagTx(ctx context.Context, tx *sql.Tx, tag Tag) error {
+	label := cleanTagLabel(tag.Label)
+	if label == "" {
+		return nil
+	}
+	now := time.Now().UnixMilli()
+	_, err := tx.ExecContext(ctx, `
+INSERT INTO deleted_tags (label, source, deleted_at)
+VALUES (?, ?, ?)
+ON CONFLICT(label) DO UPDATE SET
+  source = excluded.source,
+  deleted_at = excluded.deleted_at`, label, tag.Source, now)
+	return err
+}
+
+func syncVideoTagsJSONTx(ctx context.Context, tx *sql.Tx, videoID string, manual bool) error {
+	rows, err := tx.QueryContext(ctx, `
+SELECT t.label
+FROM video_tags vt
+JOIN tags t ON t.id = vt.tag_id
+WHERE vt.video_id = ?
+ORDER BY t.id ASC`, videoID)
+	if err != nil {
+		return err
+	}
+	var labels []string
+	for rows.Next() {
+		var label string
+		if err := rows.Scan(&label); err != nil {
+			rows.Close()
+			return err
+		}
+		labels = append(labels, label)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	labelsJSON, _ := json.Marshal(labels)
+	manualValue := 0
+	if manual {
+		manualValue = 1
+	}
+	_, err = tx.ExecContext(ctx,
+		`UPDATE videos SET tags = ?, tags_manual = ?, updated_at = ? WHERE id = ?`,
+		string(labelsJSON), manualValue, time.Now().UnixMilli(), videoID)
+	return err
 }
 
 type tagRowScanner interface {

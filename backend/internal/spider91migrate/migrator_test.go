@@ -339,12 +339,14 @@ func TestRunOnceMigratesSpider91VideosAndCleansLocalFiles(t *testing.T) {
 
 	now := time.Now()
 	id := writeSpider91Video(t, cat, src, "vk001", ".mp4", []byte("video bytes here"), now)
+	commonThumbDir := t.TempDir()
 
 	m := New(Config{
 		Catalog:          cat,
 		Registry:         reg,
 		GetTargetDriveID: func() string { return pp.ID() },
 		KeepLatestN:      -1, // 关闭"保留最新 N 个"，让 1 条也能立即上传
+		CommonThumbDir:   commonThumbDir,
 	})
 	m.runOnce(context.Background())
 
@@ -382,8 +384,15 @@ func TestRunOnceMigratesSpider91VideosAndCleansLocalFiles(t *testing.T) {
 	if got.ContentHash == "" {
 		t.Fatalf("content_hash should be set after migration")
 	}
+	if got.ThumbnailURL != "/p/thumb/"+id {
+		t.Fatalf("thumbnail_url = %q, want preserved crawled thumbnail URL", got.ThumbnailURL)
+	}
+	commonThumbPath := filepath.Join(commonThumbDir, id+".jpg")
+	if data, err := os.ReadFile(commonThumbPath); err != nil || string(data) != "thumb" {
+		t.Fatalf("common thumb = %q, %v; want copied crawled thumb", string(data), err)
+	}
 
-	// 3) 本地视频和 thumb 都被删了
+	// 3) 本地视频和源 thumb 都被删了；公共 /p/thumb 副本保留。
 	videoPath, _ := src.VideoPath("vk001.mp4")
 	if _, err := os.Stat(videoPath); !os.IsNotExist(err) {
 		t.Fatalf("local mp4 still exists or stat error %v", err)

@@ -90,7 +90,6 @@
 
 .promo-card:hover {
   border-color: var(--border-accent);
-  transform: translateY(-3px);
   box-shadow: var(--shadow-md);
   color: var(--text-strong);
 }
@@ -149,7 +148,6 @@
 }
 
 .back-to-top:hover {
-  transform: translateY(-3px);
   filter: brightness(1.05);
 }
 
@@ -372,7 +370,6 @@
 }
 
 .upload-submit:hover:not(:disabled) {
-  transform: translateY(-1px);
   filter: brightness(1.05);
   box-shadow: 0 10px 22px var(--accent-glow), var(--shadow-inset);
 }

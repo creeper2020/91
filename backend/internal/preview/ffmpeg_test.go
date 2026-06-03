@@ -5,6 +5,8 @@ import (
 	"errors"
 	"math"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -95,6 +97,24 @@ func TestTinyVideoPreviewPlanUsesWholeVideoAsSingleSegment(t *testing.T) {
 	}
 }
 
+func TestProbeIgnoresStderrWarnings(t *testing.T) {
+	dir := t.TempDir()
+	ffprobePath := filepath.Join(dir, "ffprobe")
+	script := "#!/bin/sh\nprintf '%s\\n' 'h264 warning' >&2\nprintf '%s\\n' '364.800000'\n"
+	if err := os.WriteFile(ffprobePath, []byte(script), 0o755); err != nil {
+		t.Fatalf("write ffprobe stub: %v", err)
+	}
+
+	gen := New(Config{FFprobePath: ffprobePath})
+	got, err := gen.Probe(context.Background(), &drives.StreamLink{URL: filepath.Join(dir, "video.mp4")})
+	if err != nil {
+		t.Fatalf("probe: %v", err)
+	}
+	if got != 364.8 {
+		t.Fatalf("duration = %v, want 364.8", got)
+	}
+}
+
 func TestTeaserCandidateStartsKeepPrimaryAndAddFallbacks(t *testing.T) {
 	primary := []float64{10.2, 64.65, 119.1, 173.55}
 	got := teaserCandidateStarts(204, primary, 3)
@@ -148,16 +168,29 @@ func TestMediumAndLongVideosStillRequirePlannedTeaserSegments(t *testing.T) {
 	}
 }
 
-func TestThumbnailOffsetsUseFiveSecondsWithEarlyFallbacks(t *testing.T) {
-	got := thumbnailOffsets()
-	want := []float64{5, 1, 0}
-	if len(got) != len(want) {
-		t.Fatalf("offsets = %#v, want %#v", got, want)
+func TestThumbnailOffsetsPreferMiddleFrame(t *testing.T) {
+	tests := []struct {
+		name     string
+		duration float64
+		want     []float64
+	}{
+		{name: "unknown duration", duration: 0, want: []float64{5, 1, 0}},
+		{name: "long video", duration: 2804.9, want: []float64{1402.45, 5, 1, 0}},
+		{name: "short video", duration: 8.9, want: []float64{4.45, 5, 1, 0}},
+		{name: "middle equals fallback", duration: 10, want: []float64{5, 1, 0}},
 	}
-	for i := range want {
-		if got[i] != want[i] {
-			t.Fatalf("offset[%d] = %.2f, want %.2f", i, got[i], want[i])
-		}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := thumbnailOffsets(tt.duration)
+			if len(got) != len(tt.want) {
+				t.Fatalf("offsets = %#v, want %#v", got, tt.want)
+			}
+			for i := range tt.want {
+				if math.Abs(got[i]-tt.want[i]) > 0.001 {
+					t.Fatalf("offset[%d] = %.2f, want %.2f", i, got[i], tt.want[i])
+				}
+			}
+		})
 	}
 }
 

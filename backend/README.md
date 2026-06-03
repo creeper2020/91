@@ -2,7 +2,7 @@
 
 视频聚合站的 Go 后端。提供三件事：
 
-1. 多家网盘统一抽象（夸克 / 115 / PikPak / 联通沃盘 / OneDrive / 本地存储）
+1. 多家网盘统一抽象（夸克 / 115 / PikPak / 联通沃盘 / OneDrive / Google Drive / 本地存储）
 2. 视频元数据目录（SQLite）+ 扫描 + teaser 预生成
 3. REST API（前台）+ 管理后台 + 直链代理
 4. 标签池、视频隐藏、按网盘统计和详情页来源网盘类型展示能力
@@ -21,6 +21,7 @@ internal/
     pikpak/                 PikPak（自己实现，参考 OpenList pikpak）
     wopan/                  联通沃盘（壳子 + OpenListTeam/wopan-sdk-go）
     onedrive/               OneDrive（OpenList 在线续期 + Microsoft Graph 文件接口）
+    googledrive/            Google Drive（OpenList 在线续期 + Google Drive API；播放走后端代理）
     localstorage/           本地目录扫描（服务器已有视频目录）
   scanner/                  扫目录 → 落库
   preview/                  ffmpeg 抽封面和生成多段 teaser
@@ -92,7 +93,6 @@ go run ./cmd/server 后端 9192
      "kind": "quark",
      "name": "我的夸克盘",
      "rootId": "0",
-     "scanRootId": "0",
      "credentials": {
        "cookie": "粘贴浏览器 F12 复制的 pan.quark.cn Cookie"
      }
@@ -109,6 +109,7 @@ go run ./cmd/server 后端 9192
 | pikpak | `username`、`password`（token、验证码和设备 ID 由服务端自动处理并保存） |
 | wopan  | `access_token`、`refresh_token`，可选 `family_id`              |
 | onedrive | `refresh_token` |
+| googledrive | `refresh_token` |
 | localstorage | `path`（服务器上的已有视频目录，如 `/mnt/videos`） |
 
 ### PikPak 速度说明
@@ -119,16 +120,24 @@ go run ./cmd/server 后端 9192
 
 OneDrive 按 OpenList 默认应用方式调用 `https://api.oplist.org/onedrive/renewapi` 在线刷新 token，不需要配置 Azure 应用的 `client_id` / `client_secret` / `redirect_uri`。后台新建 OneDrive 时只需要填 OpenList 代刷得到的 `refresh_token`；服务端会默认挂载根目录并自动回写新 token。
 
+Google Drive 按 OpenList 在线 API 调用 `https://api.oplist.org/googleui/renewapi` 刷新 token。后台新建 Google Drive 时只需要填 OpenList Google Drive 获取到的 `refresh_token`。Google Drive 下载地址必须携带 `Authorization` 头，浏览器不能直接 302 使用，所以本站会由后端代理 `/p/stream` 播放，不加入零带宽 302 白名单。
+
 ## 文件名约定
 
-扫描器按以下顺序解析文件名：
+扫描器按以下顺序解析文件名，用于提取标题和作者：
 
-1. `[tag1,tag2] 标题 - 作者.mp4`
-2. `[tag1,tag2] 标题.mp4`
+1. `[前缀] 标题 - 作者.mp4`
+2. `[前缀] 标题.mp4`
 3. `标题 - 作者.mp4`
 4. `标题.mp4`
 
-标签分隔符支持 `, ， 、` 和空格。解析结果会和系统标签池匹配，常见番号类噪声会归并到 `AV` 等系统标签，避免把每个番号都变成独立标签。解析结果可在管理后台覆盖。
+开头的 `[前缀]` 只会从标题里剥离，不会按分隔符作为任意标签入库。视频标签来自三类规则：
+
+1. 文件名、作者和目录名命中系统标签或已有标签的标签名 / 别名。
+2. 符合条件的目录名会自动创建 `collection` 合集标签，并给同目录视频打上该标签。
+3. 常见番号类噪声会统一归并到 `AV`，避免把每个番号都变成独立标签。
+
+当前内置系统标签为：`后入`、`奶子`、`口交`、`臀`、`人妻`、`女大`、`AV`。解析结果可在管理后台覆盖；手动保存后，该视频会标记为人工标签，后续扫描不会再自动覆盖。
 
 ## 视频去重
 
@@ -146,7 +155,7 @@ OneDrive 按 OpenList 默认应用方式调用 `https://api.oplist.org/onedrive/
 
 - `/admin/drives`：新增、编辑、删除网盘，触发扫描。
 - `/admin/videos`：按网盘筛选视频，每页 100 条分页，查看各网盘 Teaser 统计，编辑标题/作者/分类/标签，单条或全量重生 teaser。
-- `/admin/tags`：新增标签并用内置规则自动匹配已有视频。
+- `/admin/tags`：新增标签并用内置规则自动匹配已有视频；删除非系统标签时会从所有视频上同步移除该标签。
 - 播放页视频信息会展示来源网盘类型；同时提供“不再展示”，点击后会把视频标记为全局隐藏。隐藏视频不会再出现在首页、列表、搜索、相关推荐和详情接口中。目前没有管理后台恢复入口，如需恢复可把数据库里对应视频的 `hidden` 字段改回 `0`。
 
 ## Teaser 生成

@@ -14,7 +14,7 @@ import (
 	"github.com/video-site/backend/internal/drives"
 )
 
-func TestRunPersistsRemoteThumbnailFromDriveEntry(t *testing.T) {
+func TestRunIgnoresRemoteThumbnailFromDriveEntry(t *testing.T) {
 	ctx := context.Background()
 	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
 	if err != nil {
@@ -50,8 +50,8 @@ func TestRunPersistsRemoteThumbnailFromDriveEntry(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get video: %v", err)
 	}
-	if got.ThumbnailURL != "https://thumbnail.example/clip.jpg" {
-		t.Fatalf("thumbnail = %q, want remote thumbnail", got.ThumbnailURL)
+	if got.ThumbnailURL != "" {
+		t.Fatalf("thumbnail = %q, want empty so local thumbnail worker regenerates it", got.ThumbnailURL)
 	}
 }
 
@@ -90,7 +90,7 @@ func TestRunIgnoresZeroSizeVideoFiles(t *testing.T) {
 	}
 }
 
-func TestRunBackfillsRemoteThumbnailForExistingVideo(t *testing.T) {
+func TestRunDoesNotBackfillRemoteThumbnailForExistingVideo(t *testing.T) {
 	ctx := context.Background()
 	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
 	if err != nil {
@@ -140,8 +140,8 @@ func TestRunBackfillsRemoteThumbnailForExistingVideo(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get video: %v", err)
 	}
-	if got.ThumbnailURL != "https://thumbnail.example/backfilled.jpg" {
-		t.Fatalf("thumbnail = %q, want backfilled remote thumbnail", got.ThumbnailURL)
+	if got.ThumbnailURL != "" {
+		t.Fatalf("thumbnail = %q, want empty so local thumbnail worker regenerates it", got.ThumbnailURL)
 	}
 }
 
@@ -251,6 +251,93 @@ func TestRunAddsShortCollectionDirectoryAsTag(t *testing.T) {
 	}
 	if !sameStrings(got.Tags, []string{"sunny"}) {
 		t.Fatalf("tags = %#v, want sunny", got.Tags)
+	}
+}
+
+func TestRunDoesNotRecreateDeletedCollectionDirectoryTag(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cat.Close(); err != nil {
+			t.Fatalf("close catalog: %v", err)
+		}
+	})
+	now := time.Now()
+	for _, id := range []string{"existing-1", "existing-2"} {
+		if err := cat.UpsertVideo(ctx, &catalog.Video{
+			ID:          id,
+			DriveID:     "drive",
+			FileID:      id,
+			Title:       "Existing",
+			Category:    "sunny",
+			PublishedAt: now,
+			CreatedAt:   now,
+			UpdatedAt:   now,
+		}); err != nil {
+			t.Fatalf("seed existing sunny video: %v", err)
+		}
+	}
+	if label, ok, err := cat.EnsureCollectionTag(ctx, "sunny"); err != nil || !ok || label != "sunny" {
+		t.Fatalf("ensure collection = %q, %v, %v; want sunny true nil", label, ok, err)
+	}
+	tags, err := cat.ListTags(ctx)
+	if err != nil {
+		t.Fatalf("list tags: %v", err)
+	}
+	var tagID int64
+	for _, tag := range tags {
+		if tag.Label == "sunny" {
+			tagID = tag.ID
+			break
+		}
+	}
+	if tagID == 0 {
+		t.Fatal("sunny tag not found before delete")
+	}
+	if _, err := cat.DeleteTag(ctx, tagID); err != nil {
+		t.Fatalf("delete tag: %v", err)
+	}
+
+	drv := &scannerTreeFakeDrive{
+		entries: map[string][]drives.Entry{
+			"root": {{
+				ID:    "dir-1",
+				Name:  "sunny",
+				IsDir: true,
+			}},
+			"dir-1": {{
+				ID:       "file-1",
+				ParentID: "dir-1",
+				Name:     "clip.mp4",
+				Size:     123,
+				ModTime:  now,
+			}},
+		},
+	}
+	sc := New(cat, drv, []string{".mp4"}, nil, nil)
+
+	if _, err := sc.Run(ctx, ""); err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+
+	got, err := cat.GetVideo(ctx, "fake-drive-file-1")
+	if err != nil {
+		t.Fatalf("get video: %v", err)
+	}
+	if len(got.Tags) != 0 {
+		t.Fatalf("tags = %#v, want none", got.Tags)
+	}
+	tags, err = cat.ListTags(ctx)
+	if err != nil {
+		t.Fatalf("list tags after scan: %v", err)
+	}
+	for _, tag := range tags {
+		if tag.Label == "sunny" {
+			t.Fatal("deleted collection tag was recreated during scan")
+		}
 	}
 }
 

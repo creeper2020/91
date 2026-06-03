@@ -30,7 +30,7 @@ else
   echo "[entrypoint] using existing $CONFIG"
 fi
 
-if [ -n "${VIDEO_VERSION_FILE:-}" ] && [ -n "${VIDEO_IMAGE_VERSION:-}" ] && [ ! -f "$VIDEO_VERSION_FILE" ]; then
+if [ -n "${VIDEO_VERSION_FILE:-}" ] && [ -n "${VIDEO_IMAGE_VERSION:-}" ]; then
   mkdir -p "$(dirname "$VIDEO_VERSION_FILE")"
   printf '%s\n' "$VIDEO_IMAGE_VERSION" > "$VIDEO_VERSION_FILE"
 fi

@@ -36,9 +36,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3-bs4 \
     python3-lxml \
     python3-requests \
+    python3-socks \
     tar \
     tzdata \
     && rm -rf /var/lib/apt/lists/*
+
+RUN python3 -c "import requests, bs4, lxml, socks"
 
 WORKDIR /opt/video-site-91
 
@@ -48,7 +51,7 @@ COPY backend/config.example.yaml ./config.example.yaml
 COPY 91VideoSpider/ ./91VideoSpider/
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 
-ARG VERSION=
+ARG VERSION=dev
 
 ENV VIDEO_CONFIG=/opt/video-site-91/data/config.yaml \
     VIDEO_FRONTEND_DIR=/opt/video-site-91/dist \

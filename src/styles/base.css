@@ -19,6 +19,8 @@ body,
 html {
   /* 让锚点跳转有平滑动画，但尊重系统 reduce-motion */
   scroll-behavior: smooth;
+  scrollbar-gutter: stable;
+  overflow-y: scroll;
 }
 
 @media (prefers-reduced-motion: reduce) {

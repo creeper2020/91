@@ -147,13 +147,15 @@ func (p *Proxy) ServeStream(w http.ResponseWriter, r *http.Request, driveID, fil
 //     CDN 不校验请求头，直连可获得最佳带宽并避免占用 backend 出站
 //   - onedrive：Microsoft Graph 返回的 @microsoft.graph.downloadUrl 是短期
 //     免鉴权下载 URL，不需要后端继续代传视频字节
+//   - p123：123 云盘 download_info 返回的下载页会再跳 CDN；driver 已在后端
+//     先解出最终 Location，浏览器可直接 302 到该短期地址
 //
 // 其余网盘（如沃盘 / 夸克等）仍走反代，因为它们的下载
 // 链接通常需要随请求带上后端持有的 Cookie / Authorization / Range
 // 的特殊处理，浏览器拿不到这些上下文。
 func shouldRedirect(d drives.Drive) bool {
 	switch d.Kind() {
-	case "p115", "pikpak", "onedrive":
+	case "p115", "pikpak", "onedrive", "p123":
 		return true
 	}
 	return false

@@ -131,6 +131,7 @@
   /* ----- 网盘品牌色 ----- */
   --drive-quark: #5b8def;
   --drive-p115: #f56b76;
+  --drive-p123: #22b8c8;
   --drive-pikpak: #8a6dff;
   --drive-wopan: #ff8a3c;
   --drive-onedrive: #4cabea;
@@ -211,6 +212,7 @@
   /* ----- 网盘品牌色（粉白基底下重新调谐，整体柔化、降饱和） ----- */
   --drive-quark: #4f7be0;
   --drive-p115: #e0556a;
+  --drive-p123: #1596a8;
   --drive-pikpak: #8466e6;
   --drive-wopan: #e57a36;
   --drive-onedrive: #2f95cf;

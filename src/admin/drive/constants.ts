@@ -1,0 +1,271 @@
+export type Kind = "quark" | "p115" | "p123" | "pikpak" | "wopan" | "onedrive" | "googledrive" | "localstorage" | "spider91";
+
+export const kindLabel: Record<string, string> = {
+  quark: "夸克网盘",
+  p115: "115 网盘",
+  p123: "123 云盘",
+  pikpak: "PikPak",
+  wopan: "联通沃盘",
+  onedrive: "OneDrive",
+  googledrive: "Google Drive",
+  localstorage: "本地存储",
+  spider91: "91 爬虫",
+};
+
+export type FormState = {
+  id: string;
+  kind: Kind;
+  name: string;
+  rootId: string;
+  creds: Record<string, string>;
+  spider91UploadDriveId: string;
+};
+
+export const emptyForm: FormState = {
+  id: "",
+  kind: "p115",
+  name: "",
+  rootId: "",
+  creds: {},
+  spider91UploadDriveId: "",
+};
+
+export const idleNightlyStatus = {
+  state: "idle" as const,
+  running: false,
+  queued: false,
+};
+
+export function nightlyButtonText(status: { running: boolean; queued: boolean }, triggering: boolean) {
+  if (triggering) return "触发中...";
+  if (status.running) return "扫描运行中";
+  if (status.queued) return "扫描已排队";
+  return "扫描所有网盘";
+}
+
+export function nightlyBusyText(status: { running: boolean; queued: boolean }) {
+  if (status.running) return "扫描任务正在运行";
+  if (status.queued) return "扫描任务已排队";
+  return "";
+}
+
+export function generationStateLabel(state: string): string {
+  if (state === "generating") return "生成中";
+  if (state === "cooling") return "冷却中";
+  if (state === "queued") return "排队中";
+  return "空闲";
+}
+
+export function generationStateClass(state: string): string {
+  if (state === "generating" || state === "cooling" || state === "queued") {
+    return state;
+  }
+  return "idle";
+}
+
+export function generationDetail(status?: { state: string; cooldownUntil?: string; currentTitle?: string }): string {
+  if (!status) return "";
+  if (status.state === "cooling" && status.cooldownUntil) {
+    return `剩余 ${formatCooldownRemaining(status.cooldownUntil)}`;
+  }
+  if (status.currentTitle) {
+    return status.currentTitle;
+  }
+  return "";
+}
+
+export function generationTitle(status: { state: string; cooldownUntil?: string; currentTitle?: string } | undefined, detail: string): string | undefined {
+  if (!status) return detail || undefined;
+  if (status.state === "cooling" && status.cooldownUntil) {
+    return `冷却至 ${formatClock(status.cooldownUntil)}`;
+  }
+  return status.currentTitle || detail || undefined;
+}
+
+export function formatCooldownRemaining(value: string): string {
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return value;
+  const totalSeconds = Math.max(0, Math.ceil((d.getTime() - Date.now()) / 1000));
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  if (hours > 0) return `${hours}小时${minutes}分`;
+  if (minutes > 0) return `${minutes}分${seconds}秒`;
+  return `${seconds}秒`;
+}
+
+export function formatClock(value: string): string {
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return value;
+  return d.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" });
+}
+
+export function defaultRootId(kind: Kind): string {
+  if (kind === "pikpak") return "";
+  if (kind === "onedrive") return "root";
+  if (kind === "googledrive") return "root";
+  if (kind === "localstorage") return "/";
+  if (kind === "spider91") return "/";
+  return "0";
+}
+
+export function usesRootDirectoryID(kind: Kind): boolean {
+  return kind !== "localstorage" && kind !== "spider91";
+}
+
+export function rootIdPlaceholder(kind: Kind): string {
+  const rootId = defaultRootId(kind);
+  return rootId ? `默认：${rootId}` : "留空表示根目录";
+}
+
+export function credentialHelp(kind: Kind, isEdit: boolean): string {
+  const note = isEdit ? "如不修改凭证，留空即可，保存时会沿用旧值。" : "";
+  switch (kind) {
+    case "quark":
+      return `在 pan.quark.cn 登录后，F12 → Network → 任意请求 → Request Headers 里复制整段 Cookie 粘贴到下方。${note}`;
+    case "p115":
+      return `登录 115.com 后复制 Cookie，形如 "UID=...; CID=...; SEID=...; KID=..."。${note}`;
+    case "p123":
+      return `推荐使用扫码登录自动获取 access_token；账号密码登录被 123 云盘风控拦截时，也可以只填写 access_token。播放走 302 跳转到 123 云盘返回的短期 CDN 地址。${note}`;
+    case "pikpak":
+      return `填写 PikPak 账号和密码即可。平台、设备 ID、验证码 token 和 refresh token 会由服务端自动处理并保存。${note}`;
+    case "wopan":
+      return `需要 access_token 和 refresh_token。后续会加扫码/短信登录入口，第一版只能手工粘贴。${note}`;
+    case "onedrive":
+      return `按 OpenList 默认应用在线挂载，只需要 refresh_token；保存时会自动刷新并保存 token。${note}`;
+    case "googledrive":
+      return `按 OpenList 在线 API 挂载，只需要 Google Drive refresh_token；保存时会自动刷新并保存 token。播放不走 302，会由后端带 Authorization 代理转发。${note}`;
+    case "localstorage":
+      return `把服务器上的一个已有目录作为视频来源扫描。填写绝对路径，例如 /mnt/videos；系统会读取该目录及子目录中的视频，并生成封面、Teaser 和指纹。${note}`;
+    case "spider91":
+      return "91 爬虫会把定时抓取到的视频和封面先保存到本机，并作为一个视频来源接入站点；可按服务器网络情况单独配置代理。后续流水线会把较早的视频上传到你选择的 115 / PikPak / OneDrive 目标盘。";
+    default:
+      return "";
+  }
+}
+
+export function credentialFields(kind: Kind): Array<{
+  key: string;
+  label: string;
+  placeholder: string;
+  multiline?: boolean;
+  required?: boolean;
+  help?: string;
+}> {
+  switch (kind) {
+    case "quark":
+      return [
+        {
+          key: "cookie",
+          label: "Cookie",
+          placeholder: "__pus=...; __puus=...; ...",
+          multiline: true,
+          required: true,
+        },
+      ];
+    case "p115":
+      return [
+        {
+          key: "cookie",
+          label: "Cookie",
+          placeholder: "UID=xxx; CID=xxx; SEID=xxx; KID=xxx",
+          multiline: true,
+          required: true,
+        },
+      ];
+    case "p123":
+      return [
+        {
+          key: "username",
+          label: "用户名 / 邮箱（可选）",
+          placeholder: "user@example.com",
+        },
+        {
+          key: "password",
+          label: "密码（可选）",
+          placeholder: "123 云盘密码",
+        },
+        {
+          key: "access_token",
+          label: "access_token（推荐用于风控场景）",
+          placeholder: "Bearer eyJ... 或直接粘贴 token",
+          multiline: true,
+          help: "扫码成功后会自动填入该字段；如果 token 过期，重新扫码后保存即可。",
+        },
+      ];
+    case "pikpak":
+      return [
+        {
+          key: "username",
+          label: "用户名 / 邮箱",
+          placeholder: "user@example.com",
+          required: true,
+        },
+        {
+          key: "password",
+          label: "密码",
+          placeholder: "PikPak 密码",
+          required: true,
+        },
+      ];
+    case "wopan":
+      return [
+        {
+          key: "access_token",
+          label: "access_token",
+          placeholder: "",
+          required: true,
+        },
+        {
+          key: "refresh_token",
+          label: "refresh_token",
+          placeholder: "",
+          required: true,
+        },
+        {
+          key: "family_id",
+          label: "family_id（家庭空间可选）",
+          placeholder: "留空走个人空间",
+        },
+      ];
+    case "onedrive":
+      return [
+        {
+          key: "refresh_token",
+          label: "refresh_token",
+          placeholder: "OpenList OneDrive refresh_token",
+          multiline: true,
+          required: true,
+        },
+      ];
+    case "googledrive":
+      return [
+        {
+          key: "refresh_token",
+          label: "refresh_token",
+          placeholder: "OpenList Google Drive refresh_token",
+          multiline: true,
+          required: true,
+        },
+      ];
+    case "localstorage":
+      return [
+        {
+          key: "path",
+          label: "本地目录路径",
+          placeholder: "/mnt/videos",
+          required: true,
+          help: "路径必须是后端服务器上的已有目录；保存后可手动重扫，系统会递归扫描支持的视频格式。",
+        },
+      ];
+    case "spider91":
+      return [
+        {
+          key: "proxy",
+          label: "代理地址（可选）",
+          placeholder: "http://127.0.0.1:7890",
+          help: "仅用于 91Spider 的列表/详情请求和视频、封面下载；留空则使用服务器环境变量 HTTP_PROXY / HTTPS_PROXY 或直连。支持 http://、https://、socks5:// 或 socks5h://。",
+        },
+      ];
+  }
+}

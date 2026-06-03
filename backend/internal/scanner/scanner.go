@@ -181,14 +181,10 @@ func (s *Scanner) walk(ctx context.Context, dirID, dirName string, stats *Stats,
 			if existing.Category == "" && dirName != "" {
 				patch.Category = dirName
 			}
-			if existing.ThumbnailURL == "" && e.ThumbnailURL != "" {
-				patch.ThumbnailURL = e.ThumbnailURL
-			}
-			if patch.Category != "" || patch.ThumbnailURL != "" || patch.ContentHash != "" || patch.FileName != "" {
+			if patch.Category != "" || patch.ContentHash != "" || patch.FileName != "" {
 				_ = s.Catalog.UpdateVideoMeta(ctx, id, patch)
 			}
 			if dup := s.findDuplicate(ctx, e.Hash, e.Name, e.Size, id); dup != nil {
-				s.backfillDuplicateThumbnail(ctx, dup, e.ThumbnailURL)
 				continue
 			}
 			if !sameTags(existing.Tags, tags) {
@@ -198,7 +194,6 @@ func (s *Scanner) walk(ctx context.Context, dirID, dirName string, stats *Stats,
 		}
 
 		if dup := s.findDuplicate(ctx, e.Hash, e.Name, e.Size, id); dup != nil {
-			s.backfillDuplicateThumbnail(ctx, dup, e.ThumbnailURL)
 			continue
 		}
 
@@ -216,7 +211,6 @@ func (s *Scanner) walk(ctx context.Context, dirID, dirName string, stats *Stats,
 			Ext:           strings.TrimPrefix(ext, "."),
 			Quality:       "HD",
 			Size:          e.Size,
-			ThumbnailURL:  e.ThumbnailURL,
 			PreviewStatus: "pending",
 			Category:      dirName,
 			PublishedAt:   now,
@@ -266,13 +260,6 @@ func (s *Scanner) findDuplicateByFileSignature(ctx context.Context, fileName str
 		return nil
 	}
 	return dup
-}
-
-func (s *Scanner) backfillDuplicateThumbnail(ctx context.Context, canonical *catalog.Video, thumbnailURL string) {
-	if canonical.ThumbnailURL != "" || thumbnailURL == "" {
-		return
-	}
-	_ = s.Catalog.UpdateVideoMeta(ctx, canonical.ID, catalog.VideoMetaPatch{ThumbnailURL: thumbnailURL})
 }
 
 func sameTags(a, b []string) bool {

@@ -1,8 +1,10 @@
-import { useEffect, useState } from "react";
-import { Edit, RefreshCw, Search } from "lucide-react";
+import { useEffect, useId, useState } from "react";
+import { Edit, RefreshCw, Search, CheckSquare, Square, Image } from "lucide-react";
 import * as api from "./api";
 import { useToast } from "./ToastContext";
 import { Modal } from "./Modal";
+import { ConfirmModal } from "./ConfirmModal";
+import { formatBytes } from "./storageFormat";
 
 const PAGE_SIZE = 100;
 
@@ -10,19 +12,25 @@ export function VideosPage() {
   const [list, setList] = useState<api.AdminVideo[]>([]);
   const [drives, setDrives] = useState<api.AdminDrive[]>([]);
   const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState("");
   const [keyword, setKeyword] = useState("");
+  const [searchKeyword, setSearchKeyword] = useState("");
   const [driveId, setDriveId] = useState("");
   const [page, setPage] = useState(1);
   const [total, setTotal] = useState(0);
   const [editing, setEditing] = useState<api.AdminVideo | null>(null);
   const [availableTags, setAvailableTags] = useState<api.AdminTag[]>([]);
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [batchRegenOpen, setBatchRegenOpen] = useState(false);
+  const [batchRegening, setBatchRegening] = useState(false);
   const { show } = useToast();
 
   async function refresh() {
     setLoading(true);
+    setLoadError("");
     try {
       const [r, tagList, driveList] = await Promise.all([
-        api.listVideos({ driveId, page, size: PAGE_SIZE }),
+        api.listVideos({ driveId, page, size: PAGE_SIZE, keyword: searchKeyword }),
         api.listTags(),
         api.listDrives(),
       ]);
@@ -30,8 +38,11 @@ export function VideosPage() {
       setTotal(r.total ?? 0);
       setAvailableTags(tagList);
       setDrives(driveList ?? []);
+      setSelectedIds(new Set());
     } catch (e) {
-      show(e instanceof Error ? e.message : "加载失败", "error");
+      const message = e instanceof Error ? e.message : "加载失败";
+      setLoadError(message);
+      show(message, "error");
     } finally {
       setLoading(false);
     }
@@ -39,21 +50,21 @@ export function VideosPage() {
 
   useEffect(() => {
     refresh();
-  }, [driveId, page]);
+  }, [driveId, page, searchKeyword]);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      setSearchKeyword(keyword);
+      setPage(1);
+    }, 300);
+    return () => window.clearTimeout(timer);
+  }, [keyword]);
 
   const driveNameMap = new Map(
     drives.map((d) => [d.id, d.name || d.id])
   );
 
-  const filtered = keyword.trim()
-    ? list.filter((v) => {
-        const k = keyword.toLowerCase();
-        return (
-          v.title.toLowerCase().includes(k) ||
-          (v.author ?? "").toLowerCase().includes(k)
-        );
-      })
-    : list;
+  const listItems = list;
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
   const pageStart = total === 0 ? 0 : (page - 1) * PAGE_SIZE + 1;
   const pageEnd = Math.min(total, page * PAGE_SIZE);
@@ -65,6 +76,51 @@ export function VideosPage() {
     } catch (e) {
       show(e instanceof Error ? e.message : "触发失败", "error");
     }
+  }
+
+  async function handleBatchRegen() {
+    if (selectedIds.size === 0) return;
+    setBatchRegenOpen(true);
+  }
+
+  async function confirmBatchRegen() {
+    const ids = [...selectedIds];
+    setBatchRegening(true);
+    let success = 0;
+    try {
+      const results = await Promise.allSettled(
+        ids.map((id) => api.regenPreview(id))
+      );
+      for (const r of results) {
+        if (r.status === "fulfilled") success++;
+      }
+      show(`批量触发完成，成功 ${success} / ${ids.length} 个`, success === ids.length ? "success" : "info");
+      setSelectedIds(new Set());
+      setBatchRegenOpen(false);
+    } finally {
+      setBatchRegening(false);
+    }
+  }
+
+  const toggleSelectAll = () => {
+    if (selectedIds.size === listItems.length && listItems.length > 0) {
+      setSelectedIds(new Set());
+    } else {
+      setSelectedIds(new Set(listItems.map(v => v.id)));
+    }
+  };
+
+  const toggleSelect = (id: string) => {
+    const next = new Set(selectedIds);
+    if (next.has(id)) next.delete(id);
+    else next.add(id);
+    setSelectedIds(next);
+  };
+
+  function handleSearchSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    setSearchKeyword(keyword);
+    setPage(1);
   }
 
   return (
@@ -88,15 +144,16 @@ export function VideosPage() {
               </option>
             ))}
           </select>
-          <div className="admin-videos-filter__search">
+          <form className="admin-videos-filter__search" onSubmit={handleSearchSubmit}>
             <Search size={14} className="admin-videos-filter__search-icon" />
             <input
+              aria-label="搜索标题或作者"
               value={keyword}
               onChange={(e) => setKeyword(e.target.value)}
               placeholder="搜索标题 / 作者"
             />
-          </div>
-          <button className="admin-btn" onClick={refresh}>
+          </form>
+          <button type="button" className="admin-btn" onClick={refresh}>
             <RefreshCw size={13} /> 刷新
           </button>
         </div>
@@ -133,6 +190,15 @@ export function VideosPage() {
         </div>
       )}
 
+      {selectedIds.size > 0 && (
+        <div className="admin-batch-actions admin-card" style={{ marginBottom: 16, padding: "8px 16px", display: "flex", alignItems: "center", gap: 12 }}>
+          <span className="admin-text-faint">已选择 {selectedIds.size} 项（当前页）</span>
+          <button type="button" className="admin-btn is-primary" onClick={handleBatchRegen}>
+            <RefreshCw size={13} /> 批量重生 Teaser
+          </button>
+        </div>
+      )}
+
       {!loading && (
         <div className="admin-videos-summary">
           {driveId
@@ -142,18 +208,78 @@ export function VideosPage() {
       )}
 
       {loading ? (
-        <div className="admin-empty">加载中...</div>
-      ) : filtered.length === 0 ? (
-        <div className="admin-card admin-empty">
-          {driveId
-            ? "这个网盘下还没有可显示的视频。可以在「网盘管理」里触发重扫。"
-            : "还没有视频。先在「网盘管理」里配置好盘并触发扫描。"}
+        <table className="admin-table is-selectable">
+          <thead>
+            <tr>
+              <th className="is-checkbox" style={{ width: '40px' }}><Square size={16} color="var(--border-default)" /></th>
+              <th>标题</th>
+              <th>作者</th>
+              <th>标签</th>
+              <th>时长</th>
+              <th>Teaser</th>
+              <th>来源</th>
+              <th className="is-actions">操作</th>
+            </tr>
+          </thead>
+          <tbody>
+            {[...Array(10)].map((_, i) => (
+              <tr key={i}>
+                <td className="is-checkbox"><Square size={16} color="var(--border-subtle)" /></td>
+                <td>
+                  <div className="admin-skeleton-pulse" style={{ width: '60%', height: '14px', marginBottom: '6px', borderRadius: '4px' }}></div>
+                  <div className="admin-skeleton-pulse" style={{ width: '40%', height: '12px', borderRadius: '4px' }}></div>
+                </td>
+                <td><div className="admin-skeleton-pulse" style={{ width: '80%', height: '14px', borderRadius: '4px' }}></div></td>
+                <td>
+                  <div style={{ display: 'flex', gap: '4px' }}>
+                    <div className="admin-skeleton-pulse" style={{ width: '40px', height: '22px', borderRadius: '12px' }}></div>
+                    <div className="admin-skeleton-pulse" style={{ width: '30px', height: '22px', borderRadius: '12px' }}></div>
+                  </div>
+                </td>
+                <td><div className="admin-skeleton-pulse" style={{ width: '40px', height: '14px', borderRadius: '4px' }}></div></td>
+                <td><div className="admin-skeleton-pulse" style={{ width: '50px', height: '22px', borderRadius: '4px' }}></div></td>
+                <td><div className="admin-skeleton-pulse" style={{ width: '60px', height: '14px', borderRadius: '4px' }}></div></td>
+                <td className="is-actions">
+                  <div className="admin-skeleton-pulse" style={{ width: '60px', height: '28px', borderRadius: '4px', display: 'inline-block' }}></div>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      ) : loadError ? (
+        <div className="admin-error-state">
+          <strong>视频加载失败</strong>
+          <span>{loadError}</span>
+          <button type="button" className="admin-btn" onClick={refresh}>
+            <RefreshCw size={13} /> 重试
+          </button>
+        </div>
+      ) : listItems.length === 0 ? (
+        <div className="admin-empty-state">
+          <div className="admin-empty-state__icon">
+            <Image size={48} />
+          </div>
+          <div className="admin-empty-state__text">
+            {driveId
+              ? "这个网盘下还没有可显示的视频，或未匹配到搜索结果。"
+              : "还没有视频。先在「网盘管理」里配置好盘并触发扫描，或调整搜索词。"}
+          </div>
         </div>
       ) : (
         <>
-          <table className="admin-table">
+          <table className="admin-table is-selectable">
             <thead>
               <tr>
+                <th className="is-checkbox" style={{ width: '40px' }}>
+                  <button
+                    type="button"
+                    className="admin-table-checkbox-btn"
+                    onClick={toggleSelectAll}
+                    aria-label={selectedIds.size > 0 && selectedIds.size === listItems.length ? "清空当前页选择" : "选择当前页视频"}
+                  >
+                    {selectedIds.size > 0 && selectedIds.size === listItems.length ? <CheckSquare size={16} /> : <Square size={16} />}
+                  </button>
+                </th>
                 <th>标题</th>
                 <th>作者</th>
                 <th>标签</th>
@@ -164,8 +290,18 @@ export function VideosPage() {
               </tr>
             </thead>
             <tbody>
-              {filtered.map((v) => (
-                <tr key={v.id}>
+              {listItems.map((v) => (
+                <tr key={v.id} className={selectedIds.has(v.id) ? "is-selected" : ""}>
+                  <td className="is-checkbox">
+                    <button
+                      type="button"
+                      className="admin-table-checkbox-btn"
+                      onClick={() => toggleSelect(v.id)}
+                      aria-label={`${selectedIds.has(v.id) ? "取消选择" : "选择"}视频 ${v.title}`}
+                    >
+                      {selectedIds.has(v.id) ? <CheckSquare size={16} color="var(--accent)" /> : <Square size={16} color="var(--border-strong)" />}
+                    </button>
+                  </td>
                   <td data-label="标题">
                     <div className="admin-video-title">{v.title}</div>
                     {fileMeta(v) && (
@@ -192,11 +328,11 @@ export function VideosPage() {
                     {driveNameMap.get(v.driveId) ?? v.driveId}
                   </td>
                   <td className="is-actions" data-label="操作">
-                    <button className="admin-btn" onClick={() => setEditing(v)}>
+                    <button type="button" className="admin-btn" onClick={() => setEditing(v)}>
                       <Edit size={13} /> 编辑
                     </button>{" "}
-                    <button className="admin-btn" onClick={() => handleRegen(v)}>
-                      <RefreshCw size={13} /> 重生 teaser
+                    <button type="button" className="admin-btn" onClick={() => handleRegen(v)} title="重生 teaser">
+                      <RefreshCw size={13} />
                     </button>
                   </td>
                 </tr>
@@ -205,6 +341,7 @@ export function VideosPage() {
           </table>
           <div className="admin-table-pagination">
             <button
+              type="button"
               className="admin-btn"
               onClick={() => setPage(1)}
               disabled={page <= 1}
@@ -212,6 +349,7 @@ export function VideosPage() {
               首页
             </button>
             <button
+              type="button"
               className="admin-btn"
               onClick={() => setPage((p) => Math.max(1, p - 1))}
               disabled={page <= 1}
@@ -222,6 +360,7 @@ export function VideosPage() {
               第 {page} / {totalPages} 页，每页 {PAGE_SIZE} 个
             </span>
             <button
+              type="button"
               className="admin-btn"
               onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
               disabled={page >= totalPages}
@@ -229,6 +368,7 @@ export function VideosPage() {
               下一页
             </button>
             <button
+              type="button"
               className="admin-btn"
               onClick={() => setPage(totalPages)}
               disabled={page >= totalPages}
@@ -250,6 +390,17 @@ export function VideosPage() {
           }}
         />
       )}
+      <ConfirmModal
+        open={batchRegenOpen}
+        title="批量重生 Teaser"
+        message={`确定要为当前页选中的 ${selectedIds.size} 个视频重新生成 teaser 吗？`}
+        confirmText="确认重生"
+        loading={batchRegening}
+        onCancel={() => {
+          if (!batchRegening) setBatchRegenOpen(false);
+        }}
+        onConfirm={confirmBatchRegen}
+      />
     </section>
   );
 }
@@ -279,6 +430,7 @@ function EditVideoModal({
   onClose: () => void;
   onSaved: () => void;
 }) {
+  const idPrefix = useId();
   const [title, setTitle] = useState(video.title);
   const [author, setAuthor] = useState(video.author ?? "");
   const [selectedTags, setSelectedTags] = useState(video.tags ?? []);
@@ -321,10 +473,10 @@ function EditVideoModal({
       onClose={onClose}
       footer={
         <>
-          <button className="admin-btn" onClick={onClose}>
+          <button type="button" className="admin-btn" onClick={onClose}>
             取消
           </button>
-          <button className="admin-btn is-primary" onClick={handleSave} disabled={saving}>
+          <button type="button" className="admin-btn is-primary" onClick={handleSave} disabled={saving}>
             {saving ? "保存中..." : "保存"}
           </button>
         </>
@@ -332,15 +484,15 @@ function EditVideoModal({
     >
       <div className="admin-form">
         <div className="admin-form__row">
-          <label>标题</label>
-          <input value={title} onChange={(e) => setTitle(e.target.value)} />
+          <label htmlFor={`${idPrefix}-video-title`}>标题</label>
+          <input id={`${idPrefix}-video-title`} value={title} onChange={(e) => setTitle(e.target.value)} />
         </div>
         <div className="admin-form__row">
-          <label>作者</label>
-          <input value={author} onChange={(e) => setAuthor(e.target.value)} />
+          <label htmlFor={`${idPrefix}-video-author`}>作者</label>
+          <input id={`${idPrefix}-video-author`} value={author} onChange={(e) => setAuthor(e.target.value)} />
         </div>
         <div className="admin-form__row">
-          <label>标签</label>
+          <div className="admin-form__label">标签</div>
           <div className="admin-tag-picker">
             {availableTags.map((tag) => (
               <label key={tag.id} className="admin-check">
@@ -356,36 +508,49 @@ function EditVideoModal({
           </div>
         </div>
         <div className="admin-form__row">
-          <label>分类</label>
-          <input value={category} onChange={(e) => setCategory(e.target.value)} />
+          <label htmlFor={`${idPrefix}-video-category`}>分类</label>
+          <input id={`${idPrefix}-video-category`} value={category} onChange={(e) => setCategory(e.target.value)} />
         </div>
         <div className="admin-form__row">
-          <label>徽标（逗号分隔，例如 精选, 原创）</label>
-          <input value={badges} onChange={(e) => setBadges(e.target.value)} />
+          <label htmlFor={`${idPrefix}-video-badges`}>徽标（逗号分隔，例如 精选, 原创）</label>
+          <input id={`${idPrefix}-video-badges`} value={badges} onChange={(e) => setBadges(e.target.value)} />
         </div>
         <div className="admin-form__row">
-          <label>质量</label>
-          <select value={quality} onChange={(e) => setQuality(e.target.value)}>
+          <label htmlFor={`${idPrefix}-video-quality`}>质量</label>
+          <select id={`${idPrefix}-video-quality`} value={quality} onChange={(e) => setQuality(e.target.value)}>
             <option value="">未设置</option>
             <option value="HD">HD</option>
             <option value="SD">SD</option>
           </select>
         </div>
         <div className="admin-form__row">
-          <label>时长（秒）</label>
+          <label htmlFor={`${idPrefix}-video-duration`}>时长（秒）</label>
           <input
+            id={`${idPrefix}-video-duration`}
             value={durationSec}
             onChange={(e) => setDurationSec(e.target.value)}
             inputMode="numeric"
           />
         </div>
         <div className="admin-form__row">
-          <label>封面 URL</label>
-          <input value={thumbnail} onChange={(e) => setThumbnail(e.target.value)} />
+          <label htmlFor={`${idPrefix}-video-thumbnail`}>封面 URL</label>
+          <div className="admin-thumbnail-preview">
+            <input id={`${idPrefix}-video-thumbnail`} value={thumbnail} onChange={(e) => setThumbnail(e.target.value)} />
+            {thumbnail && (
+              <img 
+                src={thumbnail} 
+                alt="封面预览" 
+                className="admin-thumbnail-img" 
+                onError={(e) => (e.currentTarget.style.display = 'none')} 
+                onLoad={(e) => (e.currentTarget.style.display = 'block')} 
+              />
+            )}
+          </div>
         </div>
         <div className="admin-form__row">
-          <label>描述</label>
+          <label htmlFor={`${idPrefix}-video-description`}>描述</label>
           <textarea
+            id={`${idPrefix}-video-description`}
             value={description}
             onChange={(e) => setDescription(e.target.value)}
           />
@@ -418,7 +583,7 @@ function fileMeta(v: api.AdminVideo): string {
   const parts = [
     normalizeExt(v.ext),
     v.quality,
-    formatBytes(v.size),
+    v.size > 0 ? formatBytes(v.size) : "",
   ].filter(Boolean);
   return parts.join(" · ");
 }
@@ -426,19 +591,6 @@ function fileMeta(v: api.AdminVideo): string {
 function normalizeExt(ext: string): string {
   const value = (ext ?? "").replace(/^\./, "").trim();
   return value ? value.toUpperCase() : "";
-}
-
-function formatBytes(size: number): string {
-  if (!size || size <= 0) return "";
-  const units = ["B", "KB", "MB", "GB", "TB"];
-  let value = size;
-  let unit = 0;
-  while (value >= 1024 && unit < units.length - 1) {
-    value /= 1024;
-    unit += 1;
-  }
-  const digits = unit === 0 || value >= 100 ? 0 : 1;
-  return `${value.toFixed(digits)} ${units[unit]}`;
 }
 
 function splitList(s: string): string[] {

@@ -12,15 +12,16 @@
   <a href="#快速开始">快速开始</a> ·
   <a href="#功能特性">功能特性</a> ·
   <a href="#预览图">预览图</a> ·
-  <a href="#数据存放位置">数据目录</a>
+  <a href="#数据存放位置">数据目录</a> ·
+  <a href="#许可证">许可证</a>
 </p>
 
 ---
 
 ## 功能特性
 
-- **多后端支持** — 兼容 115 云盘、PikPak 云盘、OneDrive和本地存储
-- **零带宽消耗** — 云盘视频采用 302 重定向播放，不占用服务器带宽
+- **多后端支持** — 兼容 115 云盘、PikPak 云盘、123云盘、OneDrive、Google Drive 和本地存储
+- **低带宽播放** — 115 云盘、PikPak 云盘、123云盘、OneDrive 都支持302模式，在线播放视频时，不占用服务器带宽，播放体验不受服务器带宽影响；Google Drive 不支持302模式，走服务器中转，观看体验会受服务器带宽影响
 - **封面 & 预览片段** — 自动为每个视频生成封面图和预览片段，首页快速选片
 - **91 爬虫** — 内置爬虫，支持抓取 91 本月最热视频
 - **双主题** — 黑黄经典主题 / 粉白清新主题，随时切换
@@ -113,13 +114,24 @@ mkdir -p video-site-91 && cd video-site-91
 ```yaml
 services:
   video-site-91:
-    image: ghcr.io/nianzhibai/91:latest
+    image: ghcr.io/nianzhibai/91:stable
     container_name: video-site-91
     ports:
       - "9191:9191"
     volumes:
       - ./data:/opt/video-site-91/data
     restart: unless-stopped
+```
+创建yml文件后运行下面指令
+```bash
+docker compose pull
+docker compose up -d
+```
+
+如果想固定某个 Release 版本，可以改成明确的 tag，例如：
+
+```yaml
+image: ghcr.io/nianzhibai/91:v0.0.6
 ```
 
 或直接拉取仓库内置配置：
@@ -138,7 +150,7 @@ docker compose up -d
 
 ```bash
 docker compose logs -f       # 查看日志
-docker compose pull          # 拉取最新镜像
+docker compose pull          # 拉取最新正式版 stable 镜像
 docker compose up -d         # 更新并重启
 ```
 
@@ -182,6 +194,12 @@ docker compose up -d         # 更新并重启
 本项目面向**个人私有部署**，请仅接入你有权访问和管理的内容，并遵守对应网盘、站点的服务条款及所在地法律法规。
 
 > 不对外传播，仅限个人使用。
+
+---
+
+## 许可证
+
+本项目基于 [MIT License](LICENSE) 开源。
 
 ---
 
