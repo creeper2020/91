@@ -84,14 +84,66 @@ export default function VideoDetailPage() {
 
   if (loading) {
     return (
-      <AppShell>
+      <AppShell mobileAutoHideNav>
         <div className="vd-page">
           <div className="vd-ambient" aria-hidden="true" />
           <div className="container vd-page__inner">
-            <div className="vd-skeleton">
-              <div className="vd-skeleton__player" />
-              <div className="vd-skeleton__title" />
-              <div className="vd-skeleton__meta" />
+            <div
+              className="vd-layout vd-skeleton"
+              aria-busy="true"
+              aria-label="视频详情加载中"
+            >
+              <div className="vd-main">
+                <div className="vd-skeleton__player" />
+
+                <div className="vd-skeleton__summary">
+                  <div className="vd-skeleton__chips">
+                    <span className="vd-skeleton__chip vd-skeleton__chip--source" />
+                    <span className="vd-skeleton__chip" />
+                    <span className="vd-skeleton__chip vd-skeleton__chip--plain" />
+                    <span className="vd-skeleton__chip vd-skeleton__chip--plain" />
+                  </div>
+                  <div className="vd-skeleton__title" />
+                  <div className="vd-skeleton__actions">
+                    <span />
+                    <span />
+                    <span />
+                  </div>
+                </div>
+
+                <div className="vd-skeleton__info">
+                  <span className="vd-skeleton__section-head" />
+                  <span className="vd-skeleton__line" />
+                  <span className="vd-skeleton__line vd-skeleton__line--short" />
+                  <div className="vd-skeleton__tag-row">
+                    <span />
+                    <span />
+                    <span />
+                  </div>
+                </div>
+              </div>
+
+              <aside className="vd-rail vd-skeleton__rail">
+                <div className="vd-rail__head">
+                  <span className="vd-rail__head-icon" aria-hidden="true">
+                    <span />
+                    <span />
+                  </span>
+                  <span className="vd-skeleton__rail-head" />
+                </div>
+                <ul className="vd-rail__list vd-skeleton__rail-list">
+                  {Array.from({ length: 6 }).map((_, index) => (
+                    <li key={index} className="vd-skeleton__rail-item">
+                      <span className="vd-skeleton__rail-thumb" />
+                      <span className="vd-skeleton__rail-body">
+                        <span className="vd-skeleton__rail-title" />
+                        <span className="vd-skeleton__rail-title vd-skeleton__rail-title--short" />
+                        <span className="vd-skeleton__rail-meta" />
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              </aside>
             </div>
           </div>
         </div>
@@ -101,7 +153,7 @@ export default function VideoDetailPage() {
 
   if (!detail) {
     return (
-      <AppShell>
+      <AppShell mobileAutoHideNav>
         <div className="vd-page">
           <div className="container vd-page__inner">
             <div className="vd-empty">视频不存在或已被移除</div>
@@ -112,7 +164,7 @@ export default function VideoDetailPage() {
   }
 
   return (
-    <AppShell>
+    <AppShell mobileAutoHideNav>
       <div className="vd-page">
         {/* Ambient 背景层：用海报作模糊底色，叠加渐变过渡到页面背景 */}
         <div
@@ -141,13 +193,15 @@ export default function VideoDetailPage() {
                 </div>
               </div>
 
-              <VideoMetaHeader video={detail} />
+              <section className="vd-summary" aria-label="当前视频">
+                <VideoMetaHeader video={detail} />
 
-              <VideoActions
-                video={detail}
-                onHideVideo={handleHideVideo}
-                hideSaving={hideSaving}
-              />
+                <VideoActions
+                  video={detail}
+                  onHideVideo={handleHideVideo}
+                  hideSaving={hideSaving}
+                />
+              </section>
 
               <VideoInfoPanel
                 video={detail}

@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { EyeOff, ThumbsDown, ThumbsUp } from "lucide-react";
 import type { VideoDetail } from "@/types";
 import { formatCount } from "@/lib/format";
@@ -12,11 +12,11 @@ type Props = {
 /**
  * 视频操作工具条。
  * - 整体是一张浮起的圆角玻璃卡，比上一版的横线分隔更"成体"。
- * - 点赞 + 点踩组成一个胶囊（中间一道竖线分隔），两侧分别带计数。
+ * - 点赞 + 点踩是两个独立按钮。
  * - "不再显示" 单独成一个次要按钮，hover 时露出 danger 色。
  *
  * 功能没变：
- * - 后端只有点赞接口（POST /api/video/:id/like），点踩仅本地 state。
+ * - 后端只有点赞计数接口，点踩仅本地 state。
  * - 失败回滚已经处理。
  */
 export function VideoActions({ video, onHideVideo, hideSaving }: Props) {
@@ -25,11 +25,20 @@ export function VideoActions({ video, onHideVideo, hideSaving }: Props) {
   const [bursting, setBursting] = useState(false);
   const [liked, setLiked] = useState(false);
   const [disliked, setDisliked] = useState(false);
+  const [likeSubmitted, setLikeSubmitted] = useState(false);
+
+  useEffect(() => {
+    setLikes(video.likes ?? 0);
+    setDislikes(video.dislikes ?? 0);
+    setBursting(false);
+    setLiked(false);
+    setDisliked(false);
+    setLikeSubmitted(false);
+  }, [video.id, video.likes, video.dislikes]);
 
   async function handleLike() {
     if (liked) return;
     setLiked(true);
-    setLikes((n) => n + 1);
     setBursting(true);
     window.setTimeout(() => setBursting(false), 320);
 
@@ -37,6 +46,11 @@ export function VideoActions({ video, onHideVideo, hideSaving }: Props) {
       setDisliked(false);
       setDislikes((n) => Math.max(0, n - 1));
     }
+
+    if (likeSubmitted) return;
+
+    setLikeSubmitted(true);
+    setLikes((n) => n + 1);
 
     try {
       const res = await fetch(
@@ -51,6 +65,7 @@ export function VideoActions({ video, onHideVideo, hideSaving }: Props) {
     } catch {
       setLikes((n) => Math.max(0, n - 1));
       setLiked(false);
+      setLikeSubmitted(false);
     }
   }
 
@@ -64,7 +79,6 @@ export function VideoActions({ video, onHideVideo, hideSaving }: Props) {
     setDislikes((n) => n + 1);
     if (liked) {
       setLiked(false);
-      setLikes((n) => Math.max(0, n - 1));
     }
   }
 
@@ -83,7 +97,6 @@ export function VideoActions({ video, onHideVideo, hideSaving }: Props) {
           <ThumbsUp size={18} fill={liked ? "currentColor" : "none"} />
           <span className="vd-actions__count">{formatCount(likes)}</span>
         </button>
-        <span className="vd-actions__divider" aria-hidden="true" />
         <button
           type="button"
           className={`vd-actions__pill vd-actions__dislike${

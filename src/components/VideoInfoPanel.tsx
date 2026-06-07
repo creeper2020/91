@@ -1,5 +1,5 @@
 import { useMemo, useState } from "react";
-import { Hash, Pencil, X } from "lucide-react";
+import { Pencil, Tag, X } from "lucide-react";
 import type { TagItem, VideoDetail } from "@/types";
 
 type Props = {
@@ -17,7 +17,7 @@ type Props = {
  * 视觉上和上一版的"两张分离卡"相比，整体感更强：
  * - 一张大卡内分两个小区块，区块之间用细分隔线
  * - 简介区块加 "简介" 标题前缀
- * - 标签区块加 # 图标暗示
+ * - 标签区块加标签轮廓图标暗示
  */
 export function VideoInfoPanel({
   video,
@@ -99,7 +99,7 @@ export function VideoInfoPanel({
       <div className="vd-info__tags">
         <div className="vd-info__section-head">
           <span className="vd-info__section-title">
-            <Hash size={14} aria-hidden="true" />
+            <Tag size={15} strokeWidth={2} aria-hidden="true" />
             标签
           </span>
           {onTagsChange && (

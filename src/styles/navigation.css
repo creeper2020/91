@@ -179,6 +179,24 @@
 
 /* ----- 响应式 ----- */
 @media (max-width: 768px) {
+  .app-shell--mobile-auto-hide-nav .app-shell__nav-stack {
+    position: sticky;
+    top: 0;
+    z-index: var(--z-nav);
+    transform: translateY(0);
+    transition: transform 220ms var(--ease-out);
+    will-change: transform;
+  }
+
+  .app-shell--mobile-auto-hide-nav.is-mobile-nav-hidden .app-shell__nav-stack {
+    transform: translateY(-100%);
+  }
+
+  .app-shell--mobile-auto-hide-nav .main-nav {
+    position: relative;
+    z-index: auto;
+  }
+
   .main-nav__inner {
     height: 56px;
     gap: var(--space-3);

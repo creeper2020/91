@@ -21,10 +21,6 @@ type Props = {
   onFirstPlay?: () => void;
 };
 
-type ResumePrompt = {
-  time: number;
-};
-
 type PlayerError = {
   title: string;
   message: string;
@@ -45,16 +41,29 @@ type PlayerSettings = {
   volume: number;
   muted: boolean;
   playbackRate: number;
-};
-
-type PlaybackRecord = {
-  time: number;
-  duration: number;
-  updatedAt: number;
+  brightness: number;
 };
 
 type VideoElementWithHls = HTMLVideoElement & {
   __hls?: Hls | null;
+};
+
+type MobileGestureMode = "seek" | "volume" | "brightness";
+type MobileGestureSide = "left" | "right";
+type PlayerGestureHudKind = "volume" | "brightness";
+type MobileGestureState = {
+  startX: number;
+  startY: number;
+  startTime: number;
+  startVolume: number;
+  startBrightness: number;
+  side: MobileGestureSide;
+  mode: MobileGestureMode | null;
+  targetTime: number;
+  moved: boolean;
+  fastActive: boolean;
+  previousRate: number;
+  pressTimer: number | null;
 };
 
 type OrientationMode = "landscape" | "portrait";
@@ -87,20 +96,31 @@ const NORMAL_RATE = 1;
 Artplayer.FAST_FORWARD_VALUE = FAST_RATE;
 
 const SETTINGS_KEY = "video-site:player-settings";
-const PLAYBACK_KEY_PREFIX = "video-site:playback:";
 const DEFAULT_SETTINGS: PlayerSettings = {
   volume: 0.7,
   muted: false,
   playbackRate: 1,
+  brightness: 1,
 };
 const ORIENTATION_CONTROL_NAME = "orientationToggle";
 const MANUAL_ORIENTATION_CLASS = "art-manual-orientation";
-const RESUME_MIN_SECONDS = 10;
-const RESUME_END_GAP_SECONDS = 12;
+const FAST_RATE_CLASS = "art-fast-rate-active";
+const FAST_RATE_HINT_CLASS = "video-player__art-rate-hint";
+const PLAYER_GESTURE_HUD_CLASS = "video-player__art-gesture-hud";
+const PLAYER_GESTURE_HUD_ICON_CLASS = "video-player__art-gesture-hud-icon";
+const PLAYER_GESTURE_HUD_VALUE_CLASS = "video-player__art-gesture-hud-value";
 const PREVIEW_WIDTH = 168;
+const BRIGHTNESS_MIN = 0.45;
+const BRIGHTNESS_MAX = 1.35;
+const GESTURE_ACTIVATION_PX = 12;
+const GESTURE_DIRECTION_LOCK_RATIO = 1.2;
+const GESTURE_VERTICAL_SCALE = 1.15;
+const GESTURE_SEEK_MIN_SECONDS = 30;
+const GESTURE_SEEK_MAX_SECONDS = 120;
+const GESTURE_SEEK_DURATION_RATIO = 0.12;
+const playerGestureHudTimers = new WeakMap<HTMLElement, number>();
 
 export function VideoPlayer({
-  id,
   src,
   poster,
   previewSrc,
@@ -112,13 +132,11 @@ export function VideoPlayer({
   const previewVideoRef = useRef<HTMLVideoElement | null>(null);
   const onFirstPlayRef = useRef<Props["onFirstPlay"]>(onFirstPlay);
   const playedRef = useRef(false);
-  const videoKey = id || src;
-  const [fastActive, setFastActive] = useState(false);
   const [retryNonce, setRetryNonce] = useState(0);
-  const [resumePrompt, setResumePrompt] = useState<ResumePrompt | null>(null);
   const [playerError, setPlayerError] = useState<PlayerError | null>(null);
   const [gestureHud, setGestureHud] = useState<GestureHud | null>(null);
   const [previewHover, setPreviewHover] = useState<PreviewHover | null>(null);
+  const gestureHudTimerRef = useRef<number | null>(null);
 
   useEffect(() => {
     onFirstPlayRef.current = onFirstPlay;
@@ -129,56 +147,48 @@ export function VideoPlayer({
     if (!mount) return;
 
     playedRef.current = false;
-    setFastActive(false);
-    setResumePrompt(null);
     setPlayerError(null);
     setPreviewHover(null);
 
     const cleanupPlayer = mountArtPlayer({
       mount,
-      videoKey,
       src,
       poster,
       title,
       artRef,
       playedRef,
       onFirstPlayRef,
-      onFastChange: setFastActive,
-      onResumeAvailable: setResumePrompt,
+      onFastChange: noop,
       onError: setPlayerError,
       onPreviewHover: setPreviewHover,
+      onGestureHud: showGestureHud,
     });
 
     return cleanupPlayer;
-  }, [poster, retryNonce, src, title, videoKey]);
+  }, [poster, retryNonce, src, title]);
+
+  useEffect(() => {
+    return () => {
+      if (gestureHudTimerRef.current !== null) {
+        window.clearTimeout(gestureHudTimerRef.current);
+      }
+    };
+  }, []);
 
   useEffect(() => {
     if (!previewSrc || !previewHover) return;
     syncPreviewVideo(previewVideoRef.current, previewHover.ratio);
   }, [previewHover, previewSrc]);
 
-  function continuePlayback() {
-    const video = artRef.current?.video;
-    if (!video || !resumePrompt) return;
-    try {
-      video.currentTime = resumePrompt.time;
-    } catch {
-      // ignore
+  function showGestureHud(label: string, duration = 700) {
+    if (gestureHudTimerRef.current !== null) {
+      window.clearTimeout(gestureHudTimerRef.current);
     }
-    setResumePrompt(null);
-  }
-
-  function restartPlayback() {
-    const video = artRef.current?.video;
-    if (video) {
-      try {
-        video.currentTime = 0;
-      } catch {
-        // ignore
-      }
-    }
-    clearPlaybackRecord(videoKey);
-    setResumePrompt(null);
+    setGestureHud({ key: Date.now(), label });
+    gestureHudTimerRef.current = window.setTimeout(() => {
+      setGestureHud(null);
+      gestureHudTimerRef.current = null;
+    }, duration);
   }
 
   function retryPlayback() {
@@ -190,10 +200,10 @@ export function VideoPlayer({
     const absolute = new URL(src, window.location.href).href;
     try {
       await navigator.clipboard.writeText(absolute);
-      showTransientHud(setGestureHud, "播放地址已复制");
+      showGestureHud("播放地址已复制", 900);
     } catch {
       fallbackCopyText(absolute);
-      showTransientHud(setGestureHud, "播放地址已复制");
+      showGestureHud("播放地址已复制", 900);
     }
   }
 
@@ -203,24 +213,7 @@ export function VideoPlayer({
 
   return (
     <div className="video-player">
-      <div
-        className="video-player__poster-bg"
-        style={{ backgroundImage: poster ? `url(${poster})` : undefined }}
-        aria-hidden="true"
-      />
       <div ref={mountRef} className="video-player__mount" />
-
-      {resumePrompt && !playerError && (
-        <div className="video-player__resume" role="status">
-          <span>上次播放到 {formatClock(resumePrompt.time)}</span>
-          <button type="button" onClick={continuePlayback}>
-            继续播放
-          </button>
-          <button type="button" onClick={restartPlayback}>
-            从头播放
-          </button>
-        </div>
-      )}
 
       {playerError && (
         <div className="video-player__error" role="alert">
@@ -268,11 +261,6 @@ export function VideoPlayer({
         </div>
       )}
 
-      {fastActive && (
-        <div className="video-player__rate-hint" aria-hidden="true">
-          2x
-        </div>
-      )}
     </div>
   );
 }
@@ -286,7 +274,6 @@ function inferSourceType(src: string) {
 
 function mountArtPlayer({
   mount,
-  videoKey,
   src,
   poster,
   title,
@@ -294,12 +281,11 @@ function mountArtPlayer({
   playedRef,
   onFirstPlayRef,
   onFastChange,
-  onResumeAvailable,
   onError,
   onPreviewHover,
+  onGestureHud,
 }: {
   mount: HTMLDivElement;
-  videoKey: string;
   src: string;
   poster: string;
   title: string;
@@ -307,14 +293,15 @@ function mountArtPlayer({
   playedRef: MutableRefObject<boolean>;
   onFirstPlayRef: MutableRefObject<Props["onFirstPlay"]>;
   onFastChange: (active: boolean) => void;
-  onResumeAvailable: (prompt: ResumePrompt | null) => void;
   onError: (error: PlayerError | null) => void;
   onPreviewHover: (hover: PreviewHover | null) => void;
+  onGestureHud: (label: string, duration?: number) => void;
 }) {
   const sourceType = inferSourceType(src);
   const settings = readPlayerSettings();
   const fastActiveRef = { current: false };
   const loadHlsSource = createHlsSourceLoader(onError);
+  const enableOrientationControl = shouldEnableMobileOrientationControl();
   const option: Option = {
     id: "91-detail-player",
     container: mount,
@@ -333,13 +320,13 @@ function mountArtPlayer({
     pip: true,
     mutex: true,
     fullscreen: true,
-    fullscreenWeb: true,
+    fullscreenWeb: !enableOrientationControl,
     miniProgressBar: true,
-    backdrop: true,
+    backdrop: false,
     playsInline: true,
     lock: true,
-    gesture: true,
-    fastForward: true,
+    gesture: false,
+    fastForward: false,
     airplay: true,
     customType: {
       hls: loadHlsSource,
@@ -347,8 +334,9 @@ function mountArtPlayer({
     },
     moreVideoAttr: {
       preload: "metadata",
+      playsInline: true,
     },
-    controls: [createOrientationControl()],
+    controls: enableOrientationControl ? [createOrientationControl()] : [],
     contextmenu: [],
     cssVar: {
       "--art-theme": "var(--video-player-progress)",
@@ -364,8 +352,10 @@ function mountArtPlayer({
   const video = art.video as VideoElementWithHls;
   video.setAttribute("aria-label", title);
   video.setAttribute("controlsList", "nodownload");
+  video.setAttribute("webkit-playsinline", "true");
   video.disablePictureInPicture = false;
   video.playbackRate = settings.playbackRate;
+  applyPlayerBrightness(art, settings.brightness);
 
   function preventContextMenu(event: Event) {
     event.preventDefault();
@@ -396,20 +386,8 @@ function mountArtPlayer({
 
   function resetFastRate() {
     fastActiveRef.current = false;
+    setPlayerFastRateHint(art, false);
     onFastChange(false);
-  }
-
-  function handleEnded() {
-    resetFastRate();
-    clearPlaybackRecord(videoKey);
-  }
-
-  function handleLoadedMetadata() {
-    maybeOfferResume(videoKey, video, onResumeAvailable);
-  }
-
-  function handleTimeUpdate() {
-    savePlaybackRecord(videoKey, video);
   }
 
   function handleVolumeChange() {
@@ -427,21 +405,30 @@ function mountArtPlayer({
     });
   }
 
-  const unbindFastRate = bindLongPressFast(video, (active) => {
+  const handleFastChange = (active: boolean) => {
     fastActiveRef.current = active;
+    setPlayerFastRateHint(art, active);
     onFastChange(active);
-  });
+  };
+
+  const unbindFastRate = bindLongPressFast(video, handleFastChange);
+  const unbindMobileGestures = bindMobilePlayerGestures(
+    art,
+    video,
+    handleFastChange,
+    onGestureHud
+  );
   const unbindProgressPreview = bindProgressPreview(
     art,
     video,
     mount,
     onPreviewHover
   );
-  const unbindOrientationToggle = bindOrientationToggle(art);
+  const unbindOrientationToggle = enableOrientationControl
+    ? bindOrientationToggle(art)
+    : noop;
 
   mount.addEventListener("contextmenu", preventContextMenu);
-  video.addEventListener("loadedmetadata", handleLoadedMetadata);
-  video.addEventListener("timeupdate", handleTimeUpdate);
   video.addEventListener("volumechange", handleVolumeChange);
   video.addEventListener("ratechange", handleRateChange);
 
@@ -453,15 +440,15 @@ function mountArtPlayer({
   art.on("error", handleVideoError);
   art.on("video:play", handlePlay);
   art.on("video:pause", resetFastRate);
-  art.on("video:ended", handleEnded);
+  art.on("video:ended", resetFastRate);
 
   return () => {
     unbindFastRate();
+    unbindMobileGestures();
     unbindProgressPreview();
     unbindOrientationToggle();
+    setPlayerFastRateHint(art, false);
     mount.removeEventListener("contextmenu", preventContextMenu);
-    video.removeEventListener("loadedmetadata", handleLoadedMetadata);
-    video.removeEventListener("timeupdate", handleTimeUpdate);
     video.removeEventListener("volumechange", handleVolumeChange);
     video.removeEventListener("ratechange", handleRateChange);
     destroyHls(video);
@@ -473,13 +460,137 @@ function mountArtPlayer({
     art.off("error", handleVideoError);
     art.off("video:play", handlePlay);
     art.off("video:pause", resetFastRate);
-    art.off("video:ended", handleEnded);
+    art.off("video:ended", resetFastRate);
     art.destroy(true);
     if (artRef.current === art) {
       artRef.current = null;
     }
     onPreviewHover(null);
   };
+}
+
+function shouldEnableMobileOrientationControl() {
+  const coarsePointer = window.matchMedia?.(
+    "(hover: none) and (pointer: coarse)"
+  ).matches;
+  if (coarsePointer) return true;
+
+  return /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent);
+}
+
+function shouldEnableMobileGestures() {
+  return shouldEnableMobileOrientationControl();
+}
+
+function isPlayerExpanded(art: Artplayer) {
+  return Boolean(
+    art.fullscreen || art.fullscreenWeb || getNativeFullscreenElement()
+  );
+}
+
+function setPlayerFastRateHint(art: Artplayer, active: boolean) {
+  const player = art.template.$player;
+  player.classList.toggle(FAST_RATE_CLASS, active);
+
+  let hint = player.querySelector<HTMLElement>(`.${FAST_RATE_HINT_CLASS}`);
+  if (!active) {
+    hint?.remove();
+    return;
+  }
+
+  if (!hint) {
+    hint = document.createElement("div");
+    hint.className = FAST_RATE_HINT_CLASS;
+    hint.setAttribute("aria-hidden", "true");
+    hint.textContent = `${FAST_RATE}x`;
+    player.appendChild(hint);
+  }
+}
+
+function showPlayerGestureHud(
+  art: Artplayer,
+  kind: PlayerGestureHudKind,
+  value: string,
+  duration = 680
+) {
+  const player = art.template.$player;
+  const currentTimer = playerGestureHudTimers.get(player);
+  if (currentTimer !== undefined) {
+    window.clearTimeout(currentTimer);
+  }
+
+  let hud = player.querySelector<HTMLElement>(`.${PLAYER_GESTURE_HUD_CLASS}`);
+  if (!hud) {
+    hud = document.createElement("div");
+    hud.setAttribute("aria-hidden", "true");
+    player.appendChild(hud);
+  }
+
+  hud.className = [
+    PLAYER_GESTURE_HUD_CLASS,
+    `${PLAYER_GESTURE_HUD_CLASS}--${kind}`,
+    kind === "volume" && value === "0%" ? `${PLAYER_GESTURE_HUD_CLASS}--muted` : "",
+  ]
+    .filter(Boolean)
+    .join(" ");
+  hud.replaceChildren();
+
+  const icon = document.createElement("span");
+  icon.className = PLAYER_GESTURE_HUD_ICON_CLASS;
+  icon.innerHTML = playerGestureHudIcon(kind, value);
+
+  const valueElement = document.createElement("span");
+  valueElement.className = PLAYER_GESTURE_HUD_VALUE_CLASS;
+  valueElement.textContent = value;
+
+  hud.append(icon, valueElement);
+
+  const timer = window.setTimeout(() => {
+    hud?.remove();
+    playerGestureHudTimers.delete(player);
+  }, duration);
+  playerGestureHudTimers.set(player, timer);
+}
+
+function clearPlayerGestureHud(art: Artplayer) {
+  const player = art.template.$player;
+  const currentTimer = playerGestureHudTimers.get(player);
+  if (currentTimer !== undefined) {
+    window.clearTimeout(currentTimer);
+    playerGestureHudTimers.delete(player);
+  }
+  player.querySelector<HTMLElement>(`.${PLAYER_GESTURE_HUD_CLASS}`)?.remove();
+}
+
+function playerGestureHudIcon(kind: PlayerGestureHudKind, value: string) {
+  if (kind === "brightness") {
+    return `
+      <svg viewBox="0 0 24 24" fill="none">
+        <circle cx="12" cy="12" r="4.2" stroke="currentColor" stroke-width="1.7"/>
+        <path d="M12 2.8v2.1M12 19.1v2.1M4.9 4.9l1.5 1.5M17.6 17.6l1.5 1.5M2.8 12h2.1M19.1 12h2.1M4.9 19.1l1.5-1.5M17.6 6.4l1.5-1.5" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/>
+      </svg>
+    `;
+  }
+
+  if (value === "0%") {
+    return `
+      <svg viewBox="0 0 24 24" fill="none">
+        <path d="M4.8 9.7h3l4.3-3.6v11.8l-4.3-3.6h-3V9.7Z" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
+        <path d="m16.1 9.9 4.1 4.1M20.2 9.9 16.1 14" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/>
+      </svg>
+    `;
+  }
+
+  return `
+    <svg viewBox="0 0 24 24" fill="none">
+      <path d="M4.8 9.7h3l4.3-3.6v11.8l-4.3-3.6h-3V9.7Z" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
+      <path d="M15.4 9.2a4.2 4.2 0 0 1 0 5.6M18 6.7a7.7 7.7 0 0 1 0 10.6" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/>
+    </svg>
+  `;
+}
+
+function noop() {
+  // noop
 }
 
 function createOrientationControl(): NonNullable<Option["controls"]>[number] {
@@ -765,6 +876,53 @@ function orientationLabel(mode: OrientationMode) {
   return mode === "landscape" ? "横屏" : "竖屏";
 }
 
+function applyPlayerBrightness(art: Artplayer, brightness: number) {
+  art.template.$player.style.setProperty(
+    "--video-player-brightness",
+    clamp(brightness, BRIGHTNESS_MIN, BRIGHTNESS_MAX).toFixed(2)
+  );
+}
+
+function getPlayerBrightness(art: Artplayer) {
+  const raw = art.template.$player.style.getPropertyValue(
+    "--video-player-brightness"
+  );
+  if (!raw.trim()) return DEFAULT_SETTINGS.brightness;
+  return clampNumber(
+    Number(raw),
+    DEFAULT_SETTINGS.brightness,
+    BRIGHTNESS_MIN,
+    BRIGHTNESS_MAX
+  );
+}
+
+function mobileGestureSeekSpan(duration: number) {
+  return Math.min(
+    duration,
+    clamp(
+      duration * GESTURE_SEEK_DURATION_RATIO,
+      GESTURE_SEEK_MIN_SECONDS,
+      GESTURE_SEEK_MAX_SECONDS
+    )
+  );
+}
+
+function seekGestureLabel(
+  startTime: number,
+  targetTime: number,
+  duration: number
+) {
+  const action = targetTime >= startTime ? "快进" : "快退";
+  return `${action} ${formatClock(targetTime)} / ${formatClock(duration)}`;
+}
+
+function formatBrightnessPercent(brightness: number) {
+  const normalized =
+    (clamp(brightness, BRIGHTNESS_MIN, BRIGHTNESS_MAX) - BRIGHTNESS_MIN) /
+    (BRIGHTNESS_MAX - BRIGHTNESS_MIN);
+  return formatPercent(normalized);
+}
+
 function createHlsSourceLoader(
   onError: (error: PlayerError | null) => void
 ) {
@@ -864,6 +1022,7 @@ function bindLongPressFast(
   let pressTimer: number | null = null;
   let fastActive = false;
   let previousRate = NORMAL_RATE;
+  let suppressNextClick = false;
 
   function clearPressTimer() {
     if (pressTimer !== null) {
@@ -899,9 +1058,13 @@ function bindLongPressFast(
     }, LONG_PRESS_MS);
   }
 
-  function endPress() {
+  function endPress(suppressClick = false) {
     clearPressTimer();
+    const wasFastActive = fastActive;
     setFast(false);
+    if (wasFastActive && suppressClick) {
+      suppressNextClick = true;
+    }
   }
 
   function handleMouseDown(event: MouseEvent) {
@@ -909,20 +1072,263 @@ function bindLongPressFast(
     startPress();
   }
 
+  function handleMouseUp(event: MouseEvent) {
+    if (event.button !== 0) return;
+    endPress(true);
+  }
+
+  function handlePressEnd() {
+    endPress();
+  }
+
+  function handleClick(event: MouseEvent) {
+    if (!suppressNextClick) return;
+    suppressNextClick = false;
+    event.preventDefault();
+    event.stopPropagation();
+    event.stopImmediatePropagation();
+  }
+
   video.addEventListener("mousedown", handleMouseDown);
-  video.addEventListener("mouseup", endPress);
-  video.addEventListener("mouseleave", endPress);
-  video.addEventListener("pause", endPress);
-  video.addEventListener("ended", endPress);
+  video.addEventListener("mouseup", handleMouseUp);
+  video.addEventListener("click", handleClick, true);
+  video.addEventListener("mouseleave", handlePressEnd);
+  video.addEventListener("pause", handlePressEnd);
+  video.addEventListener("ended", handlePressEnd);
 
   return () => {
     clearPressTimer();
     setFast(false);
     video.removeEventListener("mousedown", handleMouseDown);
-    video.removeEventListener("mouseup", endPress);
-    video.removeEventListener("mouseleave", endPress);
-    video.removeEventListener("pause", endPress);
-    video.removeEventListener("ended", endPress);
+    video.removeEventListener("mouseup", handleMouseUp);
+    video.removeEventListener("click", handleClick, true);
+    video.removeEventListener("mouseleave", handlePressEnd);
+    video.removeEventListener("pause", handlePressEnd);
+    video.removeEventListener("ended", handlePressEnd);
+  };
+}
+
+function bindMobilePlayerGestures(
+  art: Artplayer,
+  video: HTMLVideoElement,
+  onFastChange: (active: boolean) => void,
+  onGestureHud: (label: string, duration?: number) => void
+) {
+  if (!shouldEnableMobileGestures()) return noop;
+
+  const player = art.template.$player;
+  let state: MobileGestureState | null = null;
+
+  function clearPressTimer() {
+    if (!state || state.pressTimer === null) return;
+    window.clearTimeout(state.pressTimer);
+    state.pressTimer = null;
+  }
+
+  function setTouchFast(next: boolean) {
+    if (!state || state.fastActive === next) return;
+    if (next) {
+      state.previousRate =
+        Number.isFinite(video.playbackRate) && video.playbackRate > 0
+          ? video.playbackRate
+          : NORMAL_RATE;
+      state.fastActive = true;
+      onFastChange(true);
+      video.playbackRate = FAST_RATE;
+      return;
+    }
+
+    const previousRate = state.previousRate;
+    state.fastActive = false;
+    onFastChange(false);
+    video.playbackRate = previousRate;
+  }
+
+  function resetGesture() {
+    clearPressTimer();
+    if (state?.fastActive) {
+      setTouchFast(false);
+    }
+    state = null;
+  }
+
+  function handleTouchStart(event: TouchEvent) {
+    if (event.touches.length !== 1 || art.isLock) return;
+
+    const touch = event.touches[0];
+    const rect = player.getBoundingClientRect();
+    const localX = touch.clientX - rect.left;
+    state = {
+      startX: touch.clientX,
+      startY: touch.clientY,
+      startTime: video.currentTime || 0,
+      startVolume: video.muted ? 0 : clamp(video.volume, 0, 1),
+      startBrightness: getPlayerBrightness(art),
+      side: localX < rect.width / 2 ? "left" : "right",
+      mode: null,
+      targetTime: video.currentTime || 0,
+      moved: false,
+      fastActive: false,
+      previousRate: video.playbackRate || NORMAL_RATE,
+      pressTimer: null,
+    };
+
+    state.pressTimer = window.setTimeout(() => {
+      if (!state || state.mode || state.moved || video.paused || video.ended) {
+        return;
+      }
+      setTouchFast(true);
+    }, LONG_PRESS_MS);
+  }
+
+  function lockGestureMode(dx: number, dy: number) {
+    if (!state) return;
+    const absX = Math.abs(dx);
+    const absY = Math.abs(dy);
+    if (absX < GESTURE_ACTIVATION_PX && absY < GESTURE_ACTIVATION_PX) return;
+
+    state.moved = true;
+    clearPressTimer();
+
+    if (absX >= absY * GESTURE_DIRECTION_LOCK_RATIO) {
+      state.mode = "seek";
+      return;
+    }
+
+    if (absY >= absX * GESTURE_DIRECTION_LOCK_RATIO) {
+      if (!isPlayerExpanded(art)) {
+        resetGesture();
+        return;
+      }
+      state.mode = state.side === "right" ? "volume" : "brightness";
+    }
+  }
+
+  function handleTouchMove(event: TouchEvent) {
+    if (!state) return;
+    if (event.touches.length !== 1) {
+      resetGesture();
+      return;
+    }
+
+    const touch = event.touches[0];
+    const dx = touch.clientX - state.startX;
+    const dy = touch.clientY - state.startY;
+
+    if (state.fastActive) {
+      event.preventDefault();
+      return;
+    }
+
+    if (!state.mode) {
+      lockGestureMode(dx, dy);
+      if (!state || !state.mode) return;
+    }
+
+    event.preventDefault();
+
+    if (state.mode === "seek") {
+      handleSeekGesture(event, dx);
+      return;
+    }
+
+    if (state.mode === "volume") {
+      handleVolumeGesture(touch.clientY);
+      return;
+    }
+
+    handleBrightnessGesture(touch.clientY);
+  }
+
+  function handleSeekGesture(event: TouchEvent, dx: number) {
+    if (!state) return;
+    const duration = video.duration;
+    if (!Number.isFinite(duration) || duration <= 0) return;
+    const rect = player.getBoundingClientRect();
+    const span = mobileGestureSeekSpan(duration);
+    const targetTime = clamp(
+      state.startTime + (dx / Math.max(1, rect.width)) * span,
+      0,
+      duration
+    );
+    state.targetTime = targetTime;
+    art.emit("setBar", "played", targetTime / duration, event);
+    if (!isPlayerExpanded(art)) return;
+    onGestureHud(seekGestureLabel(state.startTime, targetTime, duration), 560);
+  }
+
+  function handleVolumeGesture(currentY: number) {
+    if (!state) return;
+    const rect = player.getBoundingClientRect();
+    const delta = (state.startY - currentY) / Math.max(1, rect.height);
+    const nextVolume = clamp(state.startVolume + delta, 0, 1);
+    const normalized = Math.round(nextVolume * 100) / 100;
+    video.volume = normalized;
+    video.muted = normalized <= 0;
+    showPlayerGestureHud(art, "volume", formatPercent(normalized));
+  }
+
+  function handleBrightnessGesture(currentY: number) {
+    if (!state) return;
+    const rect = player.getBoundingClientRect();
+    const delta =
+      ((state.startY - currentY) / Math.max(1, rect.height)) *
+      GESTURE_VERTICAL_SCALE;
+    const nextBrightness = clamp(
+      state.startBrightness + delta,
+      BRIGHTNESS_MIN,
+      BRIGHTNESS_MAX
+    );
+    applyPlayerBrightness(art, nextBrightness);
+    showPlayerGestureHud(art, "brightness", formatBrightnessPercent(nextBrightness));
+  }
+
+  function handleTouchEnd() {
+    if (!state) return;
+
+    if (state.mode === "seek") {
+      const duration = video.duration;
+      if (Number.isFinite(duration) && duration > 0) {
+        art.seek = clamp(state.targetTime, 0, duration);
+        if (isPlayerExpanded(art)) {
+          onGestureHud(
+            seekGestureLabel(state.startTime, state.targetTime, duration),
+            720
+          );
+        }
+      }
+    } else if (state.mode === "brightness") {
+      writePlayerSettings({
+        brightness: getPlayerBrightness(art),
+      });
+    } else if (state.mode === "volume") {
+      writePlayerSettings({
+        volume: clamp(video.volume, 0, 1),
+        muted: video.muted,
+      });
+    }
+
+    resetGesture();
+  }
+
+  video.addEventListener("touchstart", handleTouchStart, { passive: true });
+  video.addEventListener("touchmove", handleTouchMove, { passive: false });
+  video.addEventListener("touchend", handleTouchEnd);
+  video.addEventListener("touchcancel", resetGesture);
+  video.addEventListener("pause", resetGesture);
+  video.addEventListener("ended", resetGesture);
+  window.addEventListener("blur", resetGesture);
+
+  return () => {
+    clearPlayerGestureHud(art);
+    resetGesture();
+    video.removeEventListener("touchstart", handleTouchStart);
+    video.removeEventListener("touchmove", handleTouchMove);
+    video.removeEventListener("touchend", handleTouchEnd);
+    video.removeEventListener("touchcancel", resetGesture);
+    video.removeEventListener("pause", resetGesture);
+    video.removeEventListener("ended", resetGesture);
+    window.removeEventListener("blur", resetGesture);
   };
 }
 
@@ -971,70 +1377,18 @@ function bindProgressPreview(
   };
 }
 
-function maybeOfferResume(
-  videoKey: string,
-  video: HTMLVideoElement,
-  onResumeAvailable: (prompt: ResumePrompt | null) => void
-) {
-  const record = readPlaybackRecord(videoKey);
-  const duration = video.duration;
-  if (
-    !record ||
-    !Number.isFinite(duration) ||
-    duration <= 0 ||
-    record.time < RESUME_MIN_SECONDS ||
-    record.time > duration - RESUME_END_GAP_SECONDS
-  ) {
-    onResumeAvailable(null);
-    return;
-  }
-  onResumeAvailable({ time: record.time });
-}
-
-function savePlaybackRecord(videoKey: string, video: HTMLVideoElement) {
-  const duration = video.duration;
-  const time = video.currentTime;
-  if (!Number.isFinite(duration) || duration <= 0 || !Number.isFinite(time)) {
-    return;
-  }
-  if (time > duration - RESUME_END_GAP_SECONDS) {
-    clearPlaybackRecord(videoKey);
-    return;
-  }
-  if (time < RESUME_MIN_SECONDS) return;
-
-  const key = playbackStorageKey(videoKey);
-  const previous = readPlaybackRecord(videoKey);
-  if (previous && Math.abs(previous.time - time) < 2) return;
-  safeSetJSON(key, { time, duration, updatedAt: Date.now() });
-}
-
-function readPlaybackRecord(videoKey: string): PlaybackRecord | null {
-  const value = safeGetJSON<PlaybackRecord>(playbackStorageKey(videoKey));
-  if (!value || Date.now() - value.updatedAt > 1000 * 60 * 60 * 24 * 30) {
-    return null;
-  }
-  return value;
-}
-
-function clearPlaybackRecord(videoKey: string) {
-  try {
-    localStorage.removeItem(playbackStorageKey(videoKey));
-  } catch {
-    // ignore
-  }
-}
-
-function playbackStorageKey(videoKey: string) {
-  return PLAYBACK_KEY_PREFIX + encodeURIComponent(videoKey);
-}
-
 function readPlayerSettings(): PlayerSettings {
   const saved = safeGetJSON<Partial<PlayerSettings>>(SETTINGS_KEY) ?? {};
   return {
     volume: clampNumber(saved.volume, DEFAULT_SETTINGS.volume, 0, 1),
     muted: typeof saved.muted === "boolean" ? saved.muted : DEFAULT_SETTINGS.muted,
     playbackRate: clampNumber(saved.playbackRate, DEFAULT_SETTINGS.playbackRate, 0.5, 3),
+    brightness: clampNumber(
+      saved.brightness,
+      DEFAULT_SETTINGS.brightness,
+      BRIGHTNESS_MIN,
+      BRIGHTNESS_MAX
+    ),
   };
 }
 
@@ -1067,17 +1421,6 @@ function syncPreviewVideo(video: HTMLVideoElement | null, ratio: number) {
       // ignore
     }
   }
-}
-
-function showTransientHud(
-  setGestureHud: (hud: GestureHud | null) => void,
-  label: string
-) {
-  const key = Date.now();
-  setGestureHud({ key, label });
-  window.setTimeout(() => {
-    setGestureHud(null);
-  }, 900);
 }
 
 function fallbackCopyText(text: string) {
@@ -1142,4 +1485,8 @@ function formatClock(seconds: number) {
     )}:${String(s).padStart(2, "0")}`;
   }
   return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+}
+
+function formatPercent(value: number) {
+  return `${Math.round(clamp(value, 0, 1) * 100)}%`;
 }

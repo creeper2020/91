@@ -105,7 +105,7 @@ export default function HomePage() {
   const latest = latestVideos.slice(0, displayCount);
 
   return (
-    <AppShell>
+    <AppShell mobileAutoHideNav>
       <div className="container page-section">
         <PromoStrip />
         <SearchPanel />
