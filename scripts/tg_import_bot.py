@@ -3,6 +3,7 @@ import asyncio
 import json
 import mimetypes
 import os
+import re
 import tempfile
 import time
 from pathlib import Path
@@ -215,6 +216,19 @@ if not DATA_DIR.is_absolute():
 WHITELIST_FILE = DATA_DIR / "whitelist.json"
 
 VIDEO_EXTS = {".avi", ".flv", ".m4v", ".mkv", ".mov", ".mp4", ".mpeg", ".mpg", ".ts", ".webm", ".wmv"}
+VIDEO_MIME_EXTS = {
+    "video/mp4": ".mp4",
+    "video/quicktime": ".mov",
+    "video/x-matroska": ".mkv",
+    "video/webm": ".webm",
+    "video/x-msvideo": ".avi",
+    "video/x-ms-wmv": ".wmv",
+    "video/mpeg": ".mpeg",
+    "video/mp2t": ".ts",
+}
+GENERIC_MEDIA_STEMS = {"document", "file", "telegram", "video"}
+INVALID_FILENAME_CHARS = re.compile(r'[\\/*?:"<>|\x00-\x1f]')
+IMPORT_URL_RE = re.compile(r"magnet:\?\S+|https?://\S+", re.IGNORECASE)
 
 
 def load_whitelist() -> set[int]:
@@ -240,6 +254,79 @@ WHITELIST = load_whitelist()
 
 def authorized(user_id: int | None) -> bool:
     return bool(user_id and user_id in WHITELIST)
+
+
+def compact_text(value: str) -> str:
+    return re.sub(r"\s+", " ", value or "").strip()
+
+
+def strip_video_suffix(value: str) -> str:
+    suffix = Path(value).suffix.lower()
+    if suffix in VIDEO_EXTS:
+        return value[: -len(suffix)]
+    return value
+
+
+def clean_title(value: str) -> str:
+    value = compact_text(strip_video_suffix(value))
+    value = INVALID_FILENAME_CHARS.sub("", value).strip(" .")
+    return value[:160]
+
+
+def clean_file_stem(value: str, default: str) -> str:
+    value = clean_title(value)
+    if not value:
+        value = default
+    return value[:160] or default
+
+
+def media_video_suffix(media: Any, file_name: str) -> str:
+    suffix = Path(file_name).suffix.lower()
+    if suffix in VIDEO_EXTS:
+        return suffix
+    mime_type = compact_text(getattr(media, "mime_type", "")).lower()
+    if mime_type in VIDEO_MIME_EXTS:
+        return VIDEO_MIME_EXTS[mime_type]
+    if mime_type.startswith("video/"):
+        guessed = mimetypes.guess_extension(mime_type) or ""
+        if guessed == ".mpe":
+            guessed = ".mpeg"
+        if guessed.lower() in VIDEO_EXTS:
+            return guessed.lower()
+        return ".mp4"
+    return ""
+
+
+def generic_media_stem(stem: str) -> bool:
+    lowered = stem.lower()
+    return lowered in GENERIC_MEDIA_STEMS or lowered.startswith("telegram-")
+
+
+def telegram_media_names(message: Message, media: Any) -> tuple[str, str] | None:
+    raw_file_name = Path(compact_text(getattr(media, "file_name", ""))).name
+    suffix = media_video_suffix(media, raw_file_name)
+    if not suffix:
+        return None
+
+    file_title = clean_title(Path(raw_file_name).stem) if raw_file_name else ""
+    caption_title = clean_title(message.caption or "")
+    fallback = f"telegram-{int(time.time())}"
+    title = caption_title or file_title or fallback
+
+    if file_title and not generic_media_stem(file_title):
+        file_stem = file_title
+    else:
+        file_stem = caption_title or file_title or fallback
+    return f"{clean_file_stem(file_stem, fallback)}{suffix}", title
+
+
+def parse_import_text(text: str) -> tuple[str, str]:
+    match = IMPORT_URL_RE.search(text or "")
+    if not match:
+        return "", ""
+    url = match.group(0).rstrip("，。,.、)")
+    title_text = ((text or "")[: match.start()] + " " + (text or "")[match.end() :]).strip()
+    return url, clean_title(title_text)
 
 
 def api_headers(content_type: str = "application/json") -> dict[str, str]:
@@ -277,8 +364,11 @@ def multipart_upload(path: Path, title: str = "") -> dict[str, Any]:
     return response.json()
 
 
-def submit_link(url: str) -> dict[str, Any]:
-    return http_json("POST", "/api/imports/external", {"url": url})
+def submit_link(url: str, title: str = "") -> dict[str, Any]:
+    payload: dict[str, Any] = {"url": url}
+    if title:
+        payload["title"] = title
+    return http_json("POST", "/api/imports/external", payload)
 
 
 def get_job(job_id: str) -> dict[str, Any]:
@@ -346,12 +436,12 @@ async def import_link(_, message: Message) -> None:
     if not authorized(message.from_user.id if message.from_user else None):
         await message.reply_text("没有权限。")
         return
-    url = (message.text or "").strip()
-    if not (url.startswith("magnet:?") or url.startswith("http://") or url.startswith("https://")):
+    url, title = parse_import_text(message.text or "")
+    if not url:
         return
     status = await message.reply_text("已提交，等待下载。")
     try:
-        job = await asyncio.to_thread(submit_link, url)
+        job = await asyncio.to_thread(submit_link, url, title)
         last = ""
         while job.get("status") not in {"done", "failed"}:
             label = job.get("message") or job.get("status") or "running"
@@ -375,17 +465,18 @@ async def import_media(_, message: Message) -> None:
         await message.reply_text("没有权限。")
         return
     media = message.video or message.document
-    file_name = getattr(media, "file_name", "") or f"telegram-{int(time.time())}.mp4"
-    if Path(file_name).suffix.lower() not in VIDEO_EXTS:
+    names = telegram_media_names(message, media)
+    if names is None:
         await message.reply_text("不是支持的视频文件。")
         return
+    file_name, title = names
     status = await message.reply_text("正在下载 Telegram 文件。")
     with tempfile.TemporaryDirectory(prefix="tg-import-") as tmp:
         path = Path(tmp) / file_name
         try:
             downloaded = await message.download(file_name=str(path))
             await status.edit_text("正在提交入库。")
-            video = await asyncio.to_thread(multipart_upload, Path(downloaded), Path(file_name).stem)
+            video = await asyncio.to_thread(multipart_upload, Path(downloaded), title)
             await status.edit_text(f"导入完成: {video.get('title') or video.get('id')}")
         except Exception as exc:
             await status.edit_text(f"导入失败: {exc}")

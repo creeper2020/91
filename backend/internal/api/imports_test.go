@@ -60,8 +60,8 @@ func TestImportManagerIngestToDriveUsesScannerVideoIDAndQueuesUpload(t *testing.
 	if drv.uploadParent != "root" {
 		t.Fatalf("upload parent = %q, want root", drv.uploadParent)
 	}
-	if filepath.Ext(drv.uploadName) != ".mp4" {
-		t.Fatalf("upload name = %q, want generated .mp4 name", drv.uploadName)
+	if drv.uploadName != "source clip.mp4" {
+		t.Fatalf("upload name = %q, want source clip.mp4", drv.uploadName)
 	}
 	got, err := cat.GetVideo(ctx, wantID)
 	if err != nil {
@@ -72,6 +72,9 @@ func TestImportManagerIngestToDriveUsesScannerVideoIDAndQueuesUpload(t *testing.
 	}
 	if got.PreviewStatus != "pending" {
 		t.Fatalf("preview status = %q, want pending", got.PreviewStatus)
+	}
+	if got.FileName != "source clip.mp4" {
+		t.Fatalf("catalog file name = %q, want source clip.mp4", got.FileName)
 	}
 }
 
@@ -140,6 +143,12 @@ func TestHandleExternalUploadUsesDefaultDriveAndTriggersScan(t *testing.T) {
 	}
 	if got.Title != "Telegram Upload" {
 		t.Fatalf("title = %q, want form title", got.Title)
+	}
+	if got.FileName != "telegram.mp4" {
+		t.Fatalf("catalog file name = %q, want telegram.mp4", got.FileName)
+	}
+	if drv.uploadName != "telegram.mp4" {
+		t.Fatalf("upload name = %q, want telegram.mp4", drv.uploadName)
 	}
 }
 
@@ -210,13 +219,76 @@ func TestHandleUploadVideoUsesDefaultDriveAndTriggersScan(t *testing.T) {
 	if got.DriveID != "gdrive" || got.FileID != "google-file-3" {
 		t.Fatalf("catalog video drive/file = %q/%q", got.DriveID, got.FileID)
 	}
+	if got.FileName != "browser.mp4" {
+		t.Fatalf("catalog file name = %q, want browser.mp4", got.FileName)
+	}
+	if drv.uploadName != "browser.mp4" {
+		t.Fatalf("upload name = %q, want browser.mp4", drv.uploadName)
+	}
+}
+
+func TestHandleExternalUploadAddsNumberForDuplicateDriveName(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(filepath.Join(t.TempDir(), "catalog.db"))
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cat.Close(); err != nil {
+			t.Fatalf("close catalog: %v", err)
+		}
+	})
+
+	drv := &apiImportFakeDrive{
+		id:     "gdrive",
+		kind:   "googledrive",
+		rootID: "root",
+		fileID: "google-file-4",
+		entries: []drives.Entry{
+			{Name: "telegram.mp4"},
+			{Name: "telegram-2.mp4"},
+		},
+	}
+	server := &Server{
+		Catalog:             cat,
+		ExternalImportToken: "secret",
+	}
+	server.Importer = NewImportManager(server, ImportManagerConfig{
+		DefaultUploadDrive: func() drives.Drive {
+			return drv
+		},
+	})
+
+	req := multipartUploadRequest(t, map[string]string{
+		"title": "Telegram",
+	}, "telegram.mp4", "telegram video data")
+	req = req.WithContext(ctx)
+	req.Header.Set("X-Import-Token", "secret")
+	rr := httptest.NewRecorder()
+
+	server.handleExternalUpload(rr, req)
+
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("status = %d, body=%s", rr.Code, rr.Body.String())
+	}
+	if drv.uploadName != "telegram-3.mp4" {
+		t.Fatalf("upload name = %q, want telegram-3.mp4", drv.uploadName)
+	}
+	got, err := cat.GetVideo(ctx, "googledrive-gdrive-google-file-4")
+	if err != nil {
+		t.Fatalf("get catalog video: %v", err)
+	}
+	if got.FileName != "telegram-3.mp4" {
+		t.Fatalf("catalog file name = %q, want telegram-3.mp4", got.FileName)
+	}
 }
 
 type apiImportFakeDrive struct {
-	id     string
-	kind   string
-	rootID string
-	fileID string
+	id      string
+	kind    string
+	rootID  string
+	fileID  string
+	entries []drives.Entry
 
 	uploadParent string
 	uploadName   string
@@ -229,7 +301,7 @@ func (d *apiImportFakeDrive) Init(context.Context) error {
 	return nil
 }
 func (d *apiImportFakeDrive) List(context.Context, string) ([]drives.Entry, error) {
-	return nil, drives.ErrNotSupported
+	return d.entries, nil
 }
 func (d *apiImportFakeDrive) Stat(context.Context, string) (*drives.Entry, error) {
 	return nil, drives.ErrNotSupported

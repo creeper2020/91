@@ -29,6 +29,7 @@ VIDEO_EXTS = {
     ".webm",
     ".wmv",
 }
+HLS_SEGMENT_EXTS = {".ts"}
 
 TRACKER_SOURCE_URLS = [
     "https://raw.githubusercontent.com/ngosang/trackerslist/master/trackers_all.txt",
@@ -55,9 +56,43 @@ def ensure_tools(*names: str) -> None:
         raise RuntimeError("missing required command: " + ", ".join(missing))
 
 
-def is_video_url(url: str) -> bool:
+def url_suffix(url: str) -> str:
     path = urlparse(url).path.lower()
-    return Path(unquote(path)).suffix in VIDEO_EXTS
+    return Path(unquote(path)).suffix
+
+
+def is_video_url(url: str) -> bool:
+    return url_suffix(url) in VIDEO_EXTS
+
+
+def is_m3u8_url(url: str) -> bool:
+    return ".m3u8" in url.lower()
+
+
+def is_hls_segment_url(url: str) -> bool:
+    return url_suffix(url) in HLS_SEGMENT_EXTS
+
+
+def hls_demuxer_options() -> list[str]:
+    return [
+        "-allowed_segment_extensions",
+        "ALL",
+        "-allowed_extensions",
+        "ALL",
+        "-extension_picky",
+        "0",
+    ]
+
+
+def unique_urls(urls: list[str]) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for url in urls:
+        if url in seen:
+            continue
+        seen.add(url)
+        result.append(url)
+    return result
 
 
 def unique_path(path: Path) -> Path:
@@ -226,23 +261,24 @@ def aria2_download(url: str, output_dir: Path, is_magnet: bool = False) -> list[
 
 
 def ffprobe_duration(media_url: str, headers: str) -> float:
+    cmd = [
+        "ffprobe",
+        "-headers",
+        headers,
+    ]
+    if is_m3u8_url(media_url):
+        cmd += hls_demuxer_options()
+    cmd += [
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        media_url,
+    ]
     try:
-        out = subprocess.check_output(
-            [
-                "ffprobe",
-                "-headers",
-                headers,
-                "-v",
-                "error",
-                "-show_entries",
-                "format=duration",
-                "-of",
-                "default=noprint_wrappers=1:nokey=1",
-                media_url,
-            ],
-            timeout=20,
-            stderr=subprocess.DEVNULL,
-        )
+        out = subprocess.check_output(cmd, timeout=20, stderr=subprocess.DEVNULL)
         return float(out.decode().strip())
     except Exception:
         return 0.0
@@ -259,7 +295,7 @@ def capture_media_links(webpage_url: str) -> tuple[str, list[str], list[str]]:
 
     def handle_request(request) -> None:
         req_url = request.url
-        if ".m3u8" in req_url:
+        if is_m3u8_url(req_url):
             if req_url not in m3u8_links:
                 log(f"[import] captured m3u8: {req_url[:120]}")
                 m3u8_links.append(req_url)
@@ -293,42 +329,69 @@ def capture_media_links(webpage_url: str) -> tuple[str, list[str], list[str]]:
     return title, m3u8_links, video_links
 
 
+def ffmpeg_command(media_url: str, headers: str, output: Path) -> list[str]:
+    cmd = ["ffmpeg", "-headers", headers]
+    if is_m3u8_url(media_url):
+        cmd += hls_demuxer_options()
+    cmd += [
+        "-i",
+        media_url,
+        "-c",
+        "copy",
+        "-y",
+        str(output),
+    ]
+    return cmd
+
+
 def download_webpage_video(url: str, output_dir: Path) -> list[Path]:
     ensure_tools("ffmpeg", "ffprobe")
     output_dir.mkdir(parents=True, exist_ok=True)
     title, m3u8_links, video_links = capture_media_links(url)
-    targets = m3u8_links or video_links
+    m3u8_targets = unique_urls(m3u8_links)
+    video_targets = unique_urls(video_links)
+    if m3u8_targets:
+        target_kind = "m3u8"
+        targets = m3u8_targets
+    else:
+        target_kind = "video"
+        targets = [target for target in video_targets if not is_hls_segment_url(target)]
     if not targets:
         return []
-    files: list[Path] = []
     headers = f"Referer: {url}\r\nUser-Agent: {USER_AGENT}\r\n"
+    last_error: subprocess.CalledProcessError | None = None
+    files: list[Path] = []
     for index, target in enumerate(targets):
         suffix = ".mp4"
-        if not m3u8_links:
-            target_suffix = Path(unquote(urlparse(target).path)).suffix.lower()
+        if target_kind == "video":
+            target_suffix = url_suffix(target)
             if target_suffix in VIDEO_EXTS:
                 suffix = target_suffix
         name = f"{title}{suffix}" if len(targets) == 1 else f"{title}-{index + 1}{suffix}"
         output = unique_path(output_dir / name)
-        cmd = [
-            "ffmpeg",
-            "-headers",
-            headers,
-            "-i",
-            target,
-            "-c",
-            "copy",
-            "-y",
-            str(output),
-        ]
+        cmd = ffmpeg_command(target, headers, output)
         log(f"[import] running ffmpeg for {output.name}")
         duration = ffprobe_duration(target, headers)
         if duration:
             log(f"[import] media duration: {duration:.1f}s")
-        subprocess.run(cmd, check=True)
+        try:
+            subprocess.run(cmd, check=True)
+        except subprocess.CalledProcessError as exc:
+            last_error = exc
+            log(f"[import] ffmpeg failed for {target[:120]}: {exc}")
+            try:
+                if output.exists():
+                    output.unlink()
+            except OSError:
+                pass
+            continue
         if output.exists() and output.stat().st_size > 0:
             files.append(output)
-    return files
+    if files:
+        return files
+    if last_error is not None:
+        raise last_error
+    return []
 
 
 def files_payload(files: list[Path]) -> dict:

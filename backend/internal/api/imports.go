@@ -401,6 +401,41 @@ func importVideoTitle(explicit, downloaderTitle, fileName string, index, total i
 	return base
 }
 
+func uniqueDriveUploadName(ctx context.Context, drv drives.Drive, parentID, desiredName string) string {
+	name := filepath.Base(strings.TrimSpace(desiredName))
+	if name == "." || name == string(filepath.Separator) || name == "" {
+		name = "video"
+	}
+	entries, err := drv.List(ctx, parentID)
+	if err != nil {
+		log.Printf("[import] list upload target drive=%s parent=%s for unique name: %v", drv.ID(), parentID, err)
+		return name
+	}
+	used := make(map[string]struct{}, len(entries))
+	for _, entry := range entries {
+		entryName := strings.TrimSpace(entry.Name)
+		if entryName == "" {
+			continue
+		}
+		used[strings.ToLower(entryName)] = struct{}{}
+	}
+	if _, ok := used[strings.ToLower(name)]; !ok {
+		return name
+	}
+	ext := filepath.Ext(name)
+	stem := strings.TrimSpace(strings.TrimSuffix(name, ext))
+	if stem == "" {
+		stem = "video"
+	}
+	for index := 2; index < 10000; index++ {
+		candidate := fmt.Sprintf("%s-%d%s", stem, index, ext)
+		if _, ok := used[strings.ToLower(candidate)]; !ok {
+			return candidate
+		}
+	}
+	return fmt.Sprintf("%s-%d%s", stem, time.Now().UnixNano(), ext)
+}
+
 func cleanPathWithin(root, path string) (string, bool) {
 	if strings.TrimSpace(root) == "" || strings.TrimSpace(path) == "" {
 		return "", false
@@ -611,11 +646,6 @@ func (m *ImportManager) ingestReaderToDrive(ctx context.Context, drv drives.Driv
 	}
 
 	now := time.Now()
-	uploadID, err := newUploadID(now)
-	if err != nil {
-		return nil, err
-	}
-
 	m.update("", func(_ *ImportJob) {}) // noop, just to keep pattern
 
 	rootID := drv.RootID()
@@ -624,7 +654,8 @@ func (m *ImportManager) ingestReaderToDrive(ctx context.Context, drv drives.Driv
 	}
 
 	uploadStart := time.Now()
-	fileID, uploadErr := drv.Upload(ctx, rootID, uploadID+ext, r, size)
+	uploadName := uniqueDriveUploadName(ctx, drv, rootID, name)
+	fileID, uploadErr := drv.Upload(ctx, rootID, uploadName, r, size)
 	if uploadErr != nil {
 		return nil, fmt.Errorf("upload to %s: %w", drv.Kind(), uploadErr)
 	}
@@ -632,7 +663,7 @@ func (m *ImportManager) ingestReaderToDrive(ctx context.Context, drv drives.Driv
 		return nil, fmt.Errorf("upload to %s returned empty file id", drv.Kind())
 	}
 	log.Printf("[import] uploaded %s to %s drive=%s fileID=%s took %s",
-		name, drv.Kind(), drv.ID(), fileID, time.Since(uploadStart).Round(time.Millisecond))
+		uploadName, drv.Kind(), drv.ID(), fileID, time.Since(uploadStart).Round(time.Millisecond))
 
 	if title == "" {
 		title = uploadTitleFromFileName(name)
@@ -646,7 +677,7 @@ func (m *ImportManager) ingestReaderToDrive(ctx context.Context, drv drives.Driv
 		ID:            driveVideoID(drv, fileID),
 		DriveID:       drv.ID(),
 		FileID:        fileID,
-		FileName:      name,
+		FileName:      uploadName,
 		ParentID:      rootID,
 		Title:         title,
 		Author:        author,
