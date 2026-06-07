@@ -65,6 +65,11 @@ build_package() {
   cp -R "$ROOT_DIR/dist" "$work/dist"
   mkdir -p "$work/91VideoSpider"
   cp "$ROOT_DIR/91VideoSpider/spider_91porn.py" "$work/91VideoSpider/spider_91porn.py"
+  mkdir -p "$work/scripts"
+  cp "$ROOT_DIR/scripts/import_downloader.py" "$work/scripts/import_downloader.py"
+  cp "$ROOT_DIR/scripts/tg_import_bot.py" "$work/scripts/tg_import_bot.py"
+  cp "$ROOT_DIR/scripts/requirements-import.txt" "$work/scripts/requirements-import.txt"
+  cp "$ROOT_DIR/scripts/trackers.txt" "$work/scripts/trackers.txt"
 
   cat >"$work/README.txt" <<EOF
 $APP_NAME $VERSION
@@ -75,6 +80,7 @@ EOF
 
   chmod +x "$work/server"
   chmod +x "$work/install.sh"
+  chmod +x "$work/scripts/import_downloader.py" "$work/scripts/tg_import_bot.py"
   tar -C "$OUT_DIR/.work" -czf "$OUT_DIR/$artifact.tar.gz" "$artifact"
   log "wrote $OUT_DIR/$artifact.tar.gz"
 }

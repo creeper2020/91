@@ -22,12 +22,13 @@ var (
 )
 
 type Config struct {
-	Server  Server  `yaml:"server"`
-	Storage Storage `yaml:"storage"`
-	Scanner Scanner `yaml:"scanner"`
-	Preview Preview `yaml:"preview"`
-	Nightly Nightly `yaml:"nightly"`
-	Drives  []Drive `yaml:"drives"`
+	Server         Server         `yaml:"server"`
+	Storage        Storage        `yaml:"storage"`
+	Scanner        Scanner        `yaml:"scanner"`
+	Preview        Preview        `yaml:"preview"`
+	Nightly        Nightly        `yaml:"nightly"`
+	ExternalImport ExternalImport `yaml:"external_import"`
+	Drives         []Drive        `yaml:"drives"`
 }
 
 type Server struct {
@@ -203,6 +204,21 @@ type Nightly struct {
 	MaxDuration time.Duration `yaml:"max_duration"`
 }
 
+// ExternalImport 是 Telegram Bot 等外部导入工具共用的配置。
+type ExternalImport struct {
+	Token    string         `yaml:"token"`
+	APIBase  string         `yaml:"api_base"`
+	Telegram TelegramImport `yaml:"telegram"`
+}
+
+type TelegramImport struct {
+	BotToken string `yaml:"bot_token"`
+	APIID    int    `yaml:"api_id"`
+	APIHash  string `yaml:"api_hash"`
+	AdminID  int64  `yaml:"admin_id"`
+	DataDir  string `yaml:"data_dir"`
+}
+
 // Drive 配置项中的敏感字段（Cookie / RefreshToken 等）最终由管理后台写入 DB
 // 这里保留 yaml 中的静态定义，用于启动时预置盘。生产建议只在 DB 里维护。
 type Drive struct {
@@ -281,6 +297,12 @@ func (c *Config) applyDefaults() {
 		c.Nightly.MaxDuration = 6 * time.Hour
 	} else if c.Nightly.CronHour < 0 || c.Nightly.CronHour > 23 {
 		c.Nightly.CronHour = 1
+	}
+	if c.ExternalImport.APIBase == "" {
+		c.ExternalImport.APIBase = "http://127.0.0.1:9191"
+	}
+	if c.ExternalImport.Telegram.DataDir == "" {
+		c.ExternalImport.Telegram.DataDir = "./data/tg-import"
 	}
 }
 

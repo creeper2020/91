@@ -5,6 +5,7 @@ APP_NAME="${APP_NAME:-video-site-91}"
 GITHUB_REPO="${GITHUB_REPO:-nianzhibai/91}"
 INSTALL_PATH="${INSTALL_PATH:-/opt/video-site-91}"
 SERVICE_NAME="${SERVICE_NAME:-video-site-91}"
+TG_SERVICE_NAME="${TG_SERVICE_NAME:-${SERVICE_NAME}-tg-import}"
 FRONTEND_PORT_WAS_SET="${FRONTEND_PORT+x}"
 FRONTEND_PORT="${FRONTEND_PORT:-9191}"
 VERSION="${VERSION:-latest}"
@@ -17,7 +18,9 @@ INSTALL_SCRIPT_REF="${INSTALL_SCRIPT_REF:-main}"
 INSTALL_SCRIPT_URL="${INSTALL_SCRIPT_URL:-${GH_PROXY}https://raw.githubusercontent.com/${GITHUB_REPO}/${INSTALL_SCRIPT_REF}/install.sh}"
 VIDEO_SITE_SKIP_SELF_UPDATE="${VIDEO_SITE_SKIP_SELF_UPDATE:-0}"
 SERVICE_READY_TIMEOUT="${SERVICE_READY_TIMEOUT:-90}"
+INSTALL_PLAYWRIGHT="${INSTALL_PLAYWRIGHT:-1}"
 VERSION_FILE="$INSTALL_PATH/.version"
+IMPORT_VENV_PATH="${IMPORT_VENV_PATH:-$INSTALL_PATH/.venv}"
 MANAGER_PATH="/usr/local/sbin/${APP_NAME}-manager"
 COMMAND_LINK="/usr/local/bin/91"
 APP_COMMAND_LINK="/usr/local/bin/${APP_NAME}"
@@ -74,6 +77,9 @@ Options via environment:
   INSTALL_SCRIPT_REF=$INSTALL_SCRIPT_REF
   INSTALL_SCRIPT_URL=$INSTALL_SCRIPT_URL
   SERVICE_READY_TIMEOUT=$SERVICE_READY_TIMEOUT
+  TG_SERVICE_NAME=$TG_SERVICE_NAME
+  IMPORT_VENV_PATH=$IMPORT_VENV_PATH
+  INSTALL_PLAYWRIGHT=$INSTALL_PLAYWRIGHT
 
 Examples:
   sudo bash install.sh
@@ -124,7 +130,7 @@ asset_name() {
 
 verify_runtime_deps() {
   local cmd
-  for cmd in curl tar ffmpeg ffprobe openssl python3; do
+  for cmd in curl tar ffmpeg ffprobe openssl python3 aria2c; do
     command -v "$cmd" >/dev/null 2>&1 || die "missing command: $cmd"
   done
 
@@ -151,7 +157,7 @@ install_deps() {
     export DEBIAN_FRONTEND=noninteractive
     log "installing runtime dependencies"
     apt-get update
-    apt-get install -y ca-certificates curl tar ffmpeg openssl iproute2 python3 python3-requests python3-bs4 python3-lxml python3-socks
+    apt-get install -y ca-certificates curl tar ffmpeg openssl iproute2 build-essential aria2 python3 python3-dev python3-venv python3-pip python3-requests python3-bs4 python3-lxml python3-socks
     verify_runtime_deps
     return
   fi
@@ -194,7 +200,7 @@ backup_install_files() {
   local backup="$1"
   mkdir -p "$backup"
   cp -a "$INSTALL_PATH/server" "$backup/server"
-  for item in dist config.example.yaml 91VideoSpider config.yaml .version; do
+  for item in dist config.example.yaml 91VideoSpider scripts config.yaml .version; do
     if [[ -e "$INSTALL_PATH/$item" ]]; then
       cp -a "$INSTALL_PATH/$item" "$backup/$item"
     fi
@@ -205,7 +211,7 @@ restore_install_files() {
   local backup="$1"
   mkdir -p "$INSTALL_PATH"
   cp -a "$backup/server" "$INSTALL_PATH/server"
-  for item in dist config.example.yaml 91VideoSpider config.yaml .version; do
+  for item in dist config.example.yaml 91VideoSpider scripts config.yaml .version; do
     rm -rf "${INSTALL_PATH:?}/$item"
     if [[ -e "$backup/$item" ]]; then
       cp -a "$backup/$item" "$INSTALL_PATH/$item"
@@ -240,6 +246,20 @@ prepare_config() {
   fi
 }
 
+install_import_python_env() {
+  local requirements="$INSTALL_PATH/scripts/requirements-import.txt"
+  [[ -f "$requirements" ]] || return 0
+
+  chmod +x "$INSTALL_PATH/scripts/import_downloader.py" "$INSTALL_PATH/scripts/tg_import_bot.py" 2>/dev/null || true
+  log "installing import/TG Python dependencies"
+  python3 -m venv "$IMPORT_VENV_PATH"
+  "$IMPORT_VENV_PATH/bin/python" -m pip install --upgrade pip setuptools wheel
+  "$IMPORT_VENV_PATH/bin/python" -m pip install -r "$requirements"
+  if [[ "$INSTALL_PLAYWRIGHT" == "1" ]]; then
+    "$IMPORT_VENV_PATH/bin/python" -m playwright install chromium || warn "Playwright browser install failed; magnet/direct imports and TG still work"
+  fi
+}
+
 write_service() {
   cat >"/etc/systemd/system/${SERVICE_NAME}.service" <<EOF
 [Unit]
@@ -258,6 +278,8 @@ Environment=VIDEO_CONFIG=${INSTALL_PATH}/config.yaml
 Environment=VIDEO_FRONTEND_DIR=${INSTALL_PATH}/dist
 Environment=VIDEO_VERSION_FILE=${VERSION_FILE}
 Environment=VIDEO_GITHUB_REPO=${GITHUB_REPO}
+Environment=VIDEO_IMPORT_PYTHON=${IMPORT_VENV_PATH}/bin/python
+Environment=VIDEO_IMPORT_DOWNLOADER=${INSTALL_PATH}/scripts/import_downloader.py
 Environment=HOME=/root
 Environment=PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
 LimitNOFILE=65536
@@ -270,6 +292,55 @@ WantedBy=multi-user.target
 EOF
   systemctl daemon-reload
   systemctl enable "${SERVICE_NAME}.service" >/dev/null
+}
+
+telegram_configured() {
+  local cfg="$INSTALL_PATH/config.yaml"
+  [[ -f "$cfg" ]] || return 1
+  awk '
+    /^[^[:space:]#][^:]*:/ {section=$1; sub(/:.*/, "", section)}
+    section == "external_import" && /^[[:space:]]*token:[[:space:]]*"?[^"[:space:]#]+/ {token=1}
+    section == "external_import" && /^[[:space:]]*telegram:/ {in_tg=1; next}
+    in_tg && /^[^[:space:]#][^:]*:/ {in_tg=0}
+    in_tg && /^[[:space:]]*bot_token:[[:space:]]*"?[^"[:space:]#]+/ {bot=1}
+    in_tg && /^[[:space:]]*api_id:[[:space:]]*[1-9][0-9]*/ {api_id=1}
+    in_tg && /^[[:space:]]*api_hash:[[:space:]]*"?[^"[:space:]#]+/ {api_hash=1}
+    END {exit !(token && bot && api_id && api_hash)}
+  ' "$cfg"
+}
+
+write_tg_service() {
+  [[ -f "$INSTALL_PATH/scripts/tg_import_bot.py" ]] || return 0
+  cat >"/etc/systemd/system/${TG_SERVICE_NAME}.service" <<EOF
+[Unit]
+Description=Video Site 91 Telegram Import Bot
+After=network-online.target ${SERVICE_NAME}.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=${INSTALL_PATH}
+ExecStart=${IMPORT_VENV_PATH}/bin/python ${INSTALL_PATH}/scripts/tg_import_bot.py
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=20
+Environment=VIDEO_CONFIG=${INSTALL_PATH}/config.yaml
+Environment=HOME=/root
+Environment=PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=${TG_SERVICE_NAME}
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+  if telegram_configured; then
+    systemctl enable "${TG_SERVICE_NAME}.service" >/dev/null
+  else
+    systemctl disable --now "${TG_SERVICE_NAME}.service" >/dev/null 2>&1 || true
+    warn "Telegram bot service installed but not started; fill external_import.token and external_import.telegram in config.yaml, then run 91 restart"
+  fi
 }
 
 install_cli() {
@@ -336,6 +407,9 @@ exec_latest_manager_update() {
     "INSTALL_SCRIPT_REF=$INSTALL_SCRIPT_REF"
     "INSTALL_SCRIPT_URL=$INSTALL_SCRIPT_URL"
     "SERVICE_READY_TIMEOUT=$SERVICE_READY_TIMEOUT"
+    "TG_SERVICE_NAME=$TG_SERVICE_NAME"
+    "INSTALL_PLAYWRIGHT=$INSTALL_PLAYWRIGHT"
+    "IMPORT_VENV_PATH=$IMPORT_VENV_PATH"
   )
   if [[ -n "$FRONTEND_PORT_WAS_SET" ]]; then
     env_args+=("FRONTEND_PORT=$FRONTEND_PORT")
@@ -378,7 +452,7 @@ append_unique() {
 app_service_names() {
   local names=()
   local name
-  for name in "$SERVICE_NAME" "$APP_NAME" video-site-91 video-site-backend video-site-frontend; do
+  for name in "$SERVICE_NAME" "$TG_SERVICE_NAME" "${SERVICE_NAME}-tg-import" "$APP_NAME" "${APP_NAME}-tg-import" video-site-91 video-site-91-tg-import video-site-backend video-site-frontend; do
     [[ -n "$name" ]] || continue
     if append_unique "$name" "${names[@]}" >/dev/null; then
       names+=("$name")
@@ -566,6 +640,25 @@ restart_service_ready() {
   return 1
 }
 
+restart_tg_service_if_configured() {
+  [[ -f "/etc/systemd/system/${TG_SERVICE_NAME}.service" ]] || return 0
+
+  if telegram_configured; then
+    systemctl enable "${TG_SERVICE_NAME}.service" >/dev/null
+    if systemctl restart "${TG_SERVICE_NAME}.service"; then
+      log "Telegram bot service restarted"
+      return 0
+    fi
+    warn "Telegram bot service failed to start"
+    systemctl --no-pager --full status "${TG_SERVICE_NAME}.service" || true
+    journalctl -u "${TG_SERVICE_NAME}.service" -n 60 --no-pager || true
+    return 0
+  fi
+
+  systemctl disable --now "${TG_SERVICE_NAME}.service" >/dev/null 2>&1 || true
+  warn "Telegram bot service is disabled until external_import.token and external_import.telegram are configured"
+}
+
 fetch_and_unpack() {
   local tmp archive url root
   tmp="$(mktemp -d)"
@@ -598,6 +691,11 @@ fetch_and_unpack() {
   if [[ -d "$root/91VideoSpider" ]]; then
     rm -rf "$INSTALL_PATH/91VideoSpider"
     cp -R "$root/91VideoSpider" "$INSTALL_PATH/91VideoSpider"
+  fi
+  if [[ -d "$root/scripts" ]]; then
+    rm -rf "$INSTALL_PATH/scripts"
+    cp -R "$root/scripts" "$INSTALL_PATH/scripts"
+    chmod +x "$INSTALL_PATH/scripts/import_downloader.py" "$INSTALL_PATH/scripts/tg_import_bot.py" 2>/dev/null || true
   fi
   chmod +x "$INSTALL_PATH/server"
   rm -rf "$tmp"
@@ -680,6 +778,7 @@ show_success() {
   [[ -n "$public_ip" ]] && echo "公网：  http://${public_ip}:${FRONTEND_PORT}/"
   echo "后台：  http://服务器IP:${FRONTEND_PORT}/admin"
   echo "数据：  $INSTALL_PATH/data"
+  echo "TG Bot：配置 $INSTALL_PATH/config.yaml 的 external_import.token 和 external_import.telegram 后运行 91 restart"
   echo
   echo "首次访问后台时会要求设置管理员用户名和密码。"
   echo "管理命令：91 或 91 status | logs | update | restart | stop"
@@ -689,13 +788,16 @@ install_app() {
   check_system
   check_disk_space
   install_deps
-  systemctl stop "${SERVICE_NAME}.service" 2>/dev/null || true
+  systemctl stop "${TG_SERVICE_NAME}.service" "${SERVICE_NAME}.service" 2>/dev/null || true
   fetch_and_unpack || die "install failed"
   prepare_config
+  install_import_python_env
   write_service
+  write_tg_service
   install_cli
   open_firewall_port
   restart_service_ready || die "service failed to start"
+  restart_tg_service_if_configured
   record_version
   show_success
 }
@@ -722,11 +824,12 @@ update_app() {
   backup="$(mktemp -d)"
   backup_install_files "$backup"
 
-  systemctl stop "${SERVICE_NAME}.service" 2>/dev/null || true
-  if ! (fetch_and_unpack && prepare_config && write_service && install_cli); then
+  systemctl stop "${TG_SERVICE_NAME}.service" "${SERVICE_NAME}.service" 2>/dev/null || true
+  if ! (fetch_and_unpack && prepare_config && install_import_python_env && write_service && write_tg_service && install_cli); then
     warn "update failed; restoring previous files"
     restore_install_files "$backup"
     systemctl start "${SERVICE_NAME}.service" 2>/dev/null || true
+    restart_tg_service_if_configured 2>/dev/null || true
     rm -rf "$backup"
     exit 1
   fi
@@ -735,9 +838,11 @@ update_app() {
     warn "new version failed to start; restoring previous files"
     restore_install_files "$backup"
     restart_service_ready 2>/dev/null || true
+    restart_tg_service_if_configured 2>/dev/null || true
     rm -rf "$backup"
     exit 1
   fi
+  restart_tg_service_if_configured
   record_version
   rm -rf "$backup"
   log "updated"
@@ -833,16 +938,17 @@ main() {
     restart)
       need_root "$@"
       restart_service_ready || die "service failed to start"
+      restart_tg_service_if_configured
       ;;
     stop)
       need_root "$@"
-      systemctl stop "${SERVICE_NAME}.service"
+      systemctl stop "${TG_SERVICE_NAME}.service" "${SERVICE_NAME}.service" 2>/dev/null || systemctl stop "${SERVICE_NAME}.service"
       ;;
     status)
-      systemctl --no-pager --full status "${SERVICE_NAME}.service" || true
+      systemctl --no-pager --full status "${SERVICE_NAME}.service" "${TG_SERVICE_NAME}.service" || true
       ;;
     logs)
-      journalctl -u "${SERVICE_NAME}.service" -f
+      journalctl -u "${SERVICE_NAME}.service" -u "${TG_SERVICE_NAME}.service" -f
       ;;
     menu)
       show_menu

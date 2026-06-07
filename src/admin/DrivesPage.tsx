@@ -75,7 +75,7 @@ export function DrivesPage() {
     : hasCreateFormChanges(form, initialForm);
 
   const uploadTargets = useMemo(
-    () => list.filter((d) => d.kind === "pikpak" || d.kind === "p115" || d.kind === "p123" || d.kind === "onedrive"),
+    () => list.filter((d) => d.kind === "pikpak" || d.kind === "p115" || d.kind === "p123" || d.kind === "onedrive" || d.kind === "googledrive"),
     [list]
   );
 

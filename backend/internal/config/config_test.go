@@ -103,6 +103,38 @@ scanner:
 	}
 }
 
+func TestLoadExternalImportConfig(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(`
+external_import:
+  token: "import-secret"
+  api_base: "http://127.0.0.1:9191"
+  telegram:
+    bot_token: "telegram-token"
+    api_id: 12345
+    api_hash: "telegram-hash"
+    admin_id: 67890
+    data_dir: "./data/tg-import"
+`), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if cfg.ExternalImport.Token != "import-secret" {
+		t.Fatalf("external import token = %q, want import-secret", cfg.ExternalImport.Token)
+	}
+	if cfg.ExternalImport.APIBase != "http://127.0.0.1:9191" {
+		t.Fatalf("api base = %q", cfg.ExternalImport.APIBase)
+	}
+	tg := cfg.ExternalImport.Telegram
+	if tg.BotToken != "telegram-token" || tg.APIID != 12345 || tg.APIHash != "telegram-hash" || tg.AdminID != 67890 || tg.DataDir != "./data/tg-import" {
+		t.Fatalf("telegram config = %#v", tg)
+	}
+}
+
 func hasVideoExtension(exts []string, want string) bool {
 	want = strings.ToLower(strings.TrimSpace(want))
 	for _, ext := range exts {

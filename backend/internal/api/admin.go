@@ -65,6 +65,10 @@ type AdminServer struct {
 	// Spider91 → 115/123/PikPak/OneDrive 上传目标 drive ID 读写
 	GetSpider91UploadDriveID func() string
 	SetSpider91UploadDriveID func(driveID string) error
+	// DefaultUploadDriveID: 用户上传 / 链接导入的默认目标网盘。
+	// 空字符串表示保存到本地。
+	GetDefaultUploadDriveID func() string
+	SetDefaultUploadDriveID func(driveID string) error
 	// OnRunNightlyJob 触发一次完整的凌晨流水线（Phase1 扫盘 + Phase2 91 爬虫 +
 	// Phase3 迁移）。立即返回 —— 实际任务在后台跑，admin 在日志或下次状态查询里
 	// 看进度。若流水线正在跑或已排队，Runner 会拒绝重复触发。
@@ -1124,6 +1128,7 @@ func (a *AdminServer) handleRegenFailedFingerprints(w http.ResponseWriter, r *ht
 type settingsDTO struct {
 	Theme                 string `json:"theme"`
 	Spider91UploadDriveID string `json:"spider91UploadDriveId"`
+	DefaultUploadDriveID  string `json:"defaultUploadDriveId"`
 }
 
 func (a *AdminServer) handleGetSettings(w http.ResponseWriter, r *http.Request) {
@@ -1137,9 +1142,14 @@ func (a *AdminServer) handleGetSettings(w http.ResponseWriter, r *http.Request) 
 	if a.GetSpider91UploadDriveID != nil {
 		spider91UploadID = a.GetSpider91UploadDriveID()
 	}
+	defaultUploadID := ""
+	if a.GetDefaultUploadDriveID != nil {
+		defaultUploadID = a.GetDefaultUploadDriveID()
+	}
 	writeJSON(w, http.StatusOK, settingsDTO{
 		Theme:                 theme,
 		Spider91UploadDriveID: spider91UploadID,
+		DefaultUploadDriveID:  defaultUploadID,
 	})
 }
 
@@ -1178,6 +1188,18 @@ func (a *AdminServer) handlePutSettings(w http.ResponseWriter, r *http.Request) 
 		}
 	}
 
+	if v, ok := raw["defaultUploadDriveId"]; ok && a.SetDefaultUploadDriveID != nil {
+		var driveID string
+		if err := json.Unmarshal(v, &driveID); err != nil {
+			writeErr(w, http.StatusBadRequest, err)
+			return
+		}
+		if err := a.SetDefaultUploadDriveID(driveID); err != nil {
+			writeErr(w, http.StatusBadRequest, err)
+			return
+		}
+	}
+
 	// 回显当前值
 	resp := settingsDTO{}
 	if a.GetTheme != nil {
@@ -1185,6 +1207,9 @@ func (a *AdminServer) handlePutSettings(w http.ResponseWriter, r *http.Request) 
 	}
 	if a.GetSpider91UploadDriveID != nil {
 		resp.Spider91UploadDriveID = a.GetSpider91UploadDriveID()
+	}
+	if a.GetDefaultUploadDriveID != nil {
+		resp.DefaultUploadDriveID = a.GetDefaultUploadDriveID()
 	}
 	writeJSON(w, http.StatusOK, resp)
 }

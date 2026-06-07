@@ -7,12 +7,15 @@ REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 APP_NAME="${APP_NAME:-video-site-91}"
 BACKEND_SERVICE="${BACKEND_SERVICE:-video-site-backend}"
 FRONTEND_SERVICE="${FRONTEND_SERVICE:-video-site-frontend}"
+TG_SERVICE="${TG_SERVICE:-${APP_NAME}-tg-import}"
 FRONTEND_HOST="${FRONTEND_HOST:-0.0.0.0}"
 FRONTEND_PORT="${FRONTEND_PORT:-9191}"
 BACKEND_LISTEN="${BACKEND_LISTEN:-127.0.0.1:9192}"
 GO_VERSION="${GO_VERSION:-1.23.12}"
 INSTALL_DEPS="${INSTALL_DEPS:-1}"
 CONFIGURE_UFW="${CONFIGURE_UFW:-1}"
+INSTALL_PLAYWRIGHT="${INSTALL_PLAYWRIGHT:-1}"
+IMPORT_VENV_PATH="${IMPORT_VENV_PATH:-$REPO_DIR/.venv-import}"
 
 export PATH="/usr/local/go/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
 
@@ -51,6 +54,9 @@ Common overrides:
   GO_VERSION=1.23.12
   INSTALL_DEPS=0          Do not install missing Node/Go/ffmpeg/Python runtime deps
   CONFIGURE_UFW=0         Do not open UFW port automatically
+  INSTALL_PLAYWRIGHT=0    Skip Playwright browser download for web-page imports
+  TG_SERVICE=$TG_SERVICE
+  IMPORT_VENV_PATH=$IMPORT_VENV_PATH
   DEPLOY_USER=<user>      Service user; defaults to sudo user or root
 
 Examples:
@@ -131,7 +137,7 @@ apt_install() {
   log "installing base packages"
   apt-get update
   apt-get install -y ca-certificates curl git ffmpeg openssl iproute2 build-essential \
-    python3 python3-requests python3-bs4 python3-lxml python3-socks
+    aria2 python3 python3-dev python3-venv python3-pip python3-requests python3-bs4 python3-lxml python3-socks
 }
 
 verify_spider91_python_deps() {
@@ -200,6 +206,7 @@ install_dependencies() {
   install_go
   command -v ffmpeg >/dev/null 2>&1 || die "ffmpeg is required"
   command -v ffprobe >/dev/null 2>&1 || die "ffprobe is required"
+  command -v aria2c >/dev/null 2>&1 || die "aria2c is required"
   verify_spider91_python_deps
 }
 
@@ -209,6 +216,8 @@ ensure_ownership() {
   [[ -d "$REPO_DIR/backend/data" ]] && paths+=("$REPO_DIR/backend/data")
   [[ -d "$REPO_DIR/dist" ]] && paths+=("$REPO_DIR/dist")
   [[ -d "$REPO_DIR/node_modules" ]] && paths+=("$REPO_DIR/node_modules")
+  [[ -d "$REPO_DIR/scripts" ]] && paths+=("$REPO_DIR/scripts")
+  [[ -d "$IMPORT_VENV_PATH" ]] && paths+=("$IMPORT_VENV_PATH")
   [[ -e "$REPO_DIR/backend/server" ]] && paths+=("$REPO_DIR/backend/server")
   if (( ${#paths[@]} > 0 )); then
     chown -R "$DEPLOY_USER:$DEPLOY_GROUP" "${paths[@]}"
@@ -235,6 +244,21 @@ prepare_config() {
     log "generated a random session_secret"
   fi
 
+  ensure_ownership
+}
+
+install_import_python_env() {
+  local requirements="$REPO_DIR/scripts/requirements-import.txt"
+  [[ -f "$requirements" ]] || return 0
+
+  chmod +x "$REPO_DIR/scripts/import_downloader.py" "$REPO_DIR/scripts/tg_import_bot.py" 2>/dev/null || true
+  log "installing import/TG Python dependencies"
+  as_deploy_user python3 -m venv "$IMPORT_VENV_PATH"
+  as_deploy_user "$IMPORT_VENV_PATH/bin/python" -m pip install --upgrade pip setuptools wheel
+  as_deploy_user "$IMPORT_VENV_PATH/bin/python" -m pip install -r "$requirements"
+  if [[ "$INSTALL_PLAYWRIGHT" == "1" ]]; then
+    as_deploy_user "$IMPORT_VENV_PATH/bin/python" -m playwright install chromium || warn "Playwright browser install failed; magnet/direct imports and TG still work"
+  fi
   ensure_ownership
 }
 
@@ -269,11 +293,27 @@ systemd_env_lines() {
   printf '%s' "$lines"
 }
 
+telegram_configured() {
+  local cfg="$REPO_DIR/backend/config.yaml"
+  [[ -f "$cfg" ]] || return 1
+  awk '
+    /^[^[:space:]#][^:]*:/ {section=$1; sub(/:.*/, "", section)}
+    section == "external_import" && /^[[:space:]]*token:[[:space:]]*"?[^"[:space:]#]+/ {token=1}
+    section == "external_import" && /^[[:space:]]*telegram:/ {in_tg=1; next}
+    in_tg && /^[^[:space:]#][^:]*:/ {in_tg=0}
+    in_tg && /^[[:space:]]*bot_token:[[:space:]]*"?[^"[:space:]#]+/ {bot=1}
+    in_tg && /^[[:space:]]*api_id:[[:space:]]*[1-9][0-9]*/ {api_id=1}
+    in_tg && /^[[:space:]]*api_hash:[[:space:]]*"?[^"[:space:]#]+/ {api_hash=1}
+    END {exit !(token && bot && api_id && api_hash)}
+  ' "$cfg"
+}
+
 write_systemd_units() {
-  local npm_bin backend_unit frontend_unit env_lines
+  local npm_bin backend_unit frontend_unit tg_unit env_lines
   npm_bin="$(command -v npm)"
   backend_unit="/etc/systemd/system/${BACKEND_SERVICE}.service"
   frontend_unit="/etc/systemd/system/${FRONTEND_SERVICE}.service"
+  tg_unit="/etc/systemd/system/${TG_SERVICE}.service"
   env_lines="$(systemd_env_lines)"
 
   log "writing systemd unit: $backend_unit"
@@ -292,6 +332,9 @@ ExecStart=${REPO_DIR}/backend/server
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=20
+Environment=VIDEO_CONFIG=${REPO_DIR}/backend/config.yaml
+Environment=VIDEO_IMPORT_PYTHON=${IMPORT_VENV_PATH}/bin/python
+Environment=VIDEO_IMPORT_DOWNLOADER=${REPO_DIR}/scripts/import_downloader.py
 Environment=HOME=${DEPLOY_HOME}
 Environment=PATH=/usr/local/go/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
 ${env_lines}LimitNOFILE=65536
@@ -329,8 +372,45 @@ SyslogIdentifier=${FRONTEND_SERVICE}
 WantedBy=multi-user.target
 EOF
 
+  if [[ -f "$REPO_DIR/scripts/tg_import_bot.py" ]]; then
+    log "writing systemd unit: $tg_unit"
+    cat >"$tg_unit" <<EOF
+[Unit]
+Description=Video Site 91 Telegram Import Bot
+After=network-online.target ${BACKEND_SERVICE}.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=${DEPLOY_USER}
+Group=${DEPLOY_GROUP}
+WorkingDirectory=${REPO_DIR}
+ExecStart=${IMPORT_VENV_PATH}/bin/python ${REPO_DIR}/scripts/tg_import_bot.py
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=20
+Environment=VIDEO_CONFIG=${REPO_DIR}/backend/config.yaml
+Environment=HOME=${DEPLOY_HOME}
+Environment=PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+${env_lines}StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=${TG_SERVICE}
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  fi
+
   systemctl daemon-reload
   systemctl enable "${BACKEND_SERVICE}.service" "${FRONTEND_SERVICE}.service" >/dev/null
+  if [[ -f "$tg_unit" ]]; then
+    if telegram_configured; then
+      systemctl enable "${TG_SERVICE}.service" >/dev/null
+    else
+      systemctl disable --now "${TG_SERVICE}.service" >/dev/null 2>&1 || true
+      warn "Telegram bot service installed but not started; fill external_import.token and external_import.telegram in backend/config.yaml, then restart"
+    fi
+  fi
 }
 
 open_firewall_port() {
@@ -346,6 +426,26 @@ restart_services() {
   log "starting services"
   systemctl restart "${BACKEND_SERVICE}.service"
   systemctl restart "${FRONTEND_SERVICE}.service"
+  restart_tg_service_if_configured
+}
+
+restart_tg_service_if_configured() {
+  [[ -f "/etc/systemd/system/${TG_SERVICE}.service" ]] || return 0
+
+  if telegram_configured; then
+    systemctl enable "${TG_SERVICE}.service" >/dev/null
+    if systemctl restart "${TG_SERVICE}.service"; then
+      log "Telegram bot service restarted"
+      return 0
+    fi
+    warn "Telegram bot service failed to start"
+    systemctl --no-pager --full status "${TG_SERVICE}.service" || true
+    journalctl -u "${TG_SERVICE}.service" -n 60 --no-pager || true
+    return 0
+  fi
+
+  systemctl disable --now "${TG_SERVICE}.service" >/dev/null 2>&1 || true
+  warn "Telegram bot service is disabled until external_import.token and external_import.telegram are configured"
 }
 
 show_summary() {
@@ -354,6 +454,7 @@ show_summary() {
   echo "  frontend: http://<server-ip>:${FRONTEND_PORT}/"
   echo "  admin:    http://<server-ip>:${FRONTEND_PORT}/admin"
   echo "  backend:  127.0.0.1:9192"
+  echo "  tg bot:   ${TG_SERVICE}.service (starts after external_import is configured)"
   echo
   echo "First visit will ask you to create the admin username and password."
   echo "Useful commands:"
@@ -363,7 +464,7 @@ show_summary() {
 }
 
 show_status() {
-  systemctl --no-pager --full status "${BACKEND_SERVICE}.service" "${FRONTEND_SERVICE}.service" || true
+  systemctl --no-pager --full status "${BACKEND_SERVICE}.service" "${FRONTEND_SERVICE}.service" "${TG_SERVICE}.service" || true
 }
 
 install_or_update() {
@@ -372,6 +473,7 @@ install_or_update() {
   detect_deploy_user
   install_dependencies
   prepare_config
+  install_import_python_env
   install_frontend
   build_backend
   write_systemd_units
@@ -384,8 +486,8 @@ install_or_update() {
 }
 
 uninstall_services() {
-  systemctl disable --now "${FRONTEND_SERVICE}.service" "${BACKEND_SERVICE}.service" 2>/dev/null || true
-  rm -f "/etc/systemd/system/${FRONTEND_SERVICE}.service" "/etc/systemd/system/${BACKEND_SERVICE}.service"
+  systemctl disable --now "${TG_SERVICE}.service" "${FRONTEND_SERVICE}.service" "${BACKEND_SERVICE}.service" 2>/dev/null || true
+  rm -f "/etc/systemd/system/${TG_SERVICE}.service" "/etc/systemd/system/${FRONTEND_SERVICE}.service" "/etc/systemd/system/${BACKEND_SERVICE}.service"
   systemctl daemon-reload
   log "removed systemd services; repo, config, and data were kept"
 }
@@ -408,13 +510,13 @@ main() {
       ;;
     stop)
       need_root "$@"
-      systemctl stop "${FRONTEND_SERVICE}.service" "${BACKEND_SERVICE}.service"
+      systemctl stop "${TG_SERVICE}.service" "${FRONTEND_SERVICE}.service" "${BACKEND_SERVICE}.service" 2>/dev/null || systemctl stop "${FRONTEND_SERVICE}.service" "${BACKEND_SERVICE}.service"
       ;;
     status)
       show_status
       ;;
     logs)
-      journalctl -u "${BACKEND_SERVICE}.service" -u "${FRONTEND_SERVICE}.service" -f
+      journalctl -u "${BACKEND_SERVICE}.service" -u "${FRONTEND_SERVICE}.service" -u "${TG_SERVICE}.service" -f
       ;;
     uninstall)
       need_root "$@"

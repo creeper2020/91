@@ -1,5 +1,5 @@
 // Package spider91migrate 周期性把 spider91 drive 下载到本地的视频
-// 上传到一个指定的目标 drive 目录（PikPak、115、123 或 OneDrive），上传成功后：
+// 上传到一个指定的目标 drive 目录（PikPak、115、123、OneDrive 或 Google Drive），上传成功后：
 //
 //   - 改写 catalog 行：drive_id / file_id / content_hash 改成目标盘的；
 //     视频自身的 id 不变（仍是 spider91-<driveID>-<viewkey>），video_tags、
@@ -29,6 +29,7 @@ import (
 
 	"github.com/video-site/backend/internal/catalog"
 	"github.com/video-site/backend/internal/drives"
+	"github.com/video-site/backend/internal/drives/googledrive"
 	"github.com/video-site/backend/internal/drives/onedrive"
 	"github.com/video-site/backend/internal/drives/p115"
 	"github.com/video-site/backend/internal/drives/p123"
@@ -38,13 +39,14 @@ import (
 )
 
 // uploadTarget 是 migrator 调用目标 drive 的最小接口。任何一种"接收 spider91 上传"的
-// 网盘都要实现它；当前 PikPak、115、123 和 OneDrive 各自通过适配器满足。
+// 网盘都要实现它；当前 PikPak、115、123、OneDrive 和 Google Drive 各自通过适配器满足。
 //
 // 这一层抽象把"迁移调用方"和"具体盘的 SDK 协议"解耦：
 //   - PikPak 走 GCID + OSS PutObject（pikpak.UploadResult）
 //   - 115   走 SHA1   + 秒传 / OSS / 分片（p115.UploadResult）
 //   - 123   走 MD5    + 秒传 / S3 预签名分片（p123.UploadResult）
 //   - OneDrive 走 SHA1 + 小文件 PUT / 大文件 upload session
+//   - Google Drive 走 MD5 + resumable upload
 //
 // 各家返回值都被归一成本地的 UploadResult，并在 catalog 改写阶段统一处理。
 type uploadTarget interface {
@@ -59,7 +61,7 @@ type uploadTarget interface {
 // UploadResult 是 uploadTarget.UploadAndReportHash 的归一返回。
 //
 // FileID  目标盘上的新文件 ID；
-// Hash    GCID（PikPak）、MD5 HEX（123）或 SHA1 HEX（115 / OneDrive），写入 catalog.content_hash 用于跨盘去重；
+// Hash    GCID（PikPak）、MD5 HEX（123 / Google Drive）或 SHA1 HEX（115 / OneDrive），写入 catalog.content_hash 用于跨盘去重；
 // Size    实际上传字节数。
 type UploadResult struct {
 	FileID string
@@ -69,7 +71,7 @@ type UploadResult struct {
 
 const spider91UploadDirName = "91 Spider"
 
-// pikpakAdapter / p115Adapter / p123Adapter / onedriveAdapter 把具体 driver 包装成 uploadTarget。
+// pikpakAdapter / p115Adapter / p123Adapter / onedriveAdapter / googleDriveAdapter 把具体 driver 包装成 uploadTarget。
 //
 // 之所以不让 driver 直接实现 uploadTarget：
 //
@@ -160,6 +162,27 @@ func (a *onedriveAdapter) Rename(ctx context.Context, fileID, newName string) er
 	return a.d.Rename(ctx, fileID, newName)
 }
 
+type googleDriveAdapter struct {
+	d *googledrive.Driver
+}
+
+func (a *googleDriveAdapter) ID() string     { return a.d.ID() }
+func (a *googleDriveAdapter) Kind() string   { return a.d.Kind() }
+func (a *googleDriveAdapter) RootID() string { return a.d.RootID() }
+func (a *googleDriveAdapter) EnsureDir(ctx context.Context, pathFromRoot string) (string, error) {
+	return a.d.EnsureDir(ctx, pathFromRoot)
+}
+func (a *googleDriveAdapter) UploadAndReportHash(ctx context.Context, parentID, name string, r io.Reader, size int64) (UploadResult, error) {
+	res, err := a.d.UploadAndReportHash(ctx, parentID, name, r, size)
+	if err != nil {
+		return UploadResult{}, err
+	}
+	return UploadResult{FileID: res.FileID, Hash: res.Hash, Size: res.Size}, nil
+}
+func (a *googleDriveAdapter) Rename(ctx context.Context, fileID, newName string) error {
+	return a.d.Rename(ctx, fileID, newName)
+}
+
 // adaptUploadTarget 把通用 drive 包装成 uploadTarget。
 // 不支持的盘 kind 返回 error；调用方静默跳过。
 func adaptUploadTarget(d drives.Drive) (uploadTarget, error) {
@@ -172,6 +195,8 @@ func adaptUploadTarget(d drives.Drive) (uploadTarget, error) {
 		return &p123Adapter{d: v}, nil
 	case *onedrive.Driver:
 		return &onedriveAdapter{d: v}, nil
+	case *googledrive.Driver:
+		return &googleDriveAdapter{d: v}, nil
 	case uploadTarget:
 		// 测试或自定义实现可以直接传入；优先使用具体类型分支以拿到适配器。
 		return v, nil

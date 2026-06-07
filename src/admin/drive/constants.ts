@@ -146,7 +146,7 @@ export function credentialHelp(kind: Kind, isEdit: boolean): string {
     case "onedrive":
       return `按 OpenList 默认应用在线挂载，只需要 refresh_token；保存时会自动刷新并保存 token。${note}`;
     case "googledrive":
-      return `按 OpenList 在线 API 挂载，只需要 Google Drive refresh_token；保存时会自动刷新并保存 token。播放不走 302，会由后端带 Authorization 代理转发。${note}`;
+      return `使用 Google OAuth refresh_token 挂载。保存时会自动刷新 access_token，并通过后端代理播放，不会把 token 下发给浏览器。${note}`;
     case "localstorage":
       return `填写服务器可访问的本地目录绝对路径，例如 /mnt/videos。系统会扫描该目录及子目录中的视频文件和 .strm 文件；.strm 可指向 HTTP/HTTPS 直链，或指向本地存储根目录内的真实视频路径。Docker 部署时请填写容器内路径。${note}`;
     case "spider91":
@@ -253,11 +253,39 @@ export function credentialFields(kind: Kind): Array<{
     case "googledrive":
       return [
         {
+          key: "client_id",
+          label: "client_id",
+          placeholder: "Google OAuth Client ID",
+          required: true,
+        },
+        {
+          key: "client_secret",
+          label: "client_secret",
+          placeholder: "Google OAuth Client Secret",
+          required: true,
+        },
+        {
           key: "refresh_token",
           label: "refresh_token",
-          placeholder: "OpenList Google Drive refresh_token",
+          placeholder: "Google Drive refresh_token",
           multiline: true,
           required: true,
+        },
+        {
+          key: "access_token",
+          label: "access_token（可选）",
+          placeholder: "留空会通过 refresh_token 自动刷新",
+          multiline: true,
+        },
+        {
+          key: "token_url",
+          label: "token_url（可选）",
+          placeholder: "https://oauth2.googleapis.com/token",
+        },
+        {
+          key: "api_base_url",
+          label: "api_base_url（可选）",
+          placeholder: "https://www.googleapis.com/drive/v3",
         },
       ];
     case "localstorage":

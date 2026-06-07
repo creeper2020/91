@@ -13,6 +13,10 @@ OpenList-4.2.1/
 # 后端数据目录（SQLite + teaser/封面）
 backend/data/
 backend/config.yaml
+.env.import
+
+# Telegram Bot 数据目录（白名单、会话等）
+data/tg-import/
 
 # 工具链
 tools/

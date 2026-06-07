@@ -77,6 +77,40 @@ export function uploadVideo(input: UploadVideoInput): Promise<VideoItem> {
   return apiForm<VideoItem>("/api/upload", body);
 }
 
+export type ImportJob = {
+  id: string;
+  sourceUrl: string;
+  status: "queued" | "running" | "importing" | "done" | "failed" | string;
+  message?: string;
+  error?: string;
+  videoIds?: string[];
+  videos?: VideoItem[];
+  createdAt: string;
+  updatedAt: string;
+  finishedAt?: string;
+};
+
+export type CreateImportInput = {
+  url: string;
+  title: string;
+  tags: string[];
+};
+
+export function createImportJob(input: CreateImportInput): Promise<ImportJob> {
+  return apiJSON<ImportJob>("/api/imports", {
+    method: "POST",
+    body: JSON.stringify({
+      url: input.url.trim(),
+      title: input.title.trim(),
+      tags: input.tags,
+    }),
+  });
+}
+
+export function fetchImportJob(id: string): Promise<ImportJob> {
+  return apiGet<ImportJob>(`/api/imports/${encodeURIComponent(id)}`);
+}
+
 export type TagItem = { id: string; label: string; count?: number };
 
 const TAG_CACHE_TTL_MS = 30_000;

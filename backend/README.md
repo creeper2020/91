@@ -21,7 +21,7 @@ internal/
     pikpak/                 PikPak（自己实现，参考 OpenList pikpak）
     wopan/                  联通沃盘（壳子 + OpenListTeam/wopan-sdk-go）
     onedrive/               OneDrive（OpenList 在线续期 + Microsoft Graph 文件接口）
-    googledrive/            Google Drive（OpenList 在线续期 + Google Drive API；播放走后端代理）
+    googledrive/            Google Drive（Google OAuth + Google Drive API；播放走后端代理）
     localstorage/           本地目录扫描（服务器已有视频目录）
   scanner/                  扫目录 → 落库
   preview/                  ffmpeg 抽封面和生成多段预览视频
@@ -69,6 +69,8 @@ go run ./cmd/server
 
 默认监听 `127.0.0.1:9192`。首次部署如果仍是默认管理员配置，登录页会要求先设置用户名和密码，并写回 `config.yaml`。如果本地已有旧的 `config.yaml`，请确认 `server.listen` 与前端代理端口一致。
 
+Telegram Bot 和外部导入 API 统一写在 `config.yaml` 的 `external_import` 块里：`token` 是后端导入接口鉴权，`api_base` 是 bot 访问后端的地址，`telegram.bot_token/api_id/api_hash/admin_id/data_dir` 是 TG bot 自身配置。旧的 `VIDEO_IMPORT_TOKEN`、`TELEGRAM_BOT_TOKEN`、`API_ID` 等环境变量仍可作为兼容 fallback，但新部署建议只维护配置文件。
+
 ### 连接前端
 
 `vite.config.ts` 已经把 `/api`、`/p`、`/admin/api` 代理到 `127.0.0.1:9192`。
@@ -109,7 +111,7 @@ go run ./cmd/server 后端 9192
 | pikpak | `username`、`password`（token、验证码和设备 ID 由服务端自动处理并保存） |
 | wopan  | `access_token`、`refresh_token`，可选 `family_id`              |
 | onedrive | `refresh_token` |
-| googledrive | `refresh_token` |
+| googledrive | `client_id`、`client_secret`、`refresh_token`，可选 `access_token`、`token_url`、`api_base_url` |
 | localstorage | `path`（服务器上的已有视频目录，如 `/mnt/videos`） |
 
 ### PikPak 速度说明
@@ -120,7 +122,7 @@ go run ./cmd/server 后端 9192
 
 OneDrive 按 OpenList 默认应用方式调用 `https://api.oplist.org/onedrive/renewapi` 在线刷新 token，不需要配置 Azure 应用的 `client_id` / `client_secret` / `redirect_uri`。后台新建 OneDrive 时只需要填 OpenList 代刷得到的 `refresh_token`；服务端会默认挂载根目录并自动回写新 token。
 
-Google Drive 按 OpenList 在线 API 调用 `https://api.oplist.org/googleui/renewapi` 刷新 token。后台新建 Google Drive 时只需要填 OpenList Google Drive 获取到的 `refresh_token`。Google Drive 下载地址必须携带 `Authorization` 头，浏览器不能直接 302 使用，所以本站会由后端代理 `/p/stream` 播放，不加入零带宽 302 白名单。
+Google Drive 使用 Google OAuth token endpoint 刷新 token。后台新建 Google Drive 时需要填写 OAuth `client_id`、`client_secret` 和 `refresh_token`；服务端会自动刷新并回写 `access_token`。Google Drive 下载地址必须携带 `Authorization` 头，浏览器不能直接 302 使用，所以本站会由后端代理 `/p/stream` 播放，不加入零带宽 302 白名单。
 
 ## 文件名约定
 

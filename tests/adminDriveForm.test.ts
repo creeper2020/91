@@ -112,7 +112,7 @@ test("onedrive drive form only exposes required default-app fields", () => {
   assert.doesNotMatch(fields, /key: "site_id"/);
 });
 
-test("googledrive drive form only exposes refresh token", () => {
+test("googledrive drive form exposes oauth token fields", () => {
   assertDriveTypeOption("googledrive", "Google Drive");
 
   const match =
@@ -122,11 +122,13 @@ test("googledrive drive form only exposes refresh token", () => {
   assert.ok(match, "googledrive credential field block should be present");
   const fields = match[1];
 
+  assert.match(fields, /key: "client_id"/);
+  assert.match(fields, /key: "client_secret"/);
   assert.match(fields, /key: "refresh_token"/);
-  assert.doesNotMatch(fields, /key: "access_token"/);
+  assert.match(fields, /key: "access_token"/);
+  assert.match(fields, /key: "token_url"/);
+  assert.match(fields, /key: "api_base_url"/);
   assert.doesNotMatch(fields, /key: "api_url_address"/);
-  assert.doesNotMatch(fields, /key: "client_id"/);
-  assert.doesNotMatch(fields, /key: "client_secret"/);
 });
 
 test("pikpak drive form only exposes account login fields", () => {

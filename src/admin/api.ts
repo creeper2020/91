@@ -407,6 +407,8 @@ export type Settings = {
    * - 非空：显式指定。后端会校验 drive 存在且 kind ∈ {pikpak, p115, p123, onedrive}。
    */
   spider91UploadDriveId: string;
+  /** 用户上传/导入视频的默认目标网盘。空字符串 = 本地保存。*/
+  defaultUploadDriveId: string;
 };
 
 export function getSettings() {

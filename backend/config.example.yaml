@@ -58,6 +58,27 @@ preview:
   # 预览视频宽度
   width: 480
 
+external_import:
+  # Telegram Bot 等外部导入工具访问后端 API 的鉴权 token。
+  # 填写后以下端点生效：
+  #   POST /api/imports/external        — 提交链接导入任务
+  #   GET  /api/imports/external/{id}   — 查询任务状态
+  #   POST /api/imports/external-upload — 上传视频文件导入
+  token: ""
+  # Bot 访问后端的地址。本机 systemd 部署通常保持默认值即可。
+  api_base: "http://127.0.0.1:9191"
+  telegram:
+    bot_token: ""
+    api_id: 0
+    api_hash: ""
+    # 管理员 Telegram 用户 ID；首次白名单默认包含该用户。
+    admin_id: 0
+    # 相对路径按 config.yaml 所在目录解析。
+    data_dir: "./data/tg-import"
+
+# Bot 脚本：scripts/tg_import_bot.py
+# 下载器：scripts/import_downloader.py（依赖 aria2c、playwright、ffmpeg）
+
 # 盘列表。上线后请通过管理后台添加，本文件可留空。
 # kind 支持 quark / p115 / p123 / pikpak / wopan / onedrive / googledrive / localstorage。
 # OneDrive 示例：
@@ -73,7 +94,13 @@ preview:
 #   name: "我的 Google Drive"
 #   root_id: "root"
 #   params:
+#     client_id: "..."
+#     client_secret: "..."
 #     refresh_token: "..."
+#     # 可选：默认 https://oauth2.googleapis.com/token
+#     token_url: ""
+#     # 可选：默认 https://www.googleapis.com/drive/v3
+#     api_base_url: ""
 # 本地存储示例：
 # - id: "local-media"
 #   kind: "localstorage"

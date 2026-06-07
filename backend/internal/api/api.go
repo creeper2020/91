@@ -54,6 +54,10 @@ type Server struct {
 	LocalDir        string
 	UploadDir       string
 	OnVideoUploaded func(*catalog.Video)
+	Importer        *ImportManager
+	// ExternalImportToken enables token-protected import/upload endpoints for
+	// automation such as the Telegram bot. Empty disables those endpoints.
+	ExternalImportToken string
 
 	tagCacheMu    sync.Mutex
 	tagCacheUntil time.Time
@@ -130,6 +134,9 @@ func (s *Server) RegisterRoutes(r chi.Router, a *auth.Authenticator) {
 	// 公开端点：拿当前生效的主题。登录页本身要在挂前就能读，所以单独挂在
 	// 鉴权组之外。只暴露 theme 一个字段，避免泄露其他设置。
 	r.Get("/api/settings/theme", s.handleGetTheme)
+	r.Post("/api/imports/external", s.handleExternalCreateImport)
+	r.Get("/api/imports/external/{id}", s.handleExternalGetImport)
+	r.Post("/api/imports/external-upload", s.handleExternalUpload)
 
 	r.Group(func(r chi.Router) {
 		r.Use(a.Required)
@@ -142,6 +149,8 @@ func (s *Server) RegisterRoutes(r chi.Router, a *auth.Authenticator) {
 		r.Post("/api/video/{id}/view", s.handleView)
 		r.Post("/api/video/{id}/hide", s.handleHideVideo)
 		r.Post("/api/upload", s.handleUploadVideo)
+		r.Post("/api/imports", s.handleCreateImport)
+		r.Get("/api/imports/{id}", s.handleGetImport)
 		r.Get("/api/tags", s.handleTags)
 		r.Post("/api/shorts/next", s.handleShortsNext)
 
@@ -698,10 +707,6 @@ func (s *Server) handleHideVideo(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleUploadVideo(w http.ResponseWriter, r *http.Request) {
-	if s.LocalDir == "" {
-		writeErr(w, http.StatusInternalServerError, errors.New("local storage is not configured"))
-		return
-	}
 	if err := r.ParseMultipartForm(32 << 20); err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return
@@ -717,62 +722,139 @@ func (s *Server) handleUploadVideo(w http.ResponseWriter, r *http.Request) {
 	}
 	defer file.Close()
 
-	originalName := filepath.Base(strings.TrimSpace(header.Filename))
-	ext := strings.ToLower(filepath.Ext(originalName))
-	if _, ok := allowedUploadExtensions[ext]; !ok {
-		writeErr(w, http.StatusBadRequest, fmt.Errorf("unsupported video extension: %s", ext))
-		return
-	}
-
 	tags, err := parseUploadTags(uploadTagValues(r))
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
 
+	if s.Importer != nil {
+		if drv := s.Importer.defaultUploadDrive(); drv != nil {
+			video, err := s.Importer.ingestReaderToDrive(r.Context(), drv, file, filepath.Base(strings.TrimSpace(header.Filename)), r.FormValue("title"), tags, "用户上传")
+			if err != nil {
+				writeErr(w, uploadStatusCode(err), err)
+				return
+			}
+			s.Importer.notifyDriveUploadComplete(drv.ID())
+			writeJSON(w, http.StatusCreated, mapVideo(video))
+			return
+		}
+	}
+
+	video, err := s.ingestLocalVideo(r.Context(), localVideoIngestInput{
+		Reader:       file,
+		OriginalName: filepath.Base(strings.TrimSpace(header.Filename)),
+		Title:        r.FormValue("title"),
+		Tags:         tags,
+		Author:       "用户上传",
+	})
+	if err != nil {
+		writeErr(w, uploadStatusCode(err), err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, mapVideo(video))
+}
+
+// localVideoIngestInput 是 ingestLocalVideo 的入参，供普通上传和外部导入共用。
+type localVideoIngestInput struct {
+	Reader       io.Reader
+	OriginalName string
+	Title        string
+	Tags         []string
+	Author       string
+}
+
+type statusError struct {
+	status int
+	err    error
+}
+
+func (e statusError) Error() string {
+	if e.err == nil {
+		return http.StatusText(e.status)
+	}
+	return e.err.Error()
+}
+
+func (e statusError) Unwrap() error {
+	return e.err
+}
+
+func uploadStatusCode(err error) int {
+	var se statusError
+	if errors.As(err, &se) && se.status > 0 {
+		return se.status
+	}
+	return http.StatusInternalServerError
+}
+
+func uploadBadRequest(err error) error {
+	return statusError{status: http.StatusBadRequest, err: err}
+}
+
+// ingestLocalVideo 将一个视频文件写入本地存储并入库。
+// 普通上传（handleUploadVideo）和外部导入（ImportManager）共用此方法。
+func (s *Server) ingestLocalVideo(ctx context.Context, in localVideoIngestInput) (*catalog.Video, error) {
+	if s.localUploadDir() == "" {
+		return nil, errors.New("local storage is not configured")
+	}
+	if s.Catalog == nil {
+		return nil, errors.New("catalog is not configured")
+	}
+	if in.Reader == nil {
+		return nil, uploadBadRequest(errors.New("video file is required"))
+	}
+
+	originalName := filepath.Base(strings.TrimSpace(in.OriginalName))
+	if originalName == "." || originalName == string(filepath.Separator) || originalName == "" {
+		originalName = "video"
+	}
+	ext := strings.ToLower(filepath.Ext(originalName))
+	if _, ok := allowedUploadExtensions[ext]; !ok {
+		return nil, uploadBadRequest(fmt.Errorf("unsupported video extension: %s", ext))
+	}
+
 	now := time.Now()
-	title := strings.TrimSpace(r.FormValue("title"))
+	title := strings.TrimSpace(in.Title)
 	if title == "" {
 		title = uploadTitleFromFileName(originalName)
 	}
+	author := strings.TrimSpace(in.Author)
+	if author == "" {
+		author = "用户上传"
+	}
+	tags := append([]string(nil), in.Tags...)
 
 	uploadID, err := newUploadID(now)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err)
-		return
+		return nil, err
 	}
 	storedName := uploadID + ext
 	dst, err := s.localUploadFilePath(storedName)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err)
-		return
+		return nil, err
 	}
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-		writeErr(w, http.StatusInternalServerError, err)
-		return
+		return nil, err
 	}
 
 	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err)
-		return
+		return nil, err
 	}
-	size, copyErr := io.Copy(out, file)
+	size, copyErr := io.Copy(out, in.Reader)
 	closeErr := out.Close()
 	if copyErr != nil {
 		_ = os.Remove(dst)
-		writeErr(w, http.StatusInternalServerError, copyErr)
-		return
+		return nil, copyErr
 	}
 	if closeErr != nil {
 		_ = os.Remove(dst)
-		writeErr(w, http.StatusInternalServerError, closeErr)
-		return
+		return nil, closeErr
 	}
 	if size <= 0 {
 		_ = os.Remove(dst)
-		writeErr(w, http.StatusBadRequest, errors.New("uploaded video is empty"))
-		return
+		return nil, uploadBadRequest(errors.New("uploaded video is empty"))
 	}
 
 	video := &catalog.Video{
@@ -781,7 +863,7 @@ func (s *Server) handleUploadVideo(w http.ResponseWriter, r *http.Request) {
 		FileID:        storedName,
 		FileName:      originalName,
 		Title:         title,
-		Author:        "用户上传",
+		Author:        author,
 		Tags:          tags,
 		Size:          size,
 		Ext:           strings.TrimPrefix(ext, "."),
@@ -790,15 +872,14 @@ func (s *Server) handleUploadVideo(w http.ResponseWriter, r *http.Request) {
 		CreatedAt:     now,
 		UpdatedAt:     now,
 	}
-	if err := s.Catalog.UpsertVideo(r.Context(), video); err != nil {
+	if err := s.Catalog.UpsertVideo(ctx, video); err != nil {
 		_ = os.Remove(dst)
-		writeErr(w, http.StatusInternalServerError, err)
-		return
+		return nil, err
 	}
 	if s.OnVideoUploaded != nil {
 		s.OnVideoUploaded(video)
 	}
-	writeJSON(w, http.StatusCreated, mapVideo(video))
+	return video, nil
 }
 
 func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {

@@ -79,20 +79,31 @@ func main() {
 		spider91Crawlers:   make(map[string]*spider91.Crawler),
 	}
 	app.proxy = proxy.New(app.registry)
-	app.spider91Migrator = spider91migrate.New(spider91migrate.Config{
-		Catalog:          cat,
-		Registry:         app.registry,
-		GetTargetDriveID: func() string { return app.Spider91UploadDriveID() },
-		CommonThumbDir:   app.commonThumbsDir(),
-	})
 
 	// 初始化本地内置盘；外部云盘放到 HTTP 服务启动后异步挂载，避免上游
 	// 登录态校验拖慢端口监听。
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	app.spider91Migrator = spider91migrate.New(spider91migrate.Config{
+		Catalog:          cat,
+		Registry:         app.registry,
+		GetTargetDriveID: func() string { return app.Spider91UploadDriveID() },
+		CommonThumbDir:   app.commonThumbsDir(),
+		OnMigrated: func(videoID string) {
+			v, err := cat.GetVideo(ctx, videoID)
+			if err != nil {
+				log.Printf("[spider91migrate] enqueue migrated video %s: %v", videoID, err)
+				return
+			}
+			app.enqueueUploadedVideo(ctx, v)
+			app.scheduleScan(ctx, v.DriveID)
+		},
+	})
+
 	app.loadTheme(ctx)
 	app.loadSpider91UploadDriveID(ctx)
+	app.loadDefaultUploadDriveID(ctx)
 	if removed, err := app.cleanupOrphanDriveVideos(ctx); err != nil {
 		log.Printf("[cleanup] orphan drive videos: %v", err)
 	} else if removed > 0 {
@@ -120,15 +131,37 @@ func main() {
 	}
 
 	apiServer := &api.Server{
-		Catalog:   cat,
-		Proxy:     app.proxy,
-		LocalDir:  cfg.Storage.LocalPreviewDir,
-		UploadDir: app.localUploadDir(),
+		Catalog:             cat,
+		Proxy:               app.proxy,
+		LocalDir:            cfg.Storage.LocalPreviewDir,
+		UploadDir:           app.localUploadDir(),
+		ExternalImportToken: externalImportToken(cfg),
 		OnVideoUploaded: func(v *catalog.Video) {
 			app.enqueueUploadedVideo(ctx, v)
 		},
 		GetTheme: func() string { return app.Theme() },
 	}
+	importManager := api.NewImportManager(apiServer, api.ImportManagerConfig{
+		PythonPath: defaultImportPythonPath(cfg),
+		ScriptPath: defaultImportDownloaderPath(cfgPath),
+		TempDir:    filepath.Join(filepath.Dir(app.localUploadDir()), "imports"),
+		DefaultUploadDrive: func() drives.Drive {
+			id := app.DefaultUploadDriveID()
+			if id == "" {
+				return nil
+			}
+			drv, ok := app.registry.Get(id)
+			if !ok {
+				return nil
+			}
+			return drv
+		},
+		OnDriveUploadComplete: func(driveID string) {
+			app.scheduleScan(ctx, driveID)
+		},
+	})
+	apiServer.Importer = importManager
+	importManager.Start(ctx)
 
 	adminServer := &api.AdminServer{
 		Catalog:         cat,
@@ -228,6 +261,10 @@ func main() {
 		SetSpider91UploadDriveID: func(id string) error {
 			return app.SetSpider91UploadDriveID(ctx, id)
 		},
+		GetDefaultUploadDriveID: func() string { return app.DefaultUploadDriveID() },
+		SetDefaultUploadDriveID: func(id string) error {
+			return app.SetDefaultUploadDriveID(ctx, id)
+		},
 		OnRunNightlyJob: func() bool {
 			if app.nightlyRunner != nil {
 				return app.nightlyRunner.TriggerNow()
@@ -317,6 +354,7 @@ type App struct {
 	// 显式指定的 spider91 上传目标 drive ID。
 	// 空字符串表示本地保存不上传，不再自动挑选 pikpak/p115/p123/onedrive drive。
 	spider91UploadDriveID string
+	defaultUploadDriveID  string
 
 	// spider91Migrator 周期把 spider91 视频上传到目标 drive（PikPak、115、123 或 OneDrive）。
 	spider91Migrator *spider91migrate.Migrator
@@ -442,13 +480,49 @@ func (a *App) SetSpider91UploadDriveID(ctx context.Context, driveID string) erro
 			return fmt.Errorf("drive %q not found", driveID)
 		}
 		if !isSpider91UploadKind(d.Kind()) {
-			return fmt.Errorf("drive %q kind=%s, only pikpak, p115, p123 or onedrive can be spider91 upload target", driveID, d.Kind())
+			return fmt.Errorf("drive %q kind=%s, only pikpak, p115, p123, onedrive or googledrive can be spider91 upload target", driveID, d.Kind())
 		}
 	}
 	a.mu.Lock()
 	a.spider91UploadDriveID = driveID
 	a.mu.Unlock()
 	return a.cat.SetSetting(ctx, "spider91.upload_drive_id", driveID)
+}
+
+func (a *App) DefaultUploadDriveID() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.defaultUploadDriveID
+}
+
+// SetDefaultUploadDriveID 设置用户上传/导入视频的默认目标 drive ID。
+// 空字符串表示本地保存。drive 必须存在且 kind 为 pikpak / p115 / p123 / onedrive / googledrive。
+func (a *App) SetDefaultUploadDriveID(ctx context.Context, driveID string) error {
+	driveID = strings.TrimSpace(driveID)
+	if driveID != "" {
+		d, ok := a.registry.Get(driveID)
+		if !ok {
+			return fmt.Errorf("drive %q not found", driveID)
+		}
+		if !isSpider91UploadKind(d.Kind()) {
+			return fmt.Errorf("drive %q kind=%s, only pikpak, p115, p123, onedrive or googledrive can be default upload target", driveID, d.Kind())
+		}
+	}
+	a.mu.Lock()
+	a.defaultUploadDriveID = driveID
+	a.mu.Unlock()
+	return a.cat.SetSetting(ctx, "default.upload_drive_id", driveID)
+}
+
+func (a *App) loadDefaultUploadDriveID(ctx context.Context) {
+	v, err := a.cat.GetSetting(ctx, "default.upload_drive_id", "")
+	if err != nil {
+		log.Printf("[settings] load default upload drive: %v", err)
+		return
+	}
+	a.mu.Lock()
+	a.defaultUploadDriveID = strings.TrimSpace(v)
+	a.mu.Unlock()
 }
 
 func (a *App) nightlyJobStatus() api.NightlyJobStatus {
@@ -475,7 +549,7 @@ func formatOptionalRFC3339(t time.Time) string {
 // isSpider91UploadKind 是 spider91 迁移目标盘的 allowlist。
 // 与 spider91migrate.adaptUploadTarget 的支持范围保持一致。
 func isSpider91UploadKind(kind string) bool {
-	return kind == "pikpak" || kind == "p115" || kind == "p123" || kind == "onedrive"
+	return kind == "pikpak" || kind == "p115" || kind == "p123" || kind == "onedrive" || kind == "googledrive"
 }
 
 // loadSpider91UploadDriveID 从 DB 读上传目标 drive ID 设置；不存在时使用空串。
@@ -696,10 +770,8 @@ func (a *App) attachDriveUnlocked(ctx context.Context, d *catalog.Drive) error {
 			RefreshToken: d.Credentials["refresh_token"],
 			ClientID:     d.Credentials["client_id"],
 			ClientSecret: d.Credentials["client_secret"],
-			UseOnlineAPI: parseBoolDefault(d.Credentials["use_online_api"], true),
-			RenewAPIURL:  d.Credentials["api_url_address"],
-			OAuthURL:     d.Credentials["oauth_url"],
 			APIBaseURL:   d.Credentials["api_base_url"],
+			TokenURL:     d.Credentials["token_url"],
 			OnTokenUpdate: func(access, refresh string) {
 				if d.Credentials == nil {
 					d.Credentials = make(map[string]string)
@@ -2023,12 +2095,20 @@ func (a *App) enqueueUploadedVideo(ctx context.Context, v *catalog.Video) {
 	if thumbWorker != nil && v.ThumbnailURL == "" {
 		thumbWorker.Enqueue(v)
 	}
-	if worker != nil && a.teaserEnabledForDrive(ctx, v.DriveID) {
+	if worker != nil && shouldQueueUploadedPreview(v) && a.teaserEnabledForDrive(ctx, v.DriveID) {
 		worker.Enqueue(v)
 	}
 	if fingerprintWorker != nil {
 		fingerprintWorker.Enqueue(v)
 	}
+}
+
+func shouldQueueUploadedPreview(v *catalog.Video) bool {
+	if v == nil {
+		return false
+	}
+	status := strings.TrimSpace(v.PreviewStatus)
+	return status == "" || status == "pending"
 }
 
 func (a *App) regenPreview(ctx context.Context, videoID string) {
@@ -2586,4 +2666,53 @@ func parseBoolDefault(raw string, def bool) bool {
 		return def
 	}
 	return v
+}
+
+// externalImportToken 读取外部导入 API 的鉴权 token。
+// config.yaml 是主配置源；环境变量保留为旧部署兼容 fallback。
+func externalImportToken(cfg *config.Config) string {
+	if cfg != nil {
+		if v := strings.TrimSpace(cfg.ExternalImport.Token); v != "" {
+			return v
+		}
+	}
+	for _, key := range []string{"VIDEO_IMPORT_TOKEN", "IMPORT_API_TOKEN", "SYNC_TOKEN"} {
+		if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// defaultImportDownloaderPath 搜索 import_downloader.py 脚本位置。
+func defaultImportDownloaderPath(cfgPath string) string {
+	if v := strings.TrimSpace(os.Getenv("VIDEO_IMPORT_DOWNLOADER")); v != "" {
+		return v
+	}
+	candidates := []string{
+		filepath.Join(filepath.Dir(cfgPath), "scripts", "import_downloader.py"),
+		filepath.Join("..", "scripts", "import_downloader.py"),
+		filepath.Join("scripts", "import_downloader.py"),
+	}
+	for _, p := range candidates {
+		abs, err := filepath.Abs(p)
+		if err != nil {
+			continue
+		}
+		if _, err := os.Stat(abs); err == nil {
+			return abs
+		}
+	}
+	if len(candidates) > 0 {
+		return candidates[0]
+	}
+	return "import_downloader.py"
+}
+
+// defaultImportPythonPath 返回导入任务使用的 Python 解释器路径。
+func defaultImportPythonPath(cfg *config.Config) string {
+	if v := strings.TrimSpace(os.Getenv("VIDEO_IMPORT_PYTHON")); v != "" {
+		return v
+	}
+	return "python3"
 }

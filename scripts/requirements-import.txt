@@ -1,0 +1,4 @@
+playwright>=1.44
+pyrogram>=2.0
+requests>=2.31
+tgcrypto>=1.2

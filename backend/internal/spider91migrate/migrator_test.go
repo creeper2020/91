@@ -14,6 +14,7 @@ import (
 
 	"github.com/video-site/backend/internal/catalog"
 	"github.com/video-site/backend/internal/drives"
+	"github.com/video-site/backend/internal/drives/googledrive"
 	"github.com/video-site/backend/internal/drives/p123"
 	"github.com/video-site/backend/internal/drives/pikpak"
 	"github.com/video-site/backend/internal/drives/spider91"
@@ -1095,7 +1096,22 @@ func TestAdaptUploadTargetSupportsP123Driver(t *testing.T) {
 	}
 }
 
-// TestResolveTargetRejectsUnsupportedKind 验证当目标 drive 既不是 PikPak、115、123 也不是 OneDrive 时，
+func TestAdaptUploadTargetSupportsGoogleDriveDriver(t *testing.T) {
+	d := googledrive.New(googledrive.Config{
+		ID:          "google-target",
+		RootID:      "google-root",
+		AccessToken: "token-1",
+	})
+	target, err := adaptUploadTarget(d)
+	if err != nil {
+		t.Fatalf("adaptUploadTarget() error = %v", err)
+	}
+	if target.ID() != "google-target" || target.Kind() != "googledrive" || target.RootID() != "google-root" {
+		t.Fatalf("target id/kind/root = %q/%q/%q, want google-target/googledrive/google-root", target.ID(), target.Kind(), target.RootID())
+	}
+}
+
+// TestResolveTargetRejectsUnsupportedKind 验证当目标 drive 既不是 PikPak、115、123、OneDrive 也不是 Google Drive 时，
 // resolveTarget 拒绝并返回 error，让 runOnce 静默跳过（不会做破坏性变更）。
 func TestResolveTargetRejectsUnsupportedKind(t *testing.T) {
 	cat := setupCatalog(t)
