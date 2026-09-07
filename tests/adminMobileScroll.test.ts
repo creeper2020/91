@@ -65,13 +65,13 @@ test("admin shell follows CPA desktop-content and mobile-document scrolling", ()
     adminCss,
     /@media \(max-width: 768px\)[\s\S]*?\.admin-main--logs\s*\{[^}]*overflow-y:\s*(?:auto|scroll)/s
   );
-  assert.match(
+  assert.doesNotMatch(
     adminCss,
-    /@media \(max-width: 768px\)[\s\S]*?\.admin-config-section\s*\{[^}]*height:\s*clamp\(420px,\s*calc\(100dvh - var\(--admin-header-height\) - 260px\),\s*680px\);/s
+    /\.admin-config-section\s*\{[^}]*(?:^|;)\s*(?:min-|max-)?height\s*:/m
   );
-  assert.match(
+  assert.doesNotMatch(
     adminCss,
-    /\.admin-config-section\s*\{[^}]*height:\s*clamp\(520px,[^;]*780px\);[^}]*overflow-y:\s*auto;/s
+    /\.admin-config-section\s*\{[^}]*overflow(?:-y)?\s*:\s*(?:auto|scroll|hidden|clip)\b/s
   );
 });
 

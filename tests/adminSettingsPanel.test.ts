@@ -290,11 +290,11 @@ test("configuration panel follows the CLIProxy configuration workspace UI", () =
   );
   assert.match(
     adminCss,
-    /\.admin-config-section-nav\s*\{[^}]*position:\s*sticky[^}]*display:\s*flex;[^}]*overflow-x:\s*auto;[^}]*border-bottom:\s*1px solid var\(--border-default\)/s
+    /\.admin-config-section-nav\s*\{[^}]*position:\s*sticky[^}]*display:\s*flex;[^}]*overflow-x:\s*auto;[^}]*overflow-y:\s*hidden;[^}]*border-bottom:\s*1px solid var\(--border-default\)/s
   );
   assert.match(
     adminCss,
-    /\.admin-config-section-nav button::after\s*\{[^}]*bottom:\s*-1px;[^}]*height:\s*2px;[^}]*background:\s*transparent;/s
+    /\.admin-config-section-nav button::after\s*\{[^}]*bottom:\s*0;[^}]*height:\s*2px;[^}]*background:\s*transparent;/s
   );
   assert.match(
     adminCss,
@@ -305,7 +305,7 @@ test("configuration panel follows the CLIProxy configuration workspace UI", () =
   assert.match(adminCss, /\.admin-config-sections\s*\{[^}]*display:\s*block/s);
   assert.match(
     adminCss,
-    /\.admin-config-section\s*\{[^}]*border-radius:\s*8px;[^}]*background:\s*color-mix\(in srgb, var\(--bg-surface\) 50%, transparent\);/s
+    /\.admin-config-section\s*\{[^}]*border-radius:\s*8px;[^}]*background:\s*var\(--bg-surface\);/s
   );
   assert.match(
     adminCss,
@@ -364,10 +364,6 @@ test("configuration panel follows the CLIProxy configuration workspace UI", () =
     /admin-config-picker-field__value--time[\s\S]*?draft\.nightlyStartTime \|\| "--:--"[\s\S]*?event\.currentTarget\.showPicker\(\)/
   );
   assert.doesNotMatch(adminCss, /calendar-picker-indicator/);
-  assert.match(
-    adminCss,
-    /@media \(max-width: 768px\)[\s\S]*?\.admin-config-section\s*\{[^}]*height:\s*clamp\(420px,\s*calc\(100dvh - var\(--admin-header-height\) - 260px\),\s*680px\)/s
-  );
   assert.match(pageSource, /data-admin-floating-actions/);
 });
 

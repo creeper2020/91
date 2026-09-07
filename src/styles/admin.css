@@ -5487,9 +5487,10 @@ body.admin-mobile-nav-open {
 .admin-config-meta {
   display: flex;
   align-items: baseline;
-  flex: 0 0 auto;
+  flex: 0 1 auto;
   flex-wrap: nowrap;
   gap: 4px 8px;
+  min-width: 0;
   max-width: 100%;
   margin: 0;
   color: var(--text-muted);
@@ -5497,18 +5498,30 @@ body.admin-mobile-nav-open {
   font-size: 13px;
   font-weight: var(--weight-medium);
   font-variant-numeric: tabular-nums;
-  letter-spacing: 0.02em;
+  letter-spacing: 0;
   line-height: 1.4;
   white-space: nowrap;
 }
 
 .admin-config-meta::before {
   content: "▍";
+  flex-shrink: 0;
   align-self: center;
   margin-right: 1px;
   color: var(--success);
   font-size: 13px;
   line-height: 1;
+}
+
+.admin-config-meta > span {
+  flex-shrink: 0;
+}
+
+.admin-config-meta > .admin-config-meta__status {
+  flex-shrink: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .admin-config-meta__separator {
@@ -5618,9 +5631,9 @@ body.admin-mobile-nav-open {
   min-width: 0;
   padding: 0;
   overflow-x: auto;
+  overflow-y: hidden;
   border-bottom: 1px solid var(--border-default);
-  background: color-mix(in srgb, var(--bg-page) 90%, transparent);
-  backdrop-filter: blur(12px);
+  background: var(--bg-page);
   scrollbar-width: none;
 }
 
@@ -5653,7 +5666,7 @@ body.admin-mobile-nav-open {
   content: "";
   position: absolute;
   right: 10px;
-  bottom: -1px;
+  bottom: 0;
   left: 10px;
   height: 2px;
   border-radius: var(--radius-pill);
@@ -5664,7 +5677,7 @@ body.admin-mobile-nav-open {
 @media (hover: hover) and (pointer: fine) {
   .admin-config-section-nav button:hover {
     color: var(--text-strong);
-    background: color-mix(in srgb, var(--bg-elevated) 55%, transparent);
+    background: color-mix(in srgb, var(--bg-elevated) 55%, var(--bg-page));
   }
 }
 
@@ -5713,16 +5726,12 @@ body.admin-mobile-nav-open {
   width: 100%;
   max-width: 100%;
   min-width: 0;
-  height: clamp(520px, calc(100dvh - var(--admin-header-height) - 250px), 780px);
   box-sizing: border-box;
-  overflow-y: auto;
-  overscroll-behavior: auto;
   padding: clamp(20px, 2.4vw, 28px);
   border: 1px solid var(--border-default);
   border-radius: 8px;
-  background: color-mix(in srgb, var(--bg-surface) 50%, transparent);
+  background: var(--bg-surface);
   box-shadow: none;
-  scrollbar-width: thin;
 }
 
 .admin-config-section__header {
@@ -5891,7 +5900,7 @@ body.admin-mobile-nav-open {
   min-height: 38px;
   border: 1px solid var(--border-default);
   border-radius: 7px;
-  background: color-mix(in srgb, var(--bg-elevated) 84%, transparent);
+  background: var(--bg-elevated);
   box-shadow: inset 0 1px 0 color-mix(in srgb, white 4%, transparent);
   cursor: pointer;
   transition:
@@ -6007,7 +6016,7 @@ body.admin-mobile-nav-open {
   padding: 8px;
   border: 1px solid var(--border-default);
   border-radius: 8px;
-  background: color-mix(in srgb, var(--bg-surface) 76%, transparent);
+  background: var(--bg-surface);
 }
 
 .admin-config-source__search {
@@ -6169,7 +6178,7 @@ body.admin-mobile-nav-open {
 
 .admin-config-source__editor .cm-gutters {
   border-right: 1px solid var(--border-default);
-  background: color-mix(in srgb, var(--bg-elevated) 86%, transparent);
+  background: var(--bg-elevated);
   color: var(--text-faint);
 }
 
@@ -6213,11 +6222,10 @@ body.admin-mobile-nav-open {
   overflow-x: auto;
   border: 1px solid var(--border-default);
   border-radius: 8px;
-  background: color-mix(in srgb, var(--bg-surface) 92%, transparent);
+  background: var(--bg-surface);
   box-shadow: var(--shadow-lg);
   transform: translateX(-50%);
   scrollbar-width: none;
-  backdrop-filter: blur(14px);
 }
 
 .admin-config-actions::-webkit-scrollbar {
@@ -6523,12 +6531,10 @@ body.admin-mobile-nav-open {
   .admin-config-section-nav {
     top: calc(var(--admin-mobile-header-offset) + 8px);
     z-index: 12;
-    background: color-mix(in srgb, var(--bg-page) 94%, transparent);
   }
 
   .admin-config-section {
     gap: 14px;
-    height: clamp(420px, calc(100dvh - var(--admin-header-height) - 260px), 680px);
     padding: 16px;
   }
 
@@ -6624,7 +6630,16 @@ body.admin-mobile-nav-open {
 
 @media (max-width: 480px) {
   .admin-config-header {
-    flex-wrap: wrap;
+    gap: 8px;
+  }
+
+  .admin-config-meta {
+    gap: 2px;
+    font-size: 12px;
+  }
+
+  .admin-config-mode-switch button {
+    padding-inline: 6px;
   }
 
   .admin-config-row:not(.admin-config-row--inline) {

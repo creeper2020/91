@@ -137,7 +137,9 @@ function ConfigPageMeta({ statusClass, statusText }: ConfigPageMetaProps) {
       <span className="admin-config-meta__separator" aria-hidden="true">
         ·
       </span>
-      <span className={`admin-config-meta__status ${statusClass}`}>{statusText}</span>
+      <span className={`admin-config-meta__status ${statusClass}`} title={statusText}>
+        {statusText}
+      </span>
     </p>
   );
 }
