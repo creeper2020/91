@@ -13,7 +13,7 @@ permissions:
   contents: read
 
 jobs:
-  build-and-test:
+  build-windows-backend:
     runs-on: windows-latest
 
     defaults:
