@@ -67,3 +67,15 @@ test("admin route pages do not recalculate viewport height", () => {
     /\.admin-loading\s*\{[^}]*flex\s*:\s*1 1 auto;[^}]*min-height\s*:\s*0/s
   );
 });
+
+test("drive lists do not add spacing on top of the storage summary margin", () => {
+  const cardRule = adminCss.match(/\.admin-card\s*\{([^}]*)\}/)?.[1];
+  const gridRule = adminCss.match(/\.admin-drives-grid\s*\{([^}]*)\}/)?.[1];
+  assert.ok(cardRule);
+  assert.ok(gridRule);
+  assert.match(cardRule, /margin-bottom\s*:\s*var\(--space-5\)/);
+  assert.match(gridRule, /gap\s*:\s*var\(--space-4\)/);
+  assert.doesNotMatch(gridRule, /\bmargin(?:-top|-block(?:-start)?)?\s*:/);
+  assert.match(pageSources.drives, /className="admin-drives-grid"/);
+  assert.match(pageSources.driveLoading, /className="admin-drives-grid admin-drives-grid--skeleton"/);
+});

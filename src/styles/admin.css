@@ -7050,7 +7050,6 @@ body.admin-mobile-nav-open {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
   gap: var(--space-4);
-  margin-top: var(--space-4);
 }
 
 .admin-drive-card-skeleton {
