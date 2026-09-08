@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -101,5 +102,98 @@ func TestConcurrentScansAdmitAndDispatchEachSharedVideoOnce(t *testing.T) {
 	}
 	if stored != wantNew {
 		t.Fatalf("stored=%d, want %d physical rows", stored, wantNew)
+	}
+}
+
+func TestConcurrentScansPreserveTagsWithMetadataWrites(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	cat, err := catalog.Open(filepath.Join(t.TempDir(), "catalog.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = cat.Close() })
+	const label = "scan-keyword"
+	if _, err := cat.EnsureTag(ctx, label, "user"); err != nil {
+		t.Fatal(err)
+	}
+	if err := cat.UpsertVideo(ctx, &catalog.Video{ID: "background", DriveID: "other", FileID: "background", Title: "Background"}); err != nil {
+		t.Fatal(err)
+	}
+
+	const scanCount, filesPerScan = 6, 20
+	started := make(chan string, scanCount)
+	release := make(chan struct{})
+	type outcome struct {
+		result Result
+		err    error
+	}
+	finished := make(chan outcome, scanCount)
+	var tasks sync.WaitGroup
+	defer func() {
+		cancel()
+		tasks.Wait()
+	}()
+	for i := range scanCount {
+		source := &concurrentScanSource{id: fmt.Sprintf("drive-%d", i), started: started, release: release}
+		for j := range filesPerScan {
+			source.entries = append(source.entries, drives.Entry{
+				ID: fmt.Sprintf("file-%d", j), Name: fmt.Sprintf("%s-%d-%d.mp4", label, i, j), Size: 123,
+			})
+		}
+		tasks.Add(1)
+		go func() {
+			defer tasks.Done()
+			scan := New(cat, source, []string{".mp4"}, nil, nil)
+			result, err := scan.Scan(ctx, "root")
+			finished <- outcome{result, err}
+		}()
+	}
+	for range scanCount {
+		select {
+		case <-started:
+		case <-ctx.Done():
+			t.Fatal("scans did not start concurrently")
+		}
+	}
+	metadataFinished := make(chan error, 1)
+	tasks.Add(1)
+	go func() {
+		defer tasks.Done()
+		<-release
+		for i := 1; i <= scanCount*filesPerScan*2; i++ {
+			if err := cat.UpdateVideoMeta(ctx, "background", catalog.VideoMetaPatch{DurationSeconds: i}); err != nil {
+				metadataFinished <- err
+				return
+			}
+		}
+		metadataFinished <- nil
+	}()
+	close(release)
+	for range scanCount {
+		got := <-finished
+		if got.err != nil || len(got.result.Issues) != 0 {
+			t.Errorf("scan error=%v issues=%+v", got.err, got.result.Issues)
+		}
+		if got.result.Stats.Scanned != filesPerScan || got.result.Stats.Added != filesPerScan {
+			t.Errorf("scanned=%d added=%d, want %d of each", got.result.Stats.Scanned, got.result.Stats.Added, filesPerScan)
+		}
+	}
+	if err := <-metadataFinished; err != nil {
+		t.Fatalf("background metadata write: %v", err)
+	}
+	for i := range scanCount {
+		videos, err := cat.ListVideosByDrive(ctx, fmt.Sprintf("drive-%d", i))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(videos) != filesPerScan {
+			t.Fatalf("drive-%d stored %d videos, want %d", i, len(videos), filesPerScan)
+		}
+		for _, video := range videos {
+			if len(video.Tags) != 1 || video.Tags[0] != label {
+				t.Errorf("video %s tags=%v, want [%s]", video.ID, video.Tags, label)
+			}
+		}
 	}
 }

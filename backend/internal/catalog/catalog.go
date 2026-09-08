@@ -54,7 +54,10 @@ type CrawlerAssetCounts struct {
 }
 
 func Open(path string) (*Catalog, error) {
-	db, err := sql.Open("sqlite", path+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)")
+	// Reserve the writer before a read-modify-write transaction takes a snapshot.
+	// Deferred transactions can fail on promotion with SQLITE_BUSY even with a
+	// busy timeout. Read-only transactions and ordinary WAL reads stay concurrent.
+	db, err := sql.Open("sqlite", path+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_txlock=immediate")
 	if err != nil {
 		return nil, err
 	}

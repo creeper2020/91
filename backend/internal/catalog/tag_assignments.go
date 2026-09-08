@@ -329,9 +329,6 @@ func (c *Catalog) replaceVideoTags(ctx context.Context, videoID string, labels [
 // ReplaceAutoVideoTags 用给定分配覆盖视频的引擎标签（source IN auto/legacy），
 // 其它来源的行保留。人工锁定视频直接跳过。返回是否发生了变更。
 func (c *Catalog) ReplaceAutoVideoTags(ctx context.Context, videoID string, assignments []TagAssignment) (bool, error) {
-	if c.hasManualTags(ctx, videoID) {
-		return false, nil
-	}
 	tx, err := c.db.BeginTx(ctx, nil)
 	if err != nil {
 		return false, err
@@ -368,6 +365,10 @@ type desiredVideoTagAssignment struct {
 // replaceAutoVideoTagsTx 是 ReplaceAutoVideoTags 的事务内实现，供批量重算复用。
 // 返回是否有实际变更（用于跳过无谓的 JSON 同步）。
 func replaceAutoVideoTagsTx(ctx context.Context, tx *sql.Tx, videoID string, assignments []TagAssignment) (bool, error) {
+	// The manual lock may have changed while this transaction waited to write.
+	if hasManualTagsTx(ctx, tx, videoID) {
+		return false, nil
+	}
 	rows, err := tx.QueryContext(ctx, `
 SELECT t.id, t.label, COALESCE(vt.source, ''), COALESCE(vt.evidence, '')
   FROM video_tags vt
