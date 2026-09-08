@@ -850,6 +850,19 @@ func TestDriveConfigUpdateDefersEveryTaskSensitiveScope(t *testing.T) {
 		case <-time.After(2 * time.Second):
 			t.Fatalf("scope %d did not apply after task exit", scope)
 		}
+		// The callback runs before the configuration transition releases task admission.
+		deadline = time.Now().Add(2 * time.Second)
+		for app.driveConfigPending("drive-id") && time.Now().Before(deadline) {
+			time.Sleep(5 * time.Millisecond)
+		}
+		if app.driveConfigPending("drive-id") {
+			t.Fatalf("scope %d configuration remained pending after apply", scope)
+		}
+		_, done, admitted := app.registerDriveTaskContext(ctx, "drive-id", 0)
+		if !admitted {
+			t.Fatalf("scope %d task admission did not recover after deferred apply", scope)
+		}
+		done()
 	}
 }
 
