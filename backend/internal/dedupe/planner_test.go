@@ -33,6 +33,13 @@ func TestBuildCompressesIntermediateCanonicalToFinalSurvivor(t *testing.T) {
 		if action.CanonicalVideoID != "content-winner" {
 			t.Fatalf("action = %#v, want final canonical content-winner", action)
 		}
+		if action.VideoID == "exact-loser" {
+			if action.Evidence.Reason != ReasonSampledSHA256 || action.Evidence.MatchedVideoID != "exact-winner" || action.Evidence.SelectedVideoID != "exact-winner" || action.Evidence.SelectionReason != "more_complete_assets" {
+				t.Fatalf("exact evidence must keep its original match and selection: %+v", action.Evidence)
+			}
+		} else if action.Evidence.Reason != ReasonContent || action.Evidence.MatchedVideoID != "content-winner" || action.Evidence.SelectionReason != "larger_file" {
+			t.Fatalf("content evidence = %+v", action.Evidence)
+		}
 	}
 	if plan.Redirects["exact-loser"] != "content-winner" || plan.Redirects["exact-winner"] != "content-winner" {
 		t.Fatalf("redirects = %#v", plan.Redirects)
@@ -72,6 +79,16 @@ func TestBuildNearGroupsUseTransitiveClosure(t *testing.T) {
 	for _, action := range plan.Actions {
 		if action.CanonicalVideoID != "c" {
 			t.Fatalf("action = %#v, want largest member c", action)
+		}
+		if action.Evidence.Match == nil || action.Evidence.Match.Score != 0.96 || action.Evidence.Match.TitleScore != 1 {
+			t.Fatalf("evidence must use an observed successful comparison: %+v", action.Evidence)
+		}
+		wantMatch := "c"
+		if action.VideoID == "a" {
+			wantMatch = "b"
+		}
+		if action.Evidence.MatchedVideoID != wantMatch {
+			t.Fatalf("%s matched %s, want %s; cannot attribute A-B score to A-C", action.VideoID, action.Evidence.MatchedVideoID, wantMatch)
 		}
 	}
 }

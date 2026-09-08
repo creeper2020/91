@@ -202,7 +202,7 @@ func (s *plannerState) planNear(ctx context.Context, candidates []Candidate, com
 					}
 					if ssim >= mediasim.NearDuplicateThumbSSIMThreshold {
 						sets.union(i, j)
-						s.plan.Matches = append(s.plan.Matches, Match{Stage: StageNear, LeftID: left.ID, RightID: right.ID, Score: ssim})
+						s.plan.Matches = append(s.plan.Matches, Match{Stage: StageNear, LeftID: left.ID, RightID: right.ID, Score: ssim, TitleScore: titleScore})
 					}
 				}
 			}
@@ -323,6 +323,7 @@ func (s *plannerState) planContent(ctx context.Context, candidates []Candidate, 
 			s.plan.Matches = append(s.plan.Matches, Match{
 				Stage: StageContent, LeftID: content[j].ID, RightID: content[i].ID,
 				Score: cross.MedianBest, Comparisons: min(cross.LeftFrames, cross.RightFrames), Cross: true,
+				CrossDetails: &cross,
 			})
 		}
 	}
@@ -356,11 +357,15 @@ func (s *plannerState) markGroup(stage Stage, group []Candidate, canonical Candi
 		if candidate.ID == canonical.ID || !s.alive[candidate.ID] {
 			continue
 		}
+		if stage == StageExact {
+			s.plan.Matches = append(s.plan.Matches, Match{Stage: StageExact, LeftID: candidate.ID, RightID: canonical.ID})
+		}
 		s.alive[candidate.ID] = false
 		s.redirects[candidate.ID] = canonical.ID
 		s.plan.Actions = append(s.plan.Actions, DeleteAction{
 			Stage: stage, VideoID: candidate.ID, CanonicalVideoID: canonical.ID,
 			ExpectedUpdatedAt: candidate.ExpectedUpdatedAt,
+			Evidence:          NewEvidence(ReasonUnknown, "", canonical.ID, canonicalSelectionReason(stage, canonical, candidate)),
 		})
 		deleted++
 	}
@@ -407,7 +412,7 @@ func (s *plannerState) finalize() error {
 		}
 		s.plan.Redirects[duplicate] = canonical
 	}
-	return nil
+	return s.attachEvidence()
 }
 
 func groupedNearCandidates(candidates []nearCandidate, sets *disjointSet) [][]nearCandidate {

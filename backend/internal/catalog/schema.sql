@@ -165,6 +165,40 @@ CREATE INDEX IF NOT EXISTS idx_deleted_videos_drive_hash
 CREATE INDEX IF NOT EXISTS idx_deleted_videos_drive_signature
     ON deleted_videos(drive_id, file_name, size_bytes);
 
+-- Internal decision history, independent of tombstones and public visibility.
+-- Snapshots and evidence survive subsequent renames, merges and source removal.
+-- Repeated observations of an identical decision update one record.
+CREATE TABLE IF NOT EXISTS duplicate_records (
+    record_key          TEXT PRIMARY KEY,
+    origin              TEXT NOT NULL,
+    outcome             TEXT NOT NULL,
+    reason              TEXT NOT NULL,
+    video_id            TEXT NOT NULL,
+    drive_id            TEXT NOT NULL,
+    file_id             TEXT NOT NULL,
+    file_name           TEXT NOT NULL,
+    size_bytes          INTEGER NOT NULL,
+    canonical_video_id  TEXT NOT NULL,
+    matched_video_id    TEXT NOT NULL,
+    selection_reason    TEXT NOT NULL,
+    source_snapshot     TEXT NOT NULL,
+    canonical_snapshot  TEXT NOT NULL,
+    matched_snapshot    TEXT NOT NULL,
+    selected_snapshot   TEXT NOT NULL,
+    evidence            TEXT NOT NULL,
+    first_seen_at       INTEGER NOT NULL,
+    last_seen_at        INTEGER NOT NULL,
+    occurrences         INTEGER NOT NULL DEFAULT 1
+);
+CREATE INDEX IF NOT EXISTS idx_duplicate_records_source
+    ON duplicate_records(drive_id, file_id, last_seen_at);
+CREATE INDEX IF NOT EXISTS idx_duplicate_records_reason
+    ON duplicate_records(reason, last_seen_at);
+CREATE INDEX IF NOT EXISTS idx_duplicate_records_canonical
+    ON duplicate_records(canonical_video_id);
+CREATE INDEX IF NOT EXISTS idx_duplicate_records_video_outcome
+    ON duplicate_records(video_id, outcome);
+
 -- 爬虫来源记录。用于把已确认重复的 source_id 写回 seen 列表，
 -- 避免后续爬虫反复下载同一个候选视频。
 CREATE TABLE IF NOT EXISTS crawler_seen_sources (

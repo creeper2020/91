@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/video-site/backend/internal/catalog"
+	"github.com/video-site/backend/internal/dedupe"
 	"github.com/video-site/backend/internal/fingerprint"
 	"github.com/video-site/backend/internal/mediaasset"
 	"github.com/video-site/backend/internal/persistence"
@@ -756,8 +757,9 @@ func (c *Crawler) processItem(ctx context.Context, item Item) (bool, error) {
 	v.FingerprintStatus = "ready"
 	if duplicate, err := c.cfg.Catalog.FindVideoBySampledFingerprint(ctx, v); err == nil && duplicate != nil {
 		_ = os.Remove(videoPath)
-		if markErr := c.cfg.Catalog.MarkCrawlerSourceSeen(ctx, Kind, c.cfg.Driver.ID(), sourceID, "duplicate", duplicate.ID, sampled, size); markErr != nil {
-			log.Printf("[scriptcrawler] drive=%s source_id=%s mark duplicate seen: %v", c.cfg.Driver.ID(), sourceID, markErr)
+		evidence := dedupe.NewEvidence(dedupe.ReasonSampledSHA256, duplicate.ID, duplicate.ID, "existing_match")
+		if err := c.recordSkippedDuplicate(ctx, v, duplicate, sourceID, evidence); err != nil {
+			return false, fmt.Errorf("record fingerprint duplicate: %w", err)
 		}
 		log.Printf("[scriptcrawler] drive=%s source_id=%s duplicate_of=%s title=%q size=%d", c.cfg.Driver.ID(), sourceID, duplicate.ID, title, size)
 		return false, nil
@@ -815,6 +817,7 @@ func (c *Crawler) processItem(ctx context.Context, item Item) (bool, error) {
 				NewVideo:                  v,
 				ReplacedVideoID:           duplicate.video.ID,
 				ExpectedReplacedUpdatedAt: duplicate.video.UpdatedAt.UnixMilli(),
+				Evidence:                  duplicate.evidence(v.ID, v.ID, "larger_file"),
 				CrawlerSource: &catalog.CrawlerSourceSeen{
 					Kind: Kind, DriveID: c.cfg.Driver.ID(), SourceID: sourceID,
 					Status: "imported", SampledSHA256: sampled, Size: size,
@@ -840,8 +843,9 @@ func (c *Crawler) processItem(ctx context.Context, item Item) (bool, error) {
 			if commonThumbPath != "" {
 				_ = os.Remove(commonThumbPath)
 			}
-			if markErr := c.cfg.Catalog.MarkCrawlerSourceSeen(ctx, Kind, c.cfg.Driver.ID(), sourceID, "duplicate", duplicate.video.ID, sampled, size); markErr != nil {
-				log.Printf("[scriptcrawler] drive=%s source_id=%s mark near duplicate seen: %v", c.cfg.Driver.ID(), sourceID, markErr)
+			evidence := duplicate.evidence(duplicate.video.ID, duplicate.video.ID, "existing_not_smaller")
+			if err := c.recordSkippedDuplicate(ctx, v, duplicate.video, sourceID, evidence); err != nil {
+				return false, fmt.Errorf("record near duplicate: %w", err)
 			}
 			log.Printf("[scriptcrawler] drive=%s source_id=%s near_duplicate_of=%s old_size=%d new_size=%d title_similarity=%.3f thumbnail_ssim=%.3f content_ssim=%.3f title=%q duration=%d", c.cfg.Driver.ID(), sourceID, duplicate.video.ID, duplicate.video.Size, v.Size, duplicate.titleSimilarity, duplicate.thumbnailSSIM, duplicate.contentSSIM, title, v.DurationSeconds)
 			return false, nil

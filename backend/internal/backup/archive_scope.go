@@ -99,6 +99,18 @@ func validateArchiveDatabaseScope(ctx context.Context, databasePath string, mani
 			return err
 		}
 	}
+	// Older archives predate this optional internal history table.
+	if !selection.AllResources() {
+		var present int
+		if err := database.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='duplicate_records'`).Scan(&present); err != nil {
+			return err
+		}
+		if present != 0 {
+			if err := requireArchiveTableEmpty(ctx, database, "duplicate_records"); err != nil {
+				return fmt.Errorf("backup: duplicate history requires all resources: %w", err)
+			}
+		}
+	}
 	if !selection.UserInfo {
 		if err := requireArchiveTableEmpty(ctx, database, "users"); err != nil {
 			return fmt.Errorf("backup: user rows are present although user information was not selected: %w", err)

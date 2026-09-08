@@ -101,6 +101,8 @@ func (a *App) applyDuplicateMaintenancePlan(ctx context.Context, localDir string
 			CanonicalVideoID:           action.CanonicalVideoID,
 			ExpectedUpdatedAt:          action.ExpectedUpdatedAt,
 			CanonicalExpectedUpdatedAt: action.CanonicalExpectedUpdatedAt,
+			Origin:                     catalog.DuplicateOriginMaintenance,
+			Evidence:                   action.Evidence,
 		})
 	}
 	if err := persistence.RLockContext(ctx); err != nil {

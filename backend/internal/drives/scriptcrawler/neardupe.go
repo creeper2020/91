@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/video-site/backend/internal/catalog"
+	"github.com/video-site/backend/internal/dedupe"
 	"github.com/video-site/backend/internal/mediaasset"
 	"github.com/video-site/backend/internal/mediasim"
 	"github.com/video-site/backend/internal/preview"
@@ -20,6 +21,20 @@ type nearDuplicateMatch struct {
 	titleSimilarity float64
 	thumbnailSSIM   float64
 	contentSSIM     float64 // >0 时表示由内容通道命中
+	match           dedupe.Match
+}
+
+func (m *nearDuplicateMatch) evidence(matchedID, selectedID, selectionReason string) dedupe.Evidence {
+	evidence := dedupe.NewEvidence(m.match.Reason(), matchedID, selectedID, selectionReason)
+	evidence.Match = &m.match
+	return evidence
+}
+
+func (c *Crawler) recordSkippedDuplicate(ctx context.Context, source, canonical *catalog.Video, sourceID string, evidence dedupe.Evidence) error {
+	return c.cfg.Catalog.RecordCrawlerDuplicate(ctx, source, canonical, catalog.CrawlerSourceSeen{
+		Kind: Kind, DriveID: c.cfg.Driver.ID(), SourceID: sourceID,
+		Status: "duplicate", SampledSHA256: source.SampledSHA256, Size: source.Size,
+	}, evidence)
 }
 
 // findNearDuplicateVideo 在导入前查找库内近重复视频，两条通道：
@@ -79,6 +94,8 @@ func (c *Crawler) findTitleThumbDuplicate(source *catalog.Video, sourceThumbPath
 				video:           candidate,
 				titleSimilarity: titleScore,
 				thumbnailSSIM:   ssimScore,
+				match: dedupe.Match{Stage: dedupe.StageNear, LeftID: source.ID, RightID: candidate.ID,
+					Score: ssimScore, TitleScore: titleScore},
 			}
 		}
 	}
@@ -133,6 +150,8 @@ func (c *Crawler) findContentDuplicate(ctx context.Context, source *catalog.Vide
 			return &nearDuplicateMatch{
 				video:       candidate,
 				contentSSIM: cmp.MedianSSIM,
+				match: dedupe.Match{Stage: dedupe.StageContent, LeftID: source.ID, RightID: candidate.ID,
+					Score: cmp.MedianSSIM, Comparisons: cmp.Comparisons},
 			}, nil
 		}
 		// 候选 teaser 含兜底段时对齐帧整段错位，时长精确相等时用交叉匹配兜底。
@@ -143,6 +162,9 @@ func (c *Crawler) findContentDuplicate(ctx context.Context, source *catalog.Vide
 				return &nearDuplicateMatch{
 					video:       candidate,
 					contentSSIM: cross.MedianBest,
+					match: dedupe.Match{Stage: dedupe.StageContent, LeftID: source.ID, RightID: candidate.ID,
+						Score: cross.MedianBest, Comparisons: min(cross.LeftFrames, cross.RightFrames),
+						Cross: true, CrossDetails: &cross},
 				}, nil
 			}
 		}

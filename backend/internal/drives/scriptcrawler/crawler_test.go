@@ -754,6 +754,7 @@ func TestCrawlerRunOnceSkipsFingerprintDuplicateAndContinues(t *testing.T) {
 	if !seenSet["dup-source"] || !seenSet["unique-source"] {
 		t.Fatalf("seen ids = %#v, want duplicate and imported source ids", seen)
 	}
+	assertCrawlerDuplicateRecord(t, filepath.Join(tmp, "catalog.db"), BuildVideoID("demo", "dup-source"), "existing-canonical", "sampled_sha256", "skipped_import")
 }
 
 func TestCrawlerProcessItemSkipsNearDuplicateByTitleDurationAndThumbnail(t *testing.T) {
@@ -846,6 +847,7 @@ func TestCrawlerProcessItemSkipsNearDuplicateByTitleDurationAndThumbnail(t *test
 	if !hasString(seen, "near-source") {
 		t.Fatalf("seen ids = %#v, want near-source", seen)
 	}
+	assertCrawlerDuplicateRecord(t, filepath.Join(tmp, "catalog.db"), BuildVideoID("demo", "near-source"), canonicalID, "title_duration_thumbnail", "skipped_import")
 }
 
 func TestCrawlerProcessItemKeepsLargerNearDuplicate(t *testing.T) {
@@ -941,6 +943,7 @@ func TestCrawlerProcessItemKeepsLargerNearDuplicate(t *testing.T) {
 	if _, err := jpeg.Decode(normalizedThumb); err != nil {
 		t.Fatalf("crawler thumbnail was not normalized to JPEG: %v", err)
 	}
+	assertCrawlerDuplicateRecord(t, filepath.Join(tmp, "catalog.db"), smallerID, larger.ID, "title_duration_thumbnail", "replaced")
 }
 
 func TestCrawlerRunOnceRejectsInvalidDownloadedVideo(t *testing.T) {

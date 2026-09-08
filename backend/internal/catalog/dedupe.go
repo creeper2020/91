@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/video-site/backend/internal/dedupe"
 )
 
 var ErrDuplicatePlanStale = errors.New("catalog: duplicate plan is stale")
@@ -19,6 +21,8 @@ type DuplicateVideoDeletion struct {
 	CanonicalVideoID           string
 	ExpectedUpdatedAt          int64
 	CanonicalExpectedUpdatedAt int64
+	Origin                     string
+	Evidence                   dedupe.Evidence
 }
 
 type DuplicateAssetCleanupJob struct {
@@ -42,6 +46,7 @@ type DuplicateVideoReplacement struct {
 	ReplacedVideoID           string
 	ExpectedReplacedUpdatedAt int64
 	CrawlerSource             *CrawlerSourceSeen
+	Evidence                  dedupe.Evidence
 }
 
 // ApplyDuplicateVideoDeletions atomically applies a finalized hard-dedupe plan.
@@ -113,6 +118,17 @@ func (c *Catalog) ApplyDuplicateVideoDeletions(ctx context.Context, deletions []
 		}
 	}
 
+	// Snapshot all matching and intermediate winner rows before retiring any of
+	// them. A later failure rolls these records back with the entire merge.
+	for _, deletion := range normalized {
+		origin := deletion.Origin
+		if origin == "" {
+			origin = DuplicateOriginMaintenance
+		}
+		if err := recordDuplicateMerge(ctx, tx, origin, DuplicateOutcomeMerged, videos[deletion.VideoID], deletion.CanonicalVideoID, deletion.Evidence); err != nil {
+			return err
+		}
+	}
 	for _, deletion := range normalized {
 		if err := mergeAndRetireDuplicateVideoTx(ctx, tx, videos[deletion.VideoID], deletion.CanonicalVideoID); err != nil {
 			return err
@@ -161,6 +177,9 @@ func (c *Catalog) ReplaceDuplicateVideo(ctx context.Context, replacement Duplica
 		return err
 	}
 	if _, err := upsertVideoRow(ctx, tx, replacement.NewVideo); err != nil {
+		return err
+	}
+	if err := recordDuplicateMerge(ctx, tx, DuplicateOriginCrawler, DuplicateOutcomeReplaced, oldVideo, newID, replacement.Evidence); err != nil {
 		return err
 	}
 	if err := mergeAndRetireDuplicateVideoTx(ctx, tx, oldVideo, newID); err != nil {

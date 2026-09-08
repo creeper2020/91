@@ -149,10 +149,13 @@ func (s *Scanner) reconcileExisting(
 		}
 	}
 
-	duplicate, err := s.Catalog.FindScannedVideoDuplicate(ctx, &catalog.Video{
+	source := &catalog.Video{
 		ID: existing.ID, DriveID: s.Drive.ID(), ContentHash: entry.Hash,
-		FileName: entry.Name, Size: entry.Size,
-	}, result.Snapshot.SeenFileIDs)
+		FileID: entry.ID, FileName: entry.Name, Title: displayTitle, Size: entry.Size,
+		ParentID: file.ParentID, DirName: file.DirName,
+		AncestorDirIDs: append([]string(nil), file.AncestorDirIDs...),
+	}
+	duplicate, err := s.Catalog.FindScannedVideoDuplicate(ctx, source, result.Snapshot.SeenFileIDs)
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return ctxErr
@@ -161,6 +164,13 @@ func (s *Scanner) reconcileExisting(
 		return nil
 	}
 	if duplicate != nil {
+		if err := s.Catalog.RecordScannedDuplicate(ctx, source, duplicate); err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
+			result.addIssue(file, IssueDuplicate, err)
+			return nil
+		}
 		result.Duplicates++
 		return nil
 	}

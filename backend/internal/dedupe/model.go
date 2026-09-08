@@ -5,6 +5,8 @@ package dedupe
 import (
 	"errors"
 	"time"
+
+	"github.com/video-site/backend/internal/mediasim"
 )
 
 // Stage identifies the maintenance channel that connected a duplicate group.
@@ -56,6 +58,7 @@ type DeleteAction struct {
 	CanonicalVideoID           string
 	ExpectedUpdatedAt          int64
 	CanonicalExpectedUpdatedAt int64
+	Evidence                   Evidence
 }
 
 // Group is one connected component produced by a channel before later-channel
@@ -71,12 +74,16 @@ type Group struct {
 // returned for operational logging; group membership remains transitive even
 // when two members do not have a direct edge.
 type Match struct {
-	Stage       Stage
-	LeftID      string
-	RightID     string
-	Score       float64
-	Comparisons int
-	Cross       bool
+	Stage       Stage   `json:"stage"`
+	LeftID      string  `json:"leftId"`
+	RightID     string  `json:"rightId"`
+	Score       float64 `json:"score,omitempty"`
+	Comparisons int     `json:"comparisons,omitempty"`
+	Cross       bool    `json:"cross,omitempty"`
+	TitleScore  float64 `json:"titleScore,omitempty"`
+	// CrossDetails preserves both directional counts; MedianBest alone is not
+	// the criterion used to accept a cross match.
+	CrossDetails *mediasim.FrameSignatureCrossComparison `json:"crossDetails,omitempty"`
 }
 
 // Issue is a non-fatal media comparison problem. The affected candidate or

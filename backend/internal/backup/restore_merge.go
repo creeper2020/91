@@ -132,6 +132,12 @@ func mergeSelectiveRestoreDatabase(
 			return err
 		}
 	}
+	if selection.AllResources() {
+		if err := mergeDuplicateRecords(ctx, tx); err != nil {
+			rollback()
+			return err
+		}
+	}
 	if err := mergeTags(ctx, tx); err != nil {
 		rollback()
 		return err
@@ -300,6 +306,26 @@ func copyCommonTableRows(
 		return fmt.Errorf("backup: merge %s: %w", table, err)
 	}
 	return nil
+}
+
+// Historical IDs and snapshots describe the environment in which a decision
+// happened, so they are not rewritten during restore or cleared with live rows.
+// Merging the same archive twice must not double its observation counters.
+func mergeDuplicateRecords(ctx context.Context, tx *sql.Tx) error {
+	columns, err := tableColumnNames(ctx, tx, "backup_source", "duplicate_records")
+	if err != nil || len(columns) == 0 {
+		return err
+	}
+	if err := copyCommonTableRows(ctx, tx, "duplicate_records", nil); err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `
+UPDATE main.duplicate_records AS target
+   SET first_seen_at = MIN(first_seen_at, (SELECT first_seen_at FROM backup_source.duplicate_records WHERE record_key = target.record_key)),
+       last_seen_at = MAX(last_seen_at, (SELECT last_seen_at FROM backup_source.duplicate_records WHERE record_key = target.record_key)),
+       occurrences = MAX(occurrences, (SELECT occurrences FROM backup_source.duplicate_records WHERE record_key = target.record_key))
+ WHERE record_key IN (SELECT record_key FROM backup_source.duplicate_records)`)
+	return err
 }
 
 func mergeRemoteUploadJobs(ctx context.Context, tx *sql.Tx) error {

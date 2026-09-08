@@ -205,6 +205,13 @@ func filterSnapshotDatabase(
 	}
 
 	if !allResourcesSelected {
+		// A decision can contain snapshots from several resource types. Export
+		// this history only with all resources, so a partial backup cannot carry
+		// file metadata from an unselected storage through comparison evidence.
+		if _, err := tx.ExecContext(ctx, `DELETE FROM duplicate_records`); err != nil {
+			rollback()
+			return snapshotSelectionState{}, err
+		}
 		if _, err := tx.ExecContext(ctx, `
 DELETE FROM video_reaction_visits
  WHERE video_id NOT IN (SELECT id FROM videos WHERE drive_id IN (SELECT id FROM backup_selected_drives))`); err != nil {

@@ -229,6 +229,8 @@ func applyPlan(ctx context.Context, cat *catalog.Catalog, localDir string, plan 
 			CanonicalVideoID:           action.CanonicalVideoID,
 			ExpectedUpdatedAt:          action.ExpectedUpdatedAt,
 			CanonicalExpectedUpdatedAt: action.CanonicalExpectedUpdatedAt,
+			Origin:                     catalog.DuplicateOriginCommand,
+			Evidence:                   action.Evidence,
 		})
 	}
 	var applyErr error
