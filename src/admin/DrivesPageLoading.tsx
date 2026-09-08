@@ -62,7 +62,7 @@ export function DriveDetailLoading({ onBack }: { onBack: () => void }) {
         aria-busy="true"
       >
         <span className="sr-only">正在加载网盘详情</span>
-        <div aria-hidden="true">
+        <div className="admin-drive-detail-layout__info" aria-hidden="true">
           <div className="admin-detail-card">
             <header className="admin-detail-card__title">
               <div className="admin-detail-card__title-left">
@@ -107,21 +107,9 @@ export function DriveDetailLoading({ onBack }: { onBack: () => void }) {
               </button>
             </div>
           </div>
-
-          <div className="admin-detail-card">
-            <header className="admin-detail-card__title">
-              <div className="admin-detail-card__title-left">
-                <FolderX size={16} />
-                <span>扫描跳过目录</span>
-              </div>
-            </header>
-            <div className="admin-detail-tree-container">
-              <SkipDirsLoadingIndicator />
-            </div>
-          </div>
         </div>
 
-        <div aria-hidden="true">
+        <div className="admin-drive-detail-layout__status" aria-hidden="true">
           <div className="admin-detail-card">
             <header className="admin-detail-card__title">
               <div className="admin-detail-card__title-left">
@@ -187,6 +175,20 @@ export function DriveDetailLoading({ onBack }: { onBack: () => void }) {
                   <strong>{EMPTY_VALUE}</strong>
                 </div>
               ))}
+            </div>
+          </div>
+        </div>
+
+        <div className="admin-drive-detail-layout__skip-dirs" aria-hidden="true">
+          <div className="admin-detail-card">
+            <header className="admin-detail-card__title">
+              <div className="admin-detail-card__title-left">
+                <FolderX size={16} />
+                <span>扫描跳过目录</span>
+              </div>
+            </header>
+            <div className="admin-detail-tree-container">
+              <SkipDirsLoadingIndicator />
             </div>
           </div>
         </div>

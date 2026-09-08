@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useRef, useState } from "react";
-import { ChevronRight, FolderX } from "lucide-react";
+import { useCallback, useEffect, useRef, useState, type CSSProperties } from "react";
+import { ChevronRight, Eye, EyeOff, Folder, FolderOpen, FolderX } from "lucide-react";
 import * as api from "../api";
 import { useToast } from "../ToastContext";
 import { SkipDirsLoadingIndicator } from "./SkipDirsLoadingIndicator";
@@ -188,7 +188,7 @@ export function SkipDirsPanel({ drive, onSaved }: SkipDirsPanelProps) {
       : {
           pending: "保存中…",
           saving: "保存中…",
-          saved: "已自动保存并生效",
+          saved: "已保存",
           deferred: "已保存，任务结束后生效",
           error: "保存失败，正在重试…",
         }[saveStatus];
@@ -202,7 +202,7 @@ export function SkipDirsPanel({ drive, onSaved }: SkipDirsPanelProps) {
           : "";
 
   return (
-    <div className="admin-detail-card">
+    <div className="admin-detail-card admin-skipdirs-panel">
       <header className="admin-detail-card__title">
         <div className="admin-detail-card__title-left">
           <FolderX size={16} />
@@ -267,7 +267,8 @@ function DirTreeNode({
 
   const isRoot = depth === 0;
   const isSelected = id !== "" && selected.has(id);
-  const dimmed = ancestorSkipped;
+  const dimmed = ancestorSkipped || isSelected;
+  const visibilityLabel = `${isSelected ? "取消隐藏目录" : "隐藏目录"} ${name}`;
   const showLoading = open && !loaded && !error;
 
   const loadChildren = useCallback(async () => {
@@ -299,35 +300,42 @@ function DirTreeNode({
     <div>
       {!isRoot && (
         <div
-          className={`admin-skipdirs-row${dimmed && !isSelected ? " is-dimmed" : ""}`}
+          className={`admin-skipdirs-row${dimmed ? " is-dimmed" : ""}`}
+          style={{ "--depth": depth - 1 } as CSSProperties}
         >
           <button
             type="button"
             onClick={handleToggleOpen}
             className={`admin-skipdirs-toggle${open ? " is-open" : ""}`}
-            aria-label={open ? "折叠" : "展开"}
+            aria-label={`${open ? "折叠" : "展开"}目录 ${name}`}
             aria-expanded={open}
+            title={name}
           >
-            <ChevronRight size={14} />
+            <ChevronRight className="admin-skipdirs-chevron" size={14} aria-hidden="true" />
+            {open ? (
+              <FolderOpen className="admin-skipdirs-folder" size={16} aria-hidden="true" />
+            ) : (
+              <Folder className="admin-skipdirs-folder" size={16} aria-hidden="true" />
+            )}
+            <span className="admin-skipdirs-name">{name}</span>
           </button>
 
-          <input
-            type="checkbox"
-            className="admin-skipdirs-checkbox"
-            checked={isSelected}
-            onChange={() => onToggle(id)}
+          <button
+            type="button"
+            className={`admin-skipdirs-visibility${isSelected ? " is-hidden" : ""}`}
+            aria-pressed={isSelected}
+            onClick={() => onToggle(id)}
             disabled={disabled}
-            aria-label={`跳过目录 ${name}`}
-          />
-
-          <span className="admin-skipdirs-name" title={name} onClick={handleToggleOpen}>
-            {name}
-          </span>
+            aria-label={visibilityLabel}
+            title={ancestorSkipped ? `${visibilityLabel}（父目录已隐藏）` : visibilityLabel}
+          >
+            {isSelected ? <EyeOff size={16} aria-hidden="true" /> : <Eye size={16} aria-hidden="true" />}
+          </button>
         </div>
       )}
 
       {open && (
-        <div className={isRoot ? undefined : "admin-skipdirs-children"}>
+        <div style={{ "--depth": depth } as CSSProperties}>
           {showLoading && <SkipDirsLoadingIndicator />}
           {error && <div className="admin-skipdirs-status is-error">{error}</div>}
           {loaded && !error && children.length === 0 && (

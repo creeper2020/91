@@ -597,7 +597,7 @@ export function DrivesPage() {
         </header>
 
         <div className="admin-drive-detail-layout">
-          <div>
+          <div className="admin-drive-detail-layout__info">
             <div className="admin-detail-card">
               <header className="admin-detail-card__title">
                 <div className="admin-detail-card__title-left">
@@ -669,24 +669,9 @@ export function DrivesPage() {
                 </button>
               </div>
             </div>
-
-            <SkipDirsPanel
-              key={d.id}
-              drive={d}
-              onSaved={(saved) => {
-                // Invalidate list requests that began before this write. Their
-                // old snapshot must not overwrite the just-confirmed value.
-                driveListRequestVersion.current += 1;
-                setList((prev) =>
-                  prev.map((item) =>
-                    item.id === saved.id ? { ...item, skipDirIds: saved.skipDirIds } : item
-                  )
-                );
-              }}
-            />
           </div>
 
-          <div>
+          <div className="admin-drive-detail-layout__status">
             <DriveGenerationPanel
               d={d}
               regenFailedId={regenFailedId}
@@ -721,6 +706,23 @@ export function DrivesPage() {
                 </div>
               </div>
             </div>
+          </div>
+
+          <div className="admin-drive-detail-layout__skip-dirs">
+            <SkipDirsPanel
+              key={d.id}
+              drive={d}
+              onSaved={(saved) => {
+                // Invalidate list requests that began before this write. Their
+                // old snapshot must not overwrite the just-confirmed value.
+                driveListRequestVersion.current += 1;
+                setList((prev) =>
+                  prev.map((item) =>
+                    item.id === saved.id ? { ...item, skipDirIds: saved.skipDirIds } : item
+                  )
+                );
+              }}
+            />
           </div>
         </div>
 

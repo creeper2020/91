@@ -1297,8 +1297,9 @@ test("drive detail refresh state uses the detail skeleton without list actions",
   assert.match(skipDirsPanelSource, /\{showLoading && <SkipDirsLoadingIndicator \/>\}/);
   assert.match(
     skipDirsLoadingIndicatorSource,
-    /className="lds-ellipsis is-xs"/
+    /<div className="admin-skipdirs-status" role="status">\s*加载中\s*<\/div>/
   );
+  assert.doesNotMatch(skipDirsLoadingIndicatorSource, /lds-ellipsis|<span|aria-hidden/);
 });
 
 test("drive discard confirmation matches delete confirmation modal styling", () => {
@@ -1396,18 +1397,63 @@ test("drive preview generation uses an accessible slider switch", () => {
   assert.doesNotMatch(driveComponentsSource, /预览视频：开|预览视频：关|PowerOff/);
 });
 
-test("drive skip directory tree uses a solid selection box without status pills", () => {
+test("drive skip directory tree uses persistent visibility icons without extra actions", () => {
   assert.doesNotMatch(skipDirsPanelSource, /SelectedDirsChips/);
   assert.doesNotMatch(skipDirsPanelSource, /admin-mono-cell/);
   assert.doesNotMatch(skipDirsPanelSource, /根目录/);
   assert.match(skipDirsPanelSource, /\{name\}/);
   assert.doesNotMatch(skipDirsPanelSource, /admin-skipdirs-flag|已跳过/);
-  assert.doesNotMatch(adminCss, /\.admin-skipdirs-checkbox(?::checked)?::before/);
+  assert.doesNotMatch(skipDirsPanelSource, /type="checkbox"|admin-skipdirs-checkbox/);
+  assert.doesNotMatch(adminCss, /\.admin-skipdirs-checkbox/);
+  assert.match(skipDirsPanelSource, /<EyeOff size=\{16\} aria-hidden="true" \/>/);
+  assert.match(skipDirsPanelSource, /<Eye size=\{16\} aria-hidden="true" \/>/);
+  assert.match(skipDirsPanelSource, /className=\{`admin-skipdirs-visibility\$\{isSelected \? " is-hidden" : ""\}`\}/);
   assert.match(
     adminCss,
-    /\.admin-skipdirs-checkbox:checked\s*\{[^}]*border-color:\s*var\(--accent\)[^}]*background:\s*var\(--accent\)/s
+    /\.admin-skipdirs-visibility\.is-hidden\s*\{[^}]*background:\s*var\(--accent-softer\);[^}]*color:\s*var\(--accent\);/s
   );
+  assert.match(skipDirsPanelSource, /aria-pressed=\{isSelected\}/);
+  assert.match(skipDirsPanelSource, /onClick=\{\(\) => onToggle\(id\)\}/);
+  assert.match(skipDirsPanelSource, /aria-label=\{visibilityLabel\}/);
+  assert.match(skipDirsPanelSource, /title=\{ancestorSkipped \?/);
+  assert.doesNotMatch(skipDirsPanelSource, /Trash2|Edit3|FolderPlus|onDoubleClick/);
+  assert.match(
+    adminCss,
+    /\.admin-skipdirs-visibility\s*\{[^}]*display:\s*grid;[^}]*flex:\s*0 0 28px;/s
+  );
+  assert.doesNotMatch(adminCss, /\.admin-skipdirs-visibility[^{}]*\{[^}]*(?:opacity:\s*0\s*;|visibility:\s*hidden|display:\s*none|pointer-events:\s*none)/s);
   assert.doesNotMatch(adminCss, /\.admin-skipdirs-flag\s*\{/);
+});
+
+test("drive directory rows use folder icons and independent expand and hide buttons", () => {
+  assert.match(skipDirsPanelSource, /<FolderOpen className="admin-skipdirs-folder"/);
+  assert.match(skipDirsPanelSource, /<Folder className="admin-skipdirs-folder"/);
+  assert.match(skipDirsPanelSource, /aria-expanded=\{open\}/);
+  assert.match(skipDirsPanelSource, /<span className="admin-skipdirs-name">\{name\}<\/span>\s*<\/button>/);
+  assert.match(skipDirsPanelSource, /const dimmed = ancestorSkipped \|\| isSelected/);
+  assert.match(skipDirsPanelSource, /listDriveDirChildren\(driveId, id \|\| undefined\)/);
+  assert.match(adminCss, /\.admin-skipdirs-row\s*\{[^}]*height:\s*32px;[^}]*18px/s);
+  assert.match(adminCss, /\.admin-skipdirs-toggle\s*\{[^}]*min-width:\s*0/s);
+  assert.match(adminCss, /\.admin-drive-detail-layout\s*\{[^}]*grid-template-columns:\s*minmax\(0, 1\.2fr\) minmax\(0, 1fr\)/s);
+  assert.match(adminCss, /@media \(max-width: 1024px\)\s*\{\s*\.admin-drive-detail-layout\s*\{\s*grid-template-columns:\s*minmax\(0, 1fr\)/s);
+  assert.match(adminCss, /\.admin-skipdirs-toggle\.is-open \.admin-skipdirs-chevron\s*\{[^}]*transform:\s*rotate\(90deg\)/s);
+  assert.match(adminCss, /\.admin-skipdirs-visibility:focus-visible/);
+  assert.match(adminCss, /@media \(pointer: coarse\)\s*\{\s*\.admin-skipdirs-row\s*\{\s*height:\s*40px;/s);
+});
+
+test("drive skip directories follow status panels on mobile, including loading", () => {
+  for (const source of [drivesPageSource, drivesPageLoadingSource]) {
+    const info = source.indexOf('className="admin-drive-detail-layout__info"');
+    const status = source.indexOf('className="admin-drive-detail-layout__status"');
+    const skipDirs = source.indexOf('className="admin-drive-detail-layout__skip-dirs"');
+    const storage = source.indexOf("本地存储占用", status);
+    assert.ok(info >= 0 && status > info && skipDirs > status);
+    assert.ok(storage > status && storage < skipDirs);
+  }
+  assert.equal(drivesPageSource.match(/<SkipDirsPanel\b/g)?.length, 1);
+  assert.match(adminCss, /\.admin-drive-detail-layout\s*\{[^}]*grid-template-areas:\s*"info status"\s*"skip-dirs status"/s);
+  assert.match(adminCss, /@media \(max-width: 1024px\)\s*\{\s*\.admin-drive-detail-layout\s*\{[^}]*grid-template-areas:\s*"info"\s*"status"\s*"skip-dirs"/s);
+  assert.match(adminCss, /\.admin-drive-detail-layout > div > \.admin-detail-card:last-child\s*\{\s*margin-bottom:\s*0;/s);
 });
 
 test("drive skip directory panel omits the deferred policy cleanup notice", () => {
@@ -1430,6 +1476,8 @@ test("drive skip directory selections auto-save without polling away local edits
     /draftRevisionRef\.current !== savedRevisionRef\.current/
   );
   assert.match(skipDirsPanelSource, /保存失败，正在重试…/);
+  assert.match(skipDirsPanelSource, /saved: "已保存"/);
+  assert.doesNotMatch(skipDirsPanelSource, /已自动保存并生效/);
   assert.match(skipDirsPanelSource, /已保存，任务结束后生效/);
   assert.doesNotMatch(skipDirsPanelSource, /drive\.scanGenerationStatus\?\.state/);
   assert.match(skipDirsPanelSource, /disabled=\{disabled\}/);
