@@ -5795,6 +5795,77 @@ body.admin-mobile-nav-open {
   background: transparent;
 }
 
+.admin-config-schedule-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 2fr);
+  gap: 16px;
+  min-width: 0;
+}
+
+.admin-config-schedule-row > .admin-config-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-content: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-width: 0;
+}
+
+.admin-config-schedule-row .admin-config-control--picker {
+  grid-template-columns: minmax(0, 1fr);
+  min-width: 0;
+  max-width: 100%;
+}
+
+.admin-config-schedule-row .admin-config-picker-field {
+  box-sizing: border-box;
+  max-width: 100%;
+}
+
+.admin-config-schedule-row .admin-config-picker-field--timezone {
+  width: 180px;
+}
+
+.admin-config-schedule-row .admin-config-picker-field__value:not(.admin-config-picker-field__value--time) {
+  padding-block: 6px;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  text-align: center;
+}
+
+#config-preview .admin-config-section__body {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+}
+
+#config-preview .admin-config-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-content: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-width: 0;
+}
+
+@media (min-width: 769px) {
+  .admin-config-schedule-row {
+    grid-column: span 2;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  #config-automation .admin-config-section__body,
+  #config-preview .admin-config-section__body,
+  #config-tags .admin-config-section__body {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  #config-automation .admin-config-section__body > .admin-config-row {
+    grid-column: 1;
+    grid-row: 2;
+  }
+}
+
 .admin-config-row__copy {
   display: flex;
   flex-direction: column;
@@ -5838,7 +5909,6 @@ body.admin-mobile-nav-open {
   min-width: 48px;
 }
 
-.admin-config-control__status,
 .admin-config-control__retry {
   color: var(--text-muted);
   font-size: 12px;
@@ -6523,6 +6593,18 @@ body.admin-mobile-nav-open {
   .admin-config-row--inline {
     grid-template-columns: minmax(0, 1fr) auto;
     align-items: center;
+  }
+
+  .admin-config-schedule-row {
+    gap: 10px;
+  }
+
+  .admin-config-schedule-row > .admin-config-row {
+    flex-direction: column;
+    align-items: flex-start;
+    align-content: stretch;
+    justify-content: flex-start;
+    padding: 10px;
   }
 
   .admin-config-control--picker {
