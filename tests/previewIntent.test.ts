@@ -14,6 +14,7 @@ test("touch preview media waits 200ms after the first tap intent", () => {
 test("touch tap starts preview instead of navigating when preview is idle", () => {
   assert.equal(
     shouldInterceptPreviewTap({
+      previewEnabled: true,
       canHover: false,
       pointerType: "touch",
       previewActive: false,
@@ -26,6 +27,7 @@ test("touch tap starts preview instead of navigating when preview is idle", () =
 test("touch tap navigates when the same card preview is already active", () => {
   assert.equal(
     shouldInterceptPreviewTap({
+      previewEnabled: true,
       canHover: false,
       pointerType: "touch",
       previewActive: true,
@@ -37,6 +39,7 @@ test("touch tap navigates when the same card preview is already active", () => {
 test("mouse click does not intercept normal navigation", () => {
   assert.equal(
     shouldInterceptPreviewTap({
+      previewEnabled: true,
       canHover: true,
       pointerType: "mouse",
       previewActive: false,
@@ -44,4 +47,14 @@ test("mouse click does not intercept normal navigation", () => {
     false
   );
   assert.equal(shouldStartInstantPreview({ pointerType: "mouse" }), false);
+});
+test("disabled previews never intercept touch navigation, even for an active preview", () => {
+  for (const previewActive of [false, true]) {
+    assert.equal(shouldInterceptPreviewTap({
+      previewEnabled: false,
+      previewActive,
+      pointerType: "touch",
+      canHover: false,
+    }), false);
+  }
 });

@@ -39,7 +39,6 @@ type crawlerDTO struct {
 	TargetNew                   string           `json:"targetNew,omitempty"`
 	UploadDriveID               string           `json:"uploadDriveId,omitempty"`
 	Paused                      bool             `json:"paused"`
-	TeaserEnabled               bool             `json:"teaserEnabled"`
 	LastCrawlAt                 int64            `json:"lastCrawlAt,omitempty"`
 	ScanGenerationStatus        GenerationStatus `json:"scanGenerationStatus"`
 	ThumbnailGenerationStatus   GenerationStatus `json:"thumbnailGenerationStatus"`
@@ -68,7 +67,6 @@ type upsertCrawlerReq struct {
 	UploadProxy     *string `json:"uploadProxy"`
 	TargetNew       string  `json:"targetNew"`
 	UploadDriveID   string  `json:"uploadDriveId"`
-	TeaserEnabled   *bool   `json:"teaserEnabled,omitempty"`
 }
 
 type crawlerPausedReq struct {
@@ -139,7 +137,6 @@ func (a *AdminServer) crawlerDTOForDrive(d *catalog.Drive, assets catalog.Crawle
 		TargetNew:                   strings.TrimSpace(d.Credentials["target_new"]),
 		UploadDriveID:               strings.TrimSpace(d.Credentials["upload_drive_id"]),
 		Paused:                      crawlerPaused(d),
-		TeaserEnabled:               d.TeaserEnabled,
 		LastCrawlAt:                 lastCrawlAt,
 		ScanGenerationStatus:        generation.Scan,
 		ThumbnailGenerationStatus:   generation.Thumbnail,
@@ -280,13 +277,6 @@ func (a *AdminServer) handleUpsertCrawler(w http.ResponseWriter, r *http.Request
 		return
 	}
 	name := meta.Name
-	teaserEnabled := true
-	if existing != nil {
-		teaserEnabled = existing.TeaserEnabled
-	}
-	if body.TeaserEnabled != nil {
-		teaserEnabled = *body.TeaserEnabled
-	}
 	if id == "" {
 		generatedID, err := a.generateCrawlerID(r.Context(), name)
 		if err != nil {
@@ -304,25 +294,19 @@ func (a *AdminServer) handleUpsertCrawler(w http.ResponseWriter, r *http.Request
 		}
 	}
 	updateScope := DriveConfigUpdateRuntime
-	teaserChanged := existing != nil && existing.TeaserEnabled != teaserEnabled
-	if teaserChanged {
-		updateScope |= DriveConfigUpdatePreview
-	}
 	if !authorizeDriveConfigUpdate(w, configLease, updateScope) {
 		return
 	}
 	d := &catalog.Drive{
-		ID:            id,
-		Kind:          scriptcrawler.Kind,
-		Name:          name,
-		RootID:        "/",
-		Credentials:   persistedCredentials,
-		Status:        "disconnected",
-		TeaserEnabled: teaserEnabled,
+		ID:          id,
+		Kind:        scriptcrawler.Kind,
+		Name:        name,
+		RootID:      "/",
+		Credentials: persistedCredentials,
+		Status:      "disconnected",
 	}
 	if err := a.Catalog.UpsertDriveWithOptions(r.Context(), d, catalog.DriveUpsertOptions{
-		ReplaceTeaserEnabled: body.TeaserEnabled != nil,
-		PatchCredentials:     existing != nil,
+		PatchCredentials: existing != nil,
 	}); err != nil {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
@@ -335,18 +319,6 @@ func (a *AdminServer) handleUpsertCrawler(w http.ResponseWriter, r *http.Request
 		}
 		return a.OnDriveRuntimeConfigChanged(id)
 	})
-	if teaserChanged {
-		previewDeferred, applyErr := commitDriveConfigUpdate(configLease, DriveConfigUpdatePreview, func() error {
-			if a.OnTeaserEnabledChanged != nil {
-				a.OnTeaserEnabledChanged(id, teaserEnabled)
-			}
-			return nil
-		})
-		deferred = deferred || previewDeferred
-		if runtimeErr == nil {
-			runtimeErr = applyErr
-		}
-	}
 	resp := map[string]any{"ok": true, "id": id}
 	if deferred {
 		resp["deferred"] = true
@@ -789,7 +761,7 @@ func (a *AdminServer) handleUploadCrawlerVideos(w http.ResponseWriter, r *http.R
 	if a.GetDriveGenerationStatuses != nil {
 		generation = a.GetDriveGenerationStatuses()[d.ID]
 	}
-	if reason := crawlerUploadBlockedReason(d, assets, generation); reason != "" {
+	if reason := crawlerUploadBlockedReason(d, assets, generation, a.previewEnabled()); reason != "" {
 		writeJSON(w, http.StatusAccepted, map[string]any{
 			"ok":       true,
 			"accepted": false,
@@ -813,7 +785,7 @@ func (a *AdminServer) handleUploadCrawlerVideos(w http.ResponseWriter, r *http.R
 	writeJSON(w, http.StatusAccepted, resp)
 }
 
-func crawlerUploadBlockedReason(d *catalog.Drive, assets catalog.CrawlerAssetCounts, generation DriveGenerationStatuses) string {
+func crawlerUploadBlockedReason(d *catalog.Drive, assets catalog.CrawlerAssetCounts, generation DriveGenerationStatuses, previewEnabled bool) string {
 	if d == nil || !isConfiguredCrawlerDrive(d) {
 		return "爬虫不存在"
 	}
@@ -832,7 +804,7 @@ func crawlerUploadBlockedReason(d *catalog.Drive, assets catalog.CrawlerAssetCou
 	if assets.Fingerprint.Failed > 0 {
 		return "存在指纹生成失败的视频，请先重试或处理失败项"
 	}
-	if d.TeaserEnabled {
+	if previewEnabled {
 		if assets.Teaser.Pending > 0 {
 			return "还有待生成的预览视频"
 		}

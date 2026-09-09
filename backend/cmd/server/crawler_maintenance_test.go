@@ -30,13 +30,13 @@ func TestCleanupLegacyDeletedCrawlersRemovesOnlyUnconfiguredSources(t *testing.T
 	for _, drive := range []*catalog.Drive{
 		{
 			ID: ghostID, Kind: scriptcrawler.Kind, Name: "Deleted", RootID: "/",
-			Credentials: map[string]string{"upload_drive_id": targetID}, TeaserEnabled: true,
+			Credentials: map[string]string{"upload_drive_id": targetID},
 		},
 		{
 			ID: activeID, Kind: scriptcrawler.Kind, Name: "Active", RootID: "/",
-			Credentials: map[string]string{"script_path": "/tmp/active.py"}, TeaserEnabled: true,
+			Credentials: map[string]string{"script_path": "/tmp/active.py"},
 		},
-		{ID: targetID, Kind: "pikpak", Name: "Target", RootID: "", TeaserEnabled: true},
+		{ID: targetID, Kind: "pikpak", Name: "Target", RootID: ""},
 	} {
 		if err := cat.UpsertDrive(ctx, drive); err != nil {
 			t.Fatalf("seed drive %s: %v", drive.ID, err)

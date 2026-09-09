@@ -24,10 +24,7 @@ import { generationStateClass, generationStateLabel } from "./drive/constants";
 import { CrawlerUploadTargetField } from "./drive/CrawlerUploadTargetField";
 import { SpiderIcon } from "./icons/SpiderIcon";
 import { AdminEmptyVisual } from "./AdminEmptyVisual";
-import {
-  CrawlerListControlsPlaceholder,
-  CrawlerListSkeleton,
-} from "./CrawlersPageLoading";
+import { CrawlerListSkeleton } from "./CrawlersPageLoading";
 import { useAdminFloatingActionSpace } from "./useAdminFloatingActionSpace";
 import {
   useAdminRouteActive,
@@ -62,7 +59,6 @@ export function CrawlersPage() {
   const [uploadingId, setUploadingId] = useState("");
   const [stoppingId, setStoppingId] = useState("");
   const [togglingPausedId, setTogglingPausedId] = useState("");
-  const [togglingTeasers, setTogglingTeasers] = useState(false);
   // undefined = 编辑器关闭；null = 新建；其余 = 编辑已有爬虫
   const [editorTarget, setEditorTarget] = useState<api.AdminCrawler | null | undefined>(undefined);
   const [deleteTarget, setDeleteTarget] = useState<api.AdminCrawler | null>(null);
@@ -171,37 +167,6 @@ export function CrawlersPage() {
     }
   }
 
-  async function toggleCrawlerTeasers() {
-    if (list.length === 0 || togglingTeasers) return;
-    const next = !list.every((item) => item.teaserEnabled);
-    const previous = list;
-    setTogglingTeasers(true);
-    setList((prev) => prev.map((item) => ({ ...item, teaserEnabled: next })));
-    try {
-      let deferred = false;
-      for (const crawler of previous) {
-        if (crawler.teaserEnabled !== next) {
-          const resp = await api.setDriveTeaserEnabled(crawler.id, next);
-          deferred = deferred || Boolean(resp.deferred);
-        }
-      }
-      show(
-        deferred
-          ? "已保存，相关爬虫任务结束后生效"
-          : next
-            ? "已开启所有爬虫预览视频生成"
-            : "已关闭所有爬虫预览视频生成",
-        "success"
-      );
-      await refresh(true);
-    } catch (e) {
-      setList(previous);
-      show(e instanceof Error ? e.message : "批量切换预览视频失败", "error");
-    } finally {
-      setTogglingTeasers(false);
-    }
-  }
-
   async function confirmDelete() {
     if (!deleteTarget) return;
     setDeleting(true);
@@ -222,9 +187,6 @@ export function CrawlersPage() {
     }
   }
 
-  const hasCrawlers = list.length > 0;
-  const allCrawlerTeasersEnabled = list.every((item) => item.teaserEnabled);
-  const partialCrawlerTeasersEnabled = !allCrawlerTeasersEnabled && list.some((item) => item.teaserEnabled);
 
   return (
     <section
@@ -236,36 +198,6 @@ export function CrawlersPage() {
           className="admin-card admin-crawler-list"
           aria-busy={loading || undefined}
         >
-          {loading && !hasCrawlers && <CrawlerListControlsPlaceholder />}
-          {hasCrawlers && (
-            <div className="admin-crawler-list__controls">
-              <div className="admin-crawler-global-teaser">
-                <span>预览视频</span>
-                <button
-                  type="button"
-                  className={`toggle-switch ${allCrawlerTeasersEnabled ? "is-on" : ""} ${
-                    togglingTeasers ? "is-saving" : ""
-                  }`}
-                  role="switch"
-                  aria-checked={allCrawlerTeasersEnabled}
-                  aria-label="切换全部爬虫预览视频生成"
-                  disabled={loading || togglingTeasers}
-                  onClick={toggleCrawlerTeasers}
-                  title={
-                    loading
-                      ? "正在加载爬虫列表"
-                      : partialCrawlerTeasersEnabled
-                        ? "部分爬虫已开启，点击开启全部"
-                        : allCrawlerTeasersEnabled
-                          ? "关闭所有爬虫预览视频生成"
-                          : "开启所有爬虫预览视频生成"
-                  }
-                >
-                  <span className="toggle-switch__dot" />
-                </button>
-              </div>
-            </div>
-          )}
           {loading ? (
             <CrawlerListSkeleton />
           ) : list.length === 0 ? (

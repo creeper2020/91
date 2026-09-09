@@ -42,12 +42,14 @@ func (a *App) applyLiveConfig(ctx context.Context, settings config.LiveSettings)
 	previews.SetLimit(settings.PreviewConcurrency)
 	fingerprints.SetLimit(settings.FingerprintConcurrency)
 	if a.cat == nil {
+		a.applyPreviewEnabled(ctx, settings.PreviewEnabled)
 		return nil
 	}
 	changed, err := a.cat.SetBuiltinTagsEnabled(ctx, settings.BuiltinTagsEnabled)
 	if err != nil {
 		return fmt.Errorf("apply built-in tag configuration: %w", err)
 	}
+	a.applyPreviewEnabled(ctx, settings.PreviewEnabled)
 	if !changed {
 		return nil
 	}
@@ -58,6 +60,24 @@ func (a *App) applyLiveConfig(ctx context.Context, settings config.LiveSettings)
 		a.startTagRetag(ctx)
 	}
 	return nil
+}
+
+func (a *App) previewEnabled() bool {
+	return !a.previewDisabled.Load()
+}
+
+// Publish before queue admission: Manager invokes live callbacks before exposing
+// its new snapshot. Workers and crawler uploads share this atomic projection.
+func (a *App) applyPreviewEnabled(ctx context.Context, enabled bool) {
+	wasDisabled := a.previewDisabled.Swap(!enabled)
+	if !enabled || !wasDisabled {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for driveID, worker := range a.workers {
+		a.scheduleDriveGenerationEnqueue(ctx, driveID, worker, nil)
+	}
 }
 
 func loadLegacyRuntimeSettings(ctx context.Context, cat *catalog.Catalog) (config.LegacyRuntimeSettings, error) {

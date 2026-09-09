@@ -110,8 +110,8 @@
     box-shadow var(--transition-normal), background var(--transition-normal);
 }
 
-.video-card:hover,
-.video-card:focus-within {
+.video-card[data-preview-enabled="true"]:hover,
+.video-card[data-preview-enabled="true"]:focus-within {
   background: var(--bg-elevated);
   border-color: var(--border-default);
   box-shadow: var(--shadow-lg);
@@ -187,7 +187,7 @@
   opacity: 1;
 }
 
-.video-card:hover .thumb-image {
+.video-card[data-preview-enabled="true"]:hover .thumb-image {
   transform: scale(1.04);
 }
 
@@ -214,8 +214,17 @@
   transition: opacity var(--transition-fast);
 }
 
-.video-card:hover .thumb-frame::after {
+.video-card[data-preview-enabled="true"]:hover .thumb-frame::after {
   opacity: 1;
+}
+
+/* Disabling previews must also stop an in-flight zoom or hover transition. */
+.video-card[data-preview-enabled="false"],
+.video-card[data-preview-enabled="false"]::after,
+.video-card[data-preview-enabled="false"] .thumb-image,
+.video-card[data-preview-enabled="false"] .thumb-frame::after,
+.video-card[data-preview-enabled="false"] .video-title {
+  transition: none;
 }
 
 /* ----- Duration ----- */
@@ -454,7 +463,7 @@
   transition: color var(--transition-fast);
 }
 
-.video-card:hover .video-title {
+.video-card[data-preview-enabled="true"]:hover .video-title {
   color: var(--accent);
 }
 
@@ -803,7 +812,7 @@
     padding: 6px;
   }
 
-  .video-card:hover {
+  .video-card[data-preview-enabled="true"]:hover {
     transform: none;
     box-shadow: var(--shadow-sm);
   }
@@ -820,12 +829,12 @@
     transition: opacity var(--transition-fast);
   }
 
-  .video-card:active::after {
+  .video-card[data-preview-enabled="true"]:active::after {
     opacity: 1;
     transition-duration: 0ms;
   }
 
-  .video-card:hover .thumb-image {
+  .video-card[data-preview-enabled="true"]:hover .thumb-image {
     transform: none;
   }
 

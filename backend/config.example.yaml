@@ -62,7 +62,7 @@ generation:
   fingerprint_concurrency: 1
 
 preview:
-  # 是否启用 ffmpeg 抽帧生成预览视频
+  # 全局预览视频开关，控制生成与卡片预览，默认开启，可热更新；封面不受影响
   enabled: true
   # ffmpeg / ffprobe 可执行文件名或绝对路径
   ffmpeg_path: "ffmpeg"

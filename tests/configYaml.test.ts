@@ -18,6 +18,36 @@ const nightlyTimezone = new Set<VisualField>(["nightlyTimezone"]);
 const builtinTagsEnabled = new Set<VisualField>(["builtinTagsEnabled"]);
 const previewConcurrency = new Set<VisualField>(["previewConcurrency"]);
 
+test("global preview switch defaults on and rejects non-boolean YAML", () => {
+  assert.equal(parseConfig("").draft.previewEnabled, true);
+  assert.equal(parseConfig("preview: { enabled: false }").draft.previewEnabled, false);
+  assert.throws(() => parseConfig('preview: { enabled: "false" }'), /preview.enabled/);
+});
+
+test("global preview switch round-trips through visual edits without changing other fields", () => {
+  for (const source of [
+    "# keep\npreview:\n  enabled: true # hot reload\n  width: 480\n",
+    "preview: { width: 480 }\n",
+    "preview:\n",
+    "preview: null\n",
+    "generation: { preview_concurrency: 3 }\n",
+  ]) {
+    const before = parseConfig(source).draft;
+    const draft = { ...before, previewEnabled: false };
+    const fields = changedVisualFields(before, draft);
+    assert.deepEqual([...fields], ["previewEnabled"]);
+    const updated = applyVisualFields(source, draft, fields);
+    assert.deepEqual(parseConfig(updated).draft, draft);
+    assert.equal(
+      configDocument(updated).getIn(["preview", "width"]),
+      configDocument(source).getIn(["preview", "width"])
+    );
+    if (source.includes("# hot reload")) {
+      assert.equal(updated, source.replace("enabled: true", "enabled: false"));
+    }
+  }
+});
+
 function settingsDraft(overrides: Partial<SettingsDraft> = {}): SettingsDraft {
   return { ...DEFAULT_DRAFT, ...overrides };
 }

@@ -130,8 +130,6 @@ export function DriveGenerationPanel({
   regenFailedId,
   regenFailedThumbId,
   regenFailedFingerprintId,
-  togglingTeaserId,
-  onToggleTeaser,
   onRegenFailed,
   onRegenFailedThumbnails,
   onRegenFailedFingerprints,
@@ -140,8 +138,6 @@ export function DriveGenerationPanel({
   regenFailedId: string;
   regenFailedThumbId: string;
   regenFailedFingerprintId: string;
-  togglingTeaserId: string;
-  onToggleTeaser: () => void;
   onRegenFailed: () => void;
   onRegenFailedThumbnails: () => void;
   onRegenFailedFingerprints: () => void;
@@ -160,27 +156,6 @@ export function DriveGenerationPanel({
         <div className="admin-detail-card__title-left">
           <Activity size={16} />
           <span>生成状态</span>
-        </div>
-        <div className="admin-detail-actions-inline">
-          <span className="admin-drive-preview-toggle__label">预览视频</span>
-          <button
-            type="button"
-            className={`toggle-switch ${d.teaserEnabled ? "is-on" : ""} ${
-              togglingTeaserId === d.id ? "is-saving" : ""
-            }`}
-            onClick={onToggleTeaser}
-            disabled={togglingTeaserId === d.id}
-            role="switch"
-            aria-checked={d.teaserEnabled}
-            aria-label="生成预览视频"
-            title={
-              d.teaserEnabled
-                ? "关闭预览视频生成"
-                : "开启预览视频生成"
-            }
-          >
-            <span className="toggle-switch__dot" />
-          </button>
         </div>
       </header>
 

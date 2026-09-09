@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/video-site/backend/internal/api"
@@ -30,6 +31,7 @@ type App struct {
 	generationLimitsOnce sync.Once
 	thumbnailLimiter     *tasklimit.Limiter
 	previewLimiter       *tasklimit.Limiter
+	previewDisabled      atomic.Bool
 	fingerprintLimiter   *tasklimit.Limiter
 	cancels              map[string]context.CancelFunc
 	// scriptCrawlers 按 driveID 索引，每个脚本爬虫 drive 独立一个 Crawler。

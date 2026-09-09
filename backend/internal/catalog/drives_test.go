@@ -86,7 +86,7 @@ func TestUpsertDrivePreservingSkipDirIDsKeepsConcurrentSetting(t *testing.T) {
 	}
 }
 
-func TestUpsertDriveWithOptionsPreservesOmittedTeaserSetting(t *testing.T) {
+func TestUpsertDriveWithOptionsPreservesCredentials(t *testing.T) {
 	ctx := context.Background()
 	cat, err := Open(t.TempDir() + "/catalog.db")
 	if err != nil {
@@ -95,25 +95,20 @@ func TestUpsertDriveWithOptionsPreservesOmittedTeaserSetting(t *testing.T) {
 	t.Cleanup(func() { _ = cat.Close() })
 
 	if err := cat.UpsertDrive(ctx, &Drive{
-		ID:            "drive",
-		Kind:          "onedrive",
-		Name:          "Old name",
-		RootID:        "root",
-		TeaserEnabled: true,
-		Credentials:   map[string]string{"refresh_token": "keep-token"},
+		ID:          "drive",
+		Kind:        "onedrive",
+		Name:        "Old name",
+		RootID:      "root",
+		Credentials: map[string]string{"refresh_token": "keep-token"},
 	}); err != nil {
 		t.Fatalf("seed drive: %v", err)
 	}
-	if err := cat.SetDriveTeaserEnabled(ctx, "drive", false); err != nil {
-		t.Fatalf("save latest teaser setting: %v", err)
-	}
 	if err := cat.UpsertDriveWithOptions(ctx, &Drive{
-		ID:            "drive",
-		Kind:          "onedrive",
-		Name:          "New name",
-		RootID:        "root",
-		TeaserEnabled: true, // stale form snapshot; omitted by the request
-		Credentials:   map[string]string{},
+		ID:          "drive",
+		Kind:        "onedrive",
+		Name:        "New name",
+		RootID:      "root",
+		Credentials: map[string]string{},
 	}, DriveUpsertOptions{PatchCredentials: true}); err != nil {
 		t.Fatalf("partial config upsert: %v", err)
 	}
@@ -122,8 +117,8 @@ func TestUpsertDriveWithOptionsPreservesOmittedTeaserSetting(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get drive: %v", err)
 	}
-	if got.Name != "New name" || got.TeaserEnabled {
-		t.Fatalf("drive after partial save = %+v, want new name and preserved disabled teaser", got)
+	if got.Name != "New name" {
+		t.Fatalf("drive after partial save = %+v, want new name", got)
 	}
 	if got.Credentials["refresh_token"] != "keep-token" {
 		t.Fatalf("credentials = %#v, want latest token preserved", got.Credentials)
@@ -139,13 +134,12 @@ func TestPatchDriveCredentialsPreservesSettingsChangedAfterAttach(t *testing.T) 
 	t.Cleanup(func() { _ = cat.Close() })
 
 	if err := cat.UpsertDrive(ctx, &Drive{
-		ID:            "drive",
-		Kind:          "pikpak",
-		Name:          "PikPak",
-		RootID:        "root-folder",
-		Status:        "ok",
-		TeaserEnabled: true,
-		SkipDirIDs:    []string{"old-skip"},
+		ID:         "drive",
+		Kind:       "pikpak",
+		Name:       "PikPak",
+		RootID:     "root-folder",
+		Status:     "ok",
+		SkipDirIDs: []string{"old-skip"},
 		Credentials: map[string]string{
 			"access_token":  "old-access",
 			"refresh_token": "old-refresh",
@@ -158,9 +152,6 @@ func TestPatchDriveCredentialsPreservesSettingsChangedAfterAttach(t *testing.T) 
 	// snapshot but before that driver refreshed its tokens.
 	if err := cat.SetDriveSkipDirIDs(ctx, "drive", []string{"keep-this-dir"}); err != nil {
 		t.Fatalf("save skip dirs: %v", err)
-	}
-	if err := cat.SetDriveTeaserEnabled(ctx, "drive", false); err != nil {
-		t.Fatalf("disable teaser: %v", err)
 	}
 	if err := cat.PatchDriveCredentials(ctx, "drive", map[string]string{
 		"access_token":  "new-access",
@@ -176,9 +167,6 @@ func TestPatchDriveCredentialsPreservesSettingsChangedAfterAttach(t *testing.T) 
 	}
 	if got.RootID != "root-folder" || got.Name != "PikPak" || got.Status != "ok" {
 		t.Fatalf("drive settings changed: %+v", got)
-	}
-	if got.TeaserEnabled {
-		t.Fatal("teaser setting was rolled back")
 	}
 	if len(got.SkipDirIDs) != 1 || got.SkipDirIDs[0] != "keep-this-dir" {
 		t.Fatalf("skip dir ids = %#v, want preserved latest setting", got.SkipDirIDs)
@@ -499,13 +487,12 @@ func TestSetDriveRuntimeStatusTracksPlaybackFailureAndRecovery(t *testing.T) {
 	t.Cleanup(func() { _ = cat.Close() })
 
 	drive := &Drive{
-		ID:            "drive",
-		Kind:          "p115",
-		Name:          "115",
-		RootID:        "configured-root",
-		Status:        "ok",
-		TeaserEnabled: true,
-		SkipDirIDs:    []string{"keep-skipped"},
+		ID:         "drive",
+		Kind:       "p115",
+		Name:       "115",
+		RootID:     "configured-root",
+		Status:     "ok",
+		SkipDirIDs: []string{"keep-skipped"},
 		Credentials: map[string]string{
 			"cookie": "credential-must-be-preserved",
 		},
@@ -527,7 +514,7 @@ func TestSetDriveRuntimeStatusTracksPlaybackFailureAndRecovery(t *testing.T) {
 	if got.Credentials["cookie"] != "credential-must-be-preserved" {
 		t.Fatalf("credentials changed: %#v", got.Credentials)
 	}
-	if got.RootID != "configured-root" || !got.TeaserEnabled || len(got.SkipDirIDs) != 1 || got.SkipDirIDs[0] != "keep-skipped" {
+	if got.RootID != "configured-root" || len(got.SkipDirIDs) != 1 || got.SkipDirIDs[0] != "keep-skipped" {
 		t.Fatalf("drive settings changed: %+v", got)
 	}
 

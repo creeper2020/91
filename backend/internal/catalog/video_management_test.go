@@ -213,7 +213,7 @@ func TestBlacklistRestorePolicies(t *testing.T) {
 	}
 
 	if err := cat.UpsertDrive(ctx, &Drive{
-		ID: "crawler-a", Kind: "scriptcrawler", Name: "Crawler", RootID: "/", TeaserEnabled: true,
+		ID: "crawler-a", Kind: "scriptcrawler", Name: "Crawler", RootID: "/",
 	}); err != nil {
 		t.Fatalf("seed crawler drive: %v", err)
 	}
@@ -880,7 +880,7 @@ func TestPurgeDeletedVideoKeepsCrawlerSeenMetadata(t *testing.T) {
 	t.Cleanup(func() { _ = cat.Close() })
 
 	if err := cat.UpsertDrive(ctx, &Drive{
-		ID: "crawler-a", Kind: "scriptcrawler", Name: "Crawler", RootID: "/", TeaserEnabled: true,
+		ID: "crawler-a", Kind: "scriptcrawler", Name: "Crawler", RootID: "/",
 	}); err != nil {
 		t.Fatalf("seed crawler drive: %v", err)
 	}

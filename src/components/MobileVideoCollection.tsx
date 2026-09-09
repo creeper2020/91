@@ -24,7 +24,7 @@ import {
 } from "@/lib/previewIntent";
 import { useDocumentScrollLock } from "@/lib/useDocumentScrollLock";
 import { useInViewport } from "@/lib/useInViewport";
-import { useIsActivePreview } from "@/lib/useIsActivePreview";
+import { useIsActivePreview, usePreviewEnabled } from "@/lib/useIsActivePreview";
 import { useLazyVideoCollection } from "@/lib/useLazyVideoCollection";
 import {
   resolveVideoReturnPath,
@@ -627,6 +627,11 @@ const CollectionItem = forwardRef<HTMLLIElement, CollectionItemProps>(
     const touchPreviewArmedRef = useRef(false);
     const lastPointerTypeRef = useRef("");
     const previewIsActive = useIsActivePreview(video.id);
+    const previewEnabled = usePreviewEnabled();
+
+    useEffect(() => {
+      if (!previewEnabled) cleanupPreview();
+    }, [previewEnabled, video.id]);
     const inView = useInViewport(rootRef);
     const setRootRef = useCallback(
       (node: HTMLLIElement | null) => {
@@ -685,7 +690,7 @@ const CollectionItem = forwardRef<HTMLLIElement, CollectionItemProps>(
     }
 
     function startTouchPreviewIntent() {
-      if (!video.previewSrc) return;
+      if (!previewController.isEnabled() || !video.previewSrc) return;
       clearPreviewIntentTimer();
       touchPreviewArmedRef.current = true;
       previewController.setActiveId(video.id);
@@ -693,6 +698,7 @@ const CollectionItem = forwardRef<HTMLLIElement, CollectionItemProps>(
       previewIntentTimerRef.current = window.setTimeout(() => {
         previewIntentTimerRef.current = null;
         if (
+          !previewController.isEnabled() ||
           !touchPreviewArmedRef.current ||
           previewController.getActiveId() !== video.id
         ) {
@@ -716,6 +722,7 @@ const CollectionItem = forwardRef<HTMLLIElement, CollectionItemProps>(
         (touchPreviewArmedRef.current || shouldRenderPreview);
       if (
         !shouldInterceptPreviewTap({
+          previewEnabled: previewController.isEnabled() && Boolean(video.previewSrc),
           pointerType: lastPointerTypeRef.current,
           canHover: window.matchMedia("(hover: hover) and (pointer: fine)")
             .matches,
@@ -736,6 +743,7 @@ const CollectionItem = forwardRef<HTMLLIElement, CollectionItemProps>(
       <li
         ref={setRootRef}
         className="vd-collection-item"
+        data-preview-enabled={previewEnabled}
         onPointerDown={(event) => {
           lastPointerTypeRef.current = event.pointerType;
         }}
@@ -751,7 +759,7 @@ const CollectionItem = forwardRef<HTMLLIElement, CollectionItemProps>(
         >
           <div className="vd-collection-item__thumb">
             <VideoThumbnail src={video.thumbnail} />
-            {shouldRenderPreview && video.previewSrc && (
+            {previewEnabled && shouldRenderPreview && video.previewSrc && (
               <PreviewVideo
                 ref={videoRef}
                 src={video.previewSrc}
@@ -761,11 +769,11 @@ const CollectionItem = forwardRef<HTMLLIElement, CollectionItemProps>(
                 onTimeUpdate={setProgress}
               />
             )}
-            {previewState === "loading" && <span className="preview-loader" />}
-            {previewState === "error" && (
+            {previewEnabled && previewState === "loading" && <span className="preview-loader" />}
+            {previewEnabled && previewState === "error" && (
               <span className="preview-error">预览加载失败</span>
             )}
-            {previewState === "playing" && (
+            {previewEnabled && previewState === "playing" && (
               <>
                 <div className="preview-progress" aria-hidden="true">
                   <div
@@ -778,12 +786,12 @@ const CollectionItem = forwardRef<HTMLLIElement, CollectionItemProps>(
                 </span>
               </>
             )}
-            {video.duration && previewState !== "playing" && (
+            {video.duration && (!previewEnabled || previewState !== "playing") && (
               <span className="vd-collection-item__duration">
                 {video.duration}
               </span>
             )}
-            {current && previewState !== "playing" && (
+            {current && (!previewEnabled || previewState !== "playing") && (
               <span className="vd-collection-item__current-thumb">
                 当前视频
               </span>

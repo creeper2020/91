@@ -33,7 +33,7 @@ func (a *App) enqueueUploadedVideo(ctx context.Context, v *catalog.Video) {
 	if thumbWorker != nil && v.ThumbnailURL == "" {
 		thumbWorker.Enqueue(v)
 	}
-	if worker != nil && a.teaserEnabledForDrive(ctx, v.DriveID) {
+	if worker != nil && a.previewEnabled() {
 		worker.Enqueue(v)
 	}
 	if fingerprintWorker != nil {
@@ -42,6 +42,9 @@ func (a *App) enqueueUploadedVideo(ctx context.Context, v *catalog.Video) {
 }
 
 func (a *App) regenPreview(ctx context.Context, videoID string) {
+	if !a.previewEnabled() {
+		return
+	}
 	v, err := a.cat.GetVideo(ctx, videoID)
 	if err != nil {
 		return
@@ -60,6 +63,9 @@ func (a *App) regenPreview(ctx context.Context, videoID string) {
 }
 
 func (a *App) regenAllPreviews(ctx context.Context) {
+	if !a.previewEnabled() {
+		return
+	}
 	items, total, err := a.cat.ListVideos(ctx, catalog.ListParams{Page: 1, PageSize: 1000000})
 	if err != nil {
 		log.Printf("[preview] list all videos for regen: %v", err)
@@ -127,6 +133,9 @@ func (a *App) resetFailedGeneration(ctx context.Context, driveID string, kinds c
 }
 
 func (a *App) regenFailedPreviews(ctx context.Context, driveID string) {
+	if !a.previewEnabled() {
+		return
+	}
 	taskCtx, done, admitted := a.registerDriveTaskContext(ctx, driveID, driveTaskScopePreview)
 	if !admitted {
 		return

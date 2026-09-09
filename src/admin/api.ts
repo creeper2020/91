@@ -1,3 +1,5 @@
+import { applyPreviewEnabled } from "../lib/previewSettings";
+
 // 管理后台 API 客户端
 // 所有请求都带 cookie，401 会抛错让路由守卫跳登录
 const BASE = "/admin/api";
@@ -493,8 +495,6 @@ export type AdminDrive = {
   hasCredential: boolean;
   /** 后端能力表声明该挂载可写入文件；爬虫上传目标据此展示。 */
   canUpload: boolean;
-  /** 当前是否给该盘生成预览视频（per-drive 开关，替代旧的全局 preview.enabled；封面不受影响）。 */
-  teaserEnabled: boolean;
   /**
    * 用户在 admin 配置的"扫描跳过目录"集合（drive 侧目录 fileID 列表）。
    * 命中其中任一目录时 scanner 直接跳过、不递归；空数组 = 不跳过任何目录。
@@ -626,7 +626,6 @@ export type AdminCrawler = {
   targetNew?: string;
   uploadDriveId?: string;
   paused: boolean;
-  teaserEnabled: boolean;
   lastCrawlAt?: number;
   scanGenerationStatus?: DriveGenerationStatus;
   thumbnailGenerationStatus?: DriveGenerationStatus;
@@ -891,21 +890,6 @@ export function getGuangYaPanQRStatus(deviceCode: string) {
   return request<GuangYaPanQRStatus>(`/drives/guangyapan/qr/status?${qs.toString()}`);
 }
 
-/**
- * 切换某个云盘的预览视频生成开关。点击网盘列表里行内的 toggle 按钮时调用。
- *
- * 后端会写 catalog.drives.teaser_enabled；空闲时立即生效，有任务时返回
- * deferred=true 并在当前任务结束后切换。
- */
-export function setDriveTeaserEnabled(id: string, enabled: boolean) {
-  return request<DriveConfigSaveResult & { teaserEnabled: boolean }>(
-    `/drives/${encodeURIComponent(id)}/teaser-enabled`,
-    {
-      method: "POST",
-      body: JSON.stringify({ enabled }),
-    }
-  );
-}
 
 /**
  * dirtree 接口的一个目录条目。前端构建按需展开的树时用。
@@ -1242,6 +1226,7 @@ export type ConfigSaveResult = {
     nightlyStartTime: string;
     nightlyTimezone: string;
     builtinTagsEnabled: boolean;
+    previewEnabled: boolean;
     previewConcurrency: number;
     thumbnailConcurrency: number;
     fingerprintConcurrency: number;
@@ -1304,7 +1289,9 @@ export async function updateConfigYAML(
     throw new ConfigConflictError(await configResponseError(res));
   }
   if (!res.ok) throw new Error(await configResponseError(res));
-  return (await res.json()) as ConfigSaveResult;
+  const result = (await res.json()) as ConfigSaveResult;
+  applyPreviewEnabled(result.settings.previewEnabled);
+  return result;
 }
 
 

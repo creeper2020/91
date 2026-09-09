@@ -90,7 +90,6 @@ export function DrivesPage() {
   const [regenFailedId, setRegenFailedId] = useState("");
   const [regenFailedThumbId, setRegenFailedThumbId] = useState("");
   const [regenFailedFingerprintId, setRegenFailedFingerprintId] = useState("");
-  const [togglingTeaserId, setTogglingTeaserId] = useState("");
   const [scanningAll, setScanningAll] = useState(false);
   const [stoppingAll, setStoppingAll] = useState(false);
   const [trackingScanAll, setTrackingScanAll] = useState(false);
@@ -491,42 +490,6 @@ export function DrivesPage() {
     }
   }
 
-  async function handleToggleTeaser(d: api.AdminDrive) {
-    const next = !d.teaserEnabled;
-    setTogglingTeaserId(d.id);
-    setList((prev) =>
-      prev.map((item) =>
-        item.id === d.id ? { ...item, teaserEnabled: next } : item
-      )
-    );
-    try {
-      const resp = await api.setDriveTeaserEnabled(d.id, next);
-      show(
-        resp.deferred
-          ? resp.message || "已保存，将在当前网盘任务结束后生效"
-          : resp.teaserEnabled
-            ? `已开启「${d.name || d.id}」的预览视频生成`
-            : `已关闭「${d.name || d.id}」的预览视频生成`,
-        "success"
-      );
-      setList((prev) =>
-        prev.map((item) =>
-          item.id === d.id ? { ...item, teaserEnabled: resp.teaserEnabled } : item
-        )
-      );
-      refreshDriveList();
-    } catch (e) {
-      setList((prev) =>
-        prev.map((item) =>
-          item.id === d.id ? { ...item, teaserEnabled: d.teaserEnabled } : item
-        )
-      );
-      show(e instanceof Error ? e.message : "切换失败", "error");
-    } finally {
-      setTogglingTeaserId("");
-    }
-  }
-
   const selectedDrive = useMemo(() => {
     return selectedDriveId ? list.find((d) => d.id === selectedDriveId) : null;
   }, [selectedDriveId, list]);
@@ -677,8 +640,6 @@ export function DrivesPage() {
               regenFailedId={regenFailedId}
               regenFailedThumbId={regenFailedThumbId}
               regenFailedFingerprintId={regenFailedFingerprintId}
-              togglingTeaserId={togglingTeaserId}
-              onToggleTeaser={() => handleToggleTeaser(d)}
               onRegenFailed={() => handleRegenFailed(d)}
               onRegenFailedThumbnails={() => handleRegenFailedThumbnails(d)}
               onRegenFailedFingerprints={() => handleRegenFailedFingerprints(d)}

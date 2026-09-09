@@ -610,68 +610,6 @@ func (a *AdminServer) nightlyJobStatus() NightlyJobStatus {
 	return status
 }
 
-// teaserEnabledReq 是 POST /admin/api/drives/{id}/teaser-enabled 的入参。
-type teaserEnabledReq struct {
-	Enabled bool `json:"enabled"`
-}
-
-// handleSetDriveTeaserEnabled 切换某盘的预览视频生成开关。
-//
-// 行为：
-//   - 立即保存 catalog.drives.teaser_enabled
-//   - 空闲时立即调 OnTeaserEnabledChanged
-//   - 有任务时在当前任务代结束后调用，并返回 deferred=true
-//   - 返回切换后的新值，方便前端乐观更新但又能以服务端为准
-//
-// 与 upsertDrive 的区别：那条接口要重传 kind / name / rootId 等，开关切换不该
-// 牵连这些字段（顺手覆盖凭证或 rootID 容易出 bug）。所以单独走一条。
-func (a *AdminServer) handleSetDriveTeaserEnabled(w http.ResponseWriter, r *http.Request) {
-	id := chi.URLParam(r, "id")
-	if id == "" {
-		http.Error(w, "id is required", http.StatusBadRequest)
-		return
-	}
-	var body teaserEnabledReq
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeErr(w, http.StatusBadRequest, err)
-		return
-	}
-	configLease, ok := a.beginDriveConfigUpdate(w, id)
-	if !ok {
-		return
-	}
-	if configLease != nil {
-		defer configLease.Release()
-	}
-	if !authorizeDriveConfigUpdate(w, configLease, DriveConfigUpdatePreview) {
-		return
-	}
-	if err := a.Catalog.SetDriveTeaserEnabled(r.Context(), id, body.Enabled); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			http.Error(w, "drive not found", http.StatusNotFound)
-			return
-		}
-		writeErr(w, http.StatusInternalServerError, err)
-		return
-	}
-	deferred, applyErr := commitDriveConfigUpdate(configLease, DriveConfigUpdatePreview, func() error {
-		if a.OnTeaserEnabledChanged != nil {
-			a.OnTeaserEnabledChanged(id, body.Enabled)
-		}
-		return nil
-	})
-	if applyErr != nil {
-		writeErr(w, http.StatusInternalServerError, applyErr)
-		return
-	}
-	resp := map[string]any{"ok": true, "teaserEnabled": body.Enabled}
-	if deferred {
-		resp["deferred"] = true
-		resp["message"] = driveConfigDeferredMessage
-	}
-	writeJSON(w, http.StatusOK, resp)
-}
-
 // skipDirsReq 是 POST /admin/api/drives/{id}/skip-dirs 的入参。
 //
 // 整体覆盖语义：传啥就保存啥（不是增量合并）。dirIds 可以是 nil/空数组 表示

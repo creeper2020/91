@@ -111,15 +111,14 @@ type UploadProgress struct {
 const scriptCrawlerUploadRootDirName = "Script Crawlers"
 
 type migrationPlan struct {
-	source              LocalSource
-	row                 *catalog.Drive
-	targetDriveID       string
-	target              uploadTarget
-	uploadDir           string
-	uploadProxyURL      string
-	keepLatestN         int
-	requireAssetsReady  bool
-	requirePreviewReady bool
+	source             LocalSource
+	row                *catalog.Drive
+	targetDriveID      string
+	target             uploadTarget
+	uploadDir          string
+	uploadProxyURL     string
+	keepLatestN        int
+	requireAssetsReady bool
 }
 
 // pikpakAdapter / p115Adapter / p123Adapter / onedriveAdapter / googledriveAdapter / webdavAdapter / wopanAdapter / guangyapanAdapter 把具体 driver 包装成 uploadTarget。
@@ -431,8 +430,11 @@ type Registry interface {
 }
 
 type Config struct {
-	Catalog  *catalog.Catalog
-	Registry Registry
+	// PreviewEnabled reads the global policy before admitting each upload.
+	// Nil requires ready previews for standalone callers.
+	PreviewEnabled func() bool
+	Catalog        *catalog.Catalog
+	Registry       Registry
 	// GetDrive returns the task-generation configuration snapshot. Production
 	// supplies this while deferred admin edits are pending; tests and standalone
 	// users may omit it to read Catalog directly.
@@ -791,15 +793,14 @@ func (m *Migrator) migrationPlan(ctx context.Context, d drives.Drive) (migration
 		return migrationPlan{}, false
 	}
 	return migrationPlan{
-		source:              src,
-		row:                 row,
-		targetDriveID:       resolvedID,
-		target:              target,
-		uploadDir:           scriptCrawlerUploadDir(row.ID),
-		uploadProxyURL:      strings.TrimSpace(row.Credentials["upload_proxy"]),
-		keepLatestN:         0,
-		requireAssetsReady:  true,
-		requirePreviewReady: row.TeaserEnabled,
+		source:             src,
+		row:                row,
+		targetDriveID:      resolvedID,
+		target:             target,
+		uploadDir:          scriptCrawlerUploadDir(row.ID),
+		uploadProxyURL:     strings.TrimSpace(row.Credentials["upload_proxy"]),
+		keepLatestN:        0,
+		requireAssetsReady: true,
 	}, true
 }
 
@@ -970,7 +971,8 @@ func (m *Migrator) migrateDrive(ctx context.Context, plan migrationPlan) (int, e
 		}
 
 		if plan.requireAssetsReady {
-			ready, err := m.crawlerVideoAssetsReady(ctx, v, plan.requirePreviewReady)
+			requirePreview := m.cfg.PreviewEnabled == nil || m.cfg.PreviewEnabled()
+			ready, err := m.crawlerVideoAssetsReady(ctx, v, requirePreview)
 			if err != nil {
 				log.Printf("[crawlerupload] %s check generated assets: %v", v.ID, err)
 				continue

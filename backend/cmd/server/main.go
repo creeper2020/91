@@ -201,6 +201,7 @@ func main() {
 		Catalog:          cat,
 		Registry:         app.registry,
 		GetDrive:         app.activeDriveConfig,
+		PreviewEnabled:   app.previewEnabled,
 		CommonThumbDir:   app.commonThumbsDir(),
 		OnUploadProgress: app.updateCrawlerUploadProgress,
 	})
@@ -332,7 +333,8 @@ func main() {
 			_, err := app.deleteVideo(reqCtx, videoID, false)
 			return err
 		},
-		GetTheme: func() string { return app.Theme() },
+		GetTheme:          func() string { return app.Theme() },
+		GetPreviewEnabled: app.previewEnabled,
 	}
 	app.onTagsChanged = apiServer.InvalidateTagCache
 
@@ -449,18 +451,6 @@ func main() {
 		},
 		GetPreviewGenerationVideoIDs: func() map[string]bool {
 			return app.previewGenerationVideoIDs()
-		},
-		OnTeaserEnabledChanged: func(driveID string, enabled bool) {
-			// 从关到开时立刻补扫该盘 pending 预览视频，行为对齐旧的"全局开关从关到开"。
-			// 关闭分支不需要做事 —— 入队前会重新查 catalog，新的 enqueue 自然停。
-			if !enabled {
-				return
-			}
-			app.mu.Lock()
-			worker := app.workers[driveID]
-			thumbWorker := app.thumbWorkers[driveID]
-			app.mu.Unlock()
-			app.scheduleDriveGenerationEnqueue(ctx, driveID, worker, thumbWorker)
 		},
 		GetTheme: func() string { return app.Theme() },
 		SetTheme: func(theme string) error {

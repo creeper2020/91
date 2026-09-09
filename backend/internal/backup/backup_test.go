@@ -2240,6 +2240,7 @@ func TestRestoreSwitchesAllDataPreservesTargetRuntimeConfigAndClearsSessions(t *
 	}
 	env.cfg.Preview.FFmpegPath = "/target/bin/ffmpeg"
 	env.cfg.Preview.FFprobePath = "/target/bin/ffprobe"
+	env.cfg.Preview.Enabled = false
 	env.cfg.Server.Admin.Username = "target-admin"
 	env.cfg.Server.Admin.Password = "target-password"
 	writeTestConfig(t, env.configPath, env.cfg)
@@ -2366,6 +2367,9 @@ func TestRestoreSwitchesAllDataPreservesTargetRuntimeConfigAndClearsSessions(t *
 		len(restoredConfig.Server.AllowedOrigins) != 1 ||
 		restoredConfig.Server.AllowedOrigins[0] != "https://target.example" {
 		t.Fatalf("target network config was not preserved: %+v", restoredConfig.Server)
+	}
+	if restoredConfig.Preview.Enabled {
+		t.Fatal("restore replaced the target global preview switch")
 	}
 	if restoredConfig.Preview.FFmpegPath != "/target/bin/ffmpeg" ||
 		restoredConfig.Preview.FFprobePath != "/target/bin/ffprobe" {

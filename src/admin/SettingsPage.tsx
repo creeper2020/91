@@ -694,6 +694,28 @@ export function SettingsPage() {
                       </div>
                     </SettingsRow>
                   ))}
+                  <SettingsRow
+                    label="预览视频"
+                    labelID="preview-enabled-label"
+                    layout="inline"
+                  >
+                    <div className="admin-config-control admin-config-control--switch">
+                      <button
+                        id="preview-enabled-toggle"
+                        type="button"
+                        className={`toggle-switch ${draft.previewEnabled ? "is-on" : ""}`}
+                        role="switch"
+                        aria-checked={draft.previewEnabled}
+                        aria-labelledby="preview-enabled-label"
+                        disabled={controlsDisabled}
+                        onClick={() =>
+                          updateVisualField("previewEnabled", !draft.previewEnabled)
+                        }
+                      >
+                        <span className="toggle-switch__dot" />
+                      </button>
+                    </div>
+                  </SettingsRow>
                 </SettingsSection>
               )}
               {activeSection === "config-tags" && (

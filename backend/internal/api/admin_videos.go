@@ -197,6 +197,9 @@ func (a *AdminServer) handleDeleteVideo(w http.ResponseWriter, r *http.Request) 
 }
 
 func (a *AdminServer) handleRegenPreview(w http.ResponseWriter, r *http.Request) {
+	if !a.requirePreviewEnabled(w) {
+		return
+	}
 	id := chi.URLParam(r, "id")
 	if a.OnRegenPreview != nil {
 		a.OnRegenPreview(id)
@@ -205,6 +208,9 @@ func (a *AdminServer) handleRegenPreview(w http.ResponseWriter, r *http.Request)
 }
 
 func (a *AdminServer) handleRegenAllPreviews(w http.ResponseWriter, r *http.Request) {
+	if !a.requirePreviewEnabled(w) {
+		return
+	}
 	if a.OnRegenAllPreviews != nil {
 		a.OnRegenAllPreviews()
 	}
@@ -212,6 +218,9 @@ func (a *AdminServer) handleRegenAllPreviews(w http.ResponseWriter, r *http.Requ
 }
 
 func (a *AdminServer) handleRegenFailedPreviews(w http.ResponseWriter, r *http.Request) {
+	if !a.requirePreviewEnabled(w) {
+		return
+	}
 	id := chi.URLParam(r, "id")
 	if a.OnRegenFailedPreviews != nil {
 		a.OnRegenFailedPreviews(id)

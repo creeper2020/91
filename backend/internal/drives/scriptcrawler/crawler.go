@@ -56,10 +56,7 @@ type CrawlerConfig struct {
 	FingerprintLimiter *tasklimit.Limiter
 	Driver             *Driver
 	Catalog            *catalog.Catalog
-	// GetDriveConfig can supply the task-generation snapshot while a newer
-	// desired configuration is waiting for the current crawl to finish.
-	GetDriveConfig func(context.Context, string) (*catalog.Drive, error)
-	CrawlerName    string
+	CrawlerName        string
 	// Protocol is the protocol to start from. Every run re-reads it from the
 	// script itself, so this is the value used before the first run and
 	// whenever SkipProtocolRefresh keeps the script from being consulted.
@@ -78,7 +75,6 @@ type CrawlerConfig struct {
 	LocalPreviewDir      string
 	ProxyURL             string
 	ConfigJSON           string
-	DisablePreview       bool
 	HTTPClient           *http.Client
 	DownloadTimeout      time.Duration
 	RunTimeout           time.Duration
@@ -728,10 +724,6 @@ func (c *Crawler) processItem(ctx context.Context, item Item) (bool, error) {
 		}
 	}
 	crawlerTagLabel = c.crawlerTagName()
-	previewStatus := "pending"
-	if c.previewDisabled(ctx) {
-		previewStatus = "disabled"
-	}
 	v := &catalog.Video{
 		ID:              videoID,
 		DriveID:         c.cfg.Driver.ID(),
@@ -743,7 +735,7 @@ func (c *Crawler) processItem(ctx context.Context, item Item) (bool, error) {
 		Size:            size,
 		Ext:             strings.TrimPrefix(videoExt, "."),
 		Description:     strings.TrimSpace(item.Description),
-		PreviewStatus:   previewStatus,
+		PreviewStatus:   "pending",
 		PublishedAt:     now,
 		CreatedAt:       now,
 		UpdatedAt:       now,
@@ -980,9 +972,6 @@ func (c *Crawler) RestoreRequestedVideos(ctx context.Context) (int, error) {
 		video.PreviewFileID = ""
 		video.PreviewLocal = ""
 		video.PreviewStatus = "pending"
-		if c.previewDisabled(ctx) {
-			video.PreviewStatus = "disabled"
-		}
 		if video.CreatedAt.IsZero() {
 			video.CreatedAt = file.modTime
 		}
@@ -1038,24 +1027,6 @@ func (c *Crawler) restoreCrawlerThumbnail(video *catalog.Video, fileID string) b
 		return true
 	}
 	return false
-}
-
-func (c *Crawler) previewDisabled(ctx context.Context) bool {
-	if c == nil {
-		return false
-	}
-	if c.cfg.Driver != nil {
-		if c.cfg.GetDriveConfig != nil {
-			if d, err := c.cfg.GetDriveConfig(ctx, c.cfg.Driver.ID()); err == nil && d != nil {
-				return !d.TeaserEnabled
-			}
-		} else if c.cfg.Catalog != nil {
-			if d, err := c.cfg.Catalog.GetDrive(ctx, c.cfg.Driver.ID()); err == nil && d != nil {
-				return !d.TeaserEnabled
-			}
-		}
-	}
-	return c.cfg.DisablePreview
 }
 
 func (c *Crawler) materializeMedia(ctx context.Context, ref MediaRef, dst, referer string, required bool) (int64, error) {

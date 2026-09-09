@@ -168,7 +168,6 @@ func TestRunOnceUploadsScriptCrawlerLocalVideo(t *testing.T) {
 			"upload_drive_id": target.ID(),
 			"upload_proxy":    "http://upload-proxy.example:7890",
 		},
-		TeaserEnabled: true,
 	}); err != nil {
 		t.Fatalf("upsert crawler drive: %v", err)
 	}
@@ -258,7 +257,6 @@ func TestStartDriveUploadsOnlySelectedCrawlerWhileRunOnceRemainsGlobal(t *testin
 				"proxy":           "http://crawl-only-proxy.example:7890",
 				"upload_drive_id": target.ID(),
 			},
-			TeaserEnabled: true,
 		}); err != nil {
 			t.Fatalf("upsert crawler %s: %v", src.ID(), err)
 		}
@@ -334,8 +332,7 @@ func TestStartDriveRejectsBeforeReportingAcceptedWhenAnotherMigrationRuns(t *tes
 	for _, src := range []*scriptcrawler.Driver{first, second} {
 		if err := cat.UpsertDrive(ctx, &catalog.Drive{
 			ID: src.ID(), Kind: scriptcrawler.Kind, Name: src.ID(), RootID: "/",
-			Credentials:   map[string]string{"script_path": "/tmp/example.py", "upload_drive_id": target.ID()},
-			TeaserEnabled: true,
+			Credentials: map[string]string{"script_path": "/tmp/example.py", "upload_drive_id": target.ID()},
 		}); err != nil {
 			t.Fatalf("upsert crawler %s: %v", src.ID(), err)
 		}
@@ -379,12 +376,11 @@ func TestRunOnceRequiresPerCrawlerUploadTarget(t *testing.T) {
 	reg.Add(target)
 
 	if err := cat.UpsertDrive(ctx, &catalog.Drive{
-		ID:            src.ID(),
-		Kind:          scriptcrawler.Kind,
-		Name:          "Local Only",
-		RootID:        "/",
-		Credentials:   map[string]string{"script_path": "/tmp/example.py"},
-		TeaserEnabled: true,
+		ID:          src.ID(),
+		Kind:        scriptcrawler.Kind,
+		Name:        "Local Only",
+		RootID:      "/",
+		Credentials: map[string]string{"script_path": "/tmp/example.py"},
 	}); err != nil {
 		t.Fatalf("upsert crawler drive: %v", err)
 	}
@@ -423,7 +419,6 @@ func TestRunOnceIgnoresUnconfiguredScriptCrawler(t *testing.T) {
 		Credentials: map[string]string{
 			"upload_drive_id": target.ID(),
 		},
-		TeaserEnabled: true,
 	}); err != nil {
 		t.Fatalf("upsert deleted crawler drive: %v", err)
 	}
@@ -461,8 +456,7 @@ func TestRunOnceReconcilesRemoteWriteAfterCatalogCrashWithoutReupload(t *testing
 	reg.Add(target)
 	if err := cat.UpsertDrive(ctx, &catalog.Drive{
 		ID: src.ID(), Kind: scriptcrawler.Kind, Name: "Reconcile", RootID: "/",
-		Credentials:   map[string]string{"script_path": "/tmp/example.py", "upload_drive_id": target.ID()},
-		TeaserEnabled: true,
+		Credentials: map[string]string{"script_path": "/tmp/example.py", "upload_drive_id": target.ID()},
 	}); err != nil {
 		t.Fatalf("upsert crawler drive: %v", err)
 	}
@@ -517,12 +511,11 @@ func TestRunOncePreservesCrawlerVideoPendingDirectoryRestore(t *testing.T) {
 	reg.Add(target)
 
 	if err := cat.UpsertDrive(ctx, &catalog.Drive{
-		ID:            src.ID(),
-		Kind:          scriptcrawler.Kind,
-		Name:          "Restore Crawler",
-		RootID:        "/",
-		Credentials:   map[string]string{"script_path": "/tmp/example.py", "upload_drive_id": target.ID()},
-		TeaserEnabled: true,
+		ID:          src.ID(),
+		Kind:        scriptcrawler.Kind,
+		Name:        "Restore Crawler",
+		RootID:      "/",
+		Credentials: map[string]string{"script_path": "/tmp/example.py", "upload_drive_id": target.ID()},
 	}); err != nil {
 		t.Fatalf("upsert crawler drive: %v", err)
 	}
@@ -638,4 +631,39 @@ func writeCrawlerVideo(t *testing.T, cat *catalog.Catalog, d *scriptcrawler.Driv
 		t.Fatalf("upsert video: %v", err)
 	}
 	return videoID
+}
+func TestCrawlerUploadFollowsLiveGlobalPreviewSwitch(t *testing.T) {
+	ctx := context.Background()
+	cat := setupCatalog(t)
+	source := setupScriptCrawler(t, "crawler-global")
+	target := newFakeUploadDrive("target-drive", "pikpak", "target-root")
+	reg := newFakeRegistry()
+	reg.Add(source)
+	reg.Add(target)
+	if err := cat.UpsertDrive(ctx, &catalog.Drive{
+		ID: source.ID(), Kind: scriptcrawler.Kind, RootID: "/",
+		Credentials: map[string]string{"script_path": "/tmp/crawler.py", "upload_drive_id": target.ID()},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	videoID := writeCrawlerVideo(t, cat, source, "pending-preview", ".mp4", []byte("payload"), true)
+	if err := cat.UpdatePreview(ctx, videoID, "", "pending"); err != nil {
+		t.Fatal(err)
+	}
+	enabled := true
+	m := New(Config{Catalog: cat, Registry: reg, PreviewEnabled: func() bool { return enabled }})
+	if err := m.RunOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if target.uploadCalls != 0 {
+		t.Fatal("enabled preview switch allowed upload before preview was ready")
+	}
+	enabled = false
+	if err := m.RunOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	video, err := cat.GetVideo(ctx, videoID)
+	if err != nil || video.DriveID != target.ID() || target.uploadCalls != 1 {
+		t.Fatalf("disabled switch did not unblock upload: %+v, %v, calls=%d", video, err, target.uploadCalls)
+	}
 }

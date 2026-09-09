@@ -11,6 +11,7 @@ import {
 } from "yaml";
 
 export type SettingsDraft = {
+  previewEnabled: boolean;
   nightlyDisabled: boolean;
   nightlyStartTime: string;
   nightlyTimezone: string;
@@ -23,6 +24,7 @@ export type SettingsDraft = {
 export type VisualField = keyof SettingsDraft;
 
 export const DEFAULT_DRAFT: SettingsDraft = {
+  previewEnabled: true,
   nightlyDisabled: false,
   nightlyStartTime: "01:00",
   nightlyTimezone: "Asia/Shanghai",
@@ -130,6 +132,14 @@ function draftFromDocument(document: ReturnType<typeof configDocument>): Setting
   ) {
     throw new Error("preview 必须是映射对象");
   }
+  const configuredPreviewEnabled = document.getIn(["preview", "enabled"]);
+  let previewEnabled = DEFAULT_DRAFT.previewEnabled;
+  if (configuredPreviewEnabled !== undefined && configuredPreviewEnabled !== null) {
+    if (typeof configuredPreviewEnabled !== "boolean") {
+      throw new Error("preview.enabled 必须是布尔值");
+    }
+    previewEnabled = configuredPreviewEnabled;
+  }
   const generationNode = document.get("generation", true);
   if (
     generationNode !== undefined &&
@@ -180,6 +190,7 @@ function draftFromDocument(document: ReturnType<typeof configDocument>): Setting
     builtinTagsEnabled = configuredBuiltinTags;
   }
   return {
+    previewEnabled,
     nightlyDisabled,
     nightlyStartTime,
     nightlyTimezone,
@@ -833,6 +844,18 @@ export function applyVisualFields(
   fields: ReadonlySet<VisualField>
 ) {
   let updated = source;
+  if (fields.has("previewEnabled")) {
+    const document = configDocument(updated);
+    updated = applySourceEdits(
+      updated,
+      booleanFieldEdits(
+        updated,
+        document,
+        { section: "preview", key: "enabled", path: "preview.enabled" },
+        draft.previewEnabled
+      )
+    );
+  }
   if (fields.has("nightlyDisabled")) {
     const document = configDocument(updated);
     updated = applySourceEdits(
@@ -883,6 +906,9 @@ export function applyVisualFields(
 
 export function changedVisualFields(saved: SettingsDraft, draft: SettingsDraft) {
   const fields = new Set<VisualField>();
+  if (saved.previewEnabled !== draft.previewEnabled) {
+    fields.add("previewEnabled");
+  }
   if (saved.nightlyDisabled !== draft.nightlyDisabled) {
     fields.add("nightlyDisabled");
   }

@@ -1040,8 +1040,7 @@ func TestHandleUpsertDriveMetadataOnlySaveDoesNotReloadRuntime(t *testing.T) {
 		Credentials: map[string]string{
 			"cookie": "existing-cookie",
 		},
-		Status:        "ok",
-		TeaserEnabled: true,
+		Status: "ok",
 	}); err != nil {
 		t.Fatalf("seed drive: %v", err)
 	}
@@ -1102,12 +1101,11 @@ func TestHandleUpsertDriveMetadataOnlySaveDoesNotReloadRuntime(t *testing.T) {
 
 func TestDriveRuntimeReloadRequired(t *testing.T) {
 	base := &catalog.Drive{
-		ID:            "drive-main",
-		Kind:          "onedrive",
-		Name:          "Old name",
-		RootID:        "root",
-		TeaserEnabled: true,
-		Credentials:   map[string]string{"refresh_token": "persisted-refresh"},
+		ID:          "drive-main",
+		Kind:        "onedrive",
+		Name:        "Old name",
+		RootID:      "root",
+		Credentials: map[string]string{"refresh_token": "persisted-refresh"},
 	}
 	tests := []struct {
 		name string
@@ -1116,7 +1114,7 @@ func TestDriveRuntimeReloadRequired(t *testing.T) {
 	}{
 		{
 			name: "metadata only",
-			next: &catalog.Drive{ID: "drive-main", Kind: "onedrive", Name: "New name", RootID: "root", TeaserEnabled: false},
+			next: &catalog.Drive{ID: "drive-main", Kind: "onedrive", Name: "New name", RootID: "root"},
 		},
 		{
 			name: "root changed",
@@ -1202,12 +1200,11 @@ func TestDriveTaskSensitiveSettingHandlersSaveAndDeferApply(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = cat.Close() })
 	if err := cat.UpsertDrive(ctx, &catalog.Drive{
-		ID:            "drive-main",
-		Kind:          "onedrive",
-		Name:          "OneDrive",
-		RootID:        "root",
-		TeaserEnabled: true,
-		SkipDirIDs:    []string{"old-dir"},
+		ID:         "drive-main",
+		Kind:       "onedrive",
+		Name:       "OneDrive",
+		RootID:     "root",
+		SkipDirIDs: []string{"old-dir"},
 	}); err != nil {
 		t.Fatalf("seed drive: %v", err)
 	}
@@ -1217,34 +1214,6 @@ func TestDriveTaskSensitiveSettingHandlersSaveAndDeferApply(t *testing.T) {
 		routeCtx.URLParams.Add("id", "drive-main")
 		return req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, routeCtx))
 	}
-
-	t.Run("preview", func(t *testing.T) {
-		lease := &adminTestDriveConfigLease{deferred: true}
-		callbackCalled := false
-		server := &AdminServer{
-			Catalog: cat,
-			BeginDriveConfigUpdate: func(string) (DriveConfigUpdateLease, string) {
-				return lease, ""
-			},
-			OnTeaserEnabledChanged: func(string, bool) { callbackCalled = true },
-		}
-		req := withDriveID(httptest.NewRequest(http.MethodPost, "/admin/api/drives/drive-main/teaser-enabled", strings.NewReader(`{"enabled":false}`)))
-		rr := httptest.NewRecorder()
-		server.handleSetDriveTeaserEnabled(rr, req)
-		if rr.Code != http.StatusOK || !strings.Contains(rr.Body.String(), `"deferred":true`) {
-			t.Fatalf("status = %d, body=%s", rr.Code, rr.Body.String())
-		}
-		got, err := cat.GetDrive(ctx, "drive-main")
-		if err != nil {
-			t.Fatalf("get drive: %v", err)
-		}
-		if got.TeaserEnabled || callbackCalled {
-			t.Fatalf("teaser persisted/callback = %v/%v, want false/deferred", got.TeaserEnabled, callbackCalled)
-		}
-		if lease.scope != DriveConfigUpdatePreview || lease.committedScope != DriveConfigUpdatePreview || !lease.released {
-			t.Fatalf("lease scopes/released = %v/%v/%v", lease.scope, lease.committedScope, lease.released)
-		}
-	})
 
 	t.Run("skip directories", func(t *testing.T) {
 		lease := &adminTestDriveConfigLease{deferred: true}
@@ -1890,11 +1859,10 @@ func TestHandleDeleteDriveRunsRequestedCleanupBeforeDeletingDrive(t *testing.T) 
 		}
 	})
 	if err := cat.UpsertDrive(ctx, &catalog.Drive{
-		ID:            "drive-one",
-		Kind:          "pikpak",
-		Name:          "Drive One",
-		RootID:        "root",
-		TeaserEnabled: true,
+		ID:     "drive-one",
+		Kind:   "pikpak",
+		Name:   "Drive One",
+		RootID: "root",
 	}); err != nil {
 		t.Fatalf("seed drive: %v", err)
 	}
@@ -1978,11 +1946,10 @@ func TestHandleDeleteDriveRequiresCleanupConfirmation(t *testing.T) {
 		}
 	})
 	if err := cat.UpsertDrive(ctx, &catalog.Drive{
-		ID:            "drive-one",
-		Kind:          "pikpak",
-		Name:          "Drive One",
-		RootID:        "root",
-		TeaserEnabled: true,
+		ID:     "drive-one",
+		Kind:   "pikpak",
+		Name:   "Drive One",
+		RootID: "root",
 	}); err != nil {
 		t.Fatalf("seed drive: %v", err)
 	}
@@ -2084,8 +2051,7 @@ func TestHandleListCrawlersOnlyIncludesCrawlerPageScripts(t *testing.T) {
 				"upload_drive_id": "p115-target",
 				"paused":          "true",
 			},
-			Status:        "ok",
-			TeaserEnabled: false,
+			Status: "ok",
 		},
 		{
 			ID:          "p115-target",
@@ -2171,7 +2137,6 @@ func TestHandleListCrawlersOnlyIncludesCrawlerPageScripts(t *testing.T) {
 		UploadProxy      string `json:"uploadProxy"`
 		UploadDriveID    string `json:"uploadDriveId"`
 		Paused           bool   `json:"paused"`
-		TeaserEnabled    bool   `json:"teaserEnabled"`
 		LastCrawlAt      int64  `json:"lastCrawlAt"`
 		TotalCrawled     int    `json:"totalCrawledCount"`
 		LocalVideos      int    `json:"localVideoCount"`
@@ -2191,7 +2156,6 @@ func TestHandleListCrawlersOnlyIncludesCrawlerPageScripts(t *testing.T) {
 		UploadProxy      string
 		UploadDriveID    string
 		Paused           bool
-		TeaserEnabled    bool
 		LastCrawlAt      int64
 		TotalCrawled     int
 		LocalVideos      int
@@ -2210,7 +2174,6 @@ func TestHandleListCrawlersOnlyIncludesCrawlerPageScripts(t *testing.T) {
 			UploadProxy:      d.UploadProxy,
 			UploadDriveID:    d.UploadDriveID,
 			Paused:           d.Paused,
-			TeaserEnabled:    d.TeaserEnabled,
 			LastCrawlAt:      d.LastCrawlAt,
 			TotalCrawled:     d.TotalCrawled,
 			LocalVideos:      d.LocalVideos,
@@ -2243,9 +2206,6 @@ func TestHandleListCrawlersOnlyIncludesCrawlerPageScripts(t *testing.T) {
 	}
 	if !byID["crawler-main"].Paused {
 		t.Fatal("paused = false, want true from crawler drive")
-	}
-	if byID["crawler-main"].TeaserEnabled {
-		t.Fatal("teaserEnabled = true, want false from crawler drive")
 	}
 	if byID["crawler-main"].LastCrawlAt != 1800000000 {
 		t.Fatalf("lastCrawlAt = %d, want 1800000000", byID["crawler-main"].LastCrawlAt)
@@ -2319,8 +2279,7 @@ func TestHandleUpsertCrawlerRequiresScriptPath(t *testing.T) {
 		"id": "crawler-main",
 		"builtin": "legacy",
 		"scriptPath": "`+scriptPath+`",
-		"targetNew": "15",
-		"teaserEnabled": false
+		"targetNew": "15"
 	}`))
 	rr = httptest.NewRecorder()
 	srv.handleUpsertCrawler(rr, req)
@@ -2343,9 +2302,6 @@ func TestHandleUpsertCrawlerRequiresScriptPath(t *testing.T) {
 	}
 	if got.Credentials["script_path"] != scriptPath {
 		t.Fatalf("script_path = %q, want %q", got.Credentials["script_path"], scriptPath)
-	}
-	if got.TeaserEnabled {
-		t.Fatal("teaserEnabled = true, want false from request")
 	}
 }
 
@@ -2431,22 +2387,15 @@ func TestHandleUpsertCrawlerPersistsAndValidatesUploadDrive(t *testing.T) {
 			t.Fatalf("seed drive %s: %v", d.ID, err)
 		}
 	}
-	var teaserCallbackID string
-	var teaserCallbackEnabled bool
 	srv := &AdminServer{
 		Catalog: cat,
-		OnTeaserEnabledChanged: func(id string, enabled bool) {
-			teaserCallbackID = id
-			teaserCallbackEnabled = enabled
-		},
 	}
 
 	req := httptest.NewRequest(http.MethodPost, "/admin/api/crawlers", strings.NewReader(`{
 		"id": "crawler-upload",
 		"scriptPath": "`+scriptPath+`",
 		"uploadDriveId": "p115-target",
-		"uploadProxy": "  http://upload-proxy.example:7890  ",
-		"teaserEnabled": false
+		"uploadProxy": "  http://upload-proxy.example:7890  "
 	}`))
 	rr := httptest.NewRecorder()
 	srv.handleUpsertCrawler(rr, req)
@@ -2462,12 +2411,6 @@ func TestHandleUpsertCrawlerPersistsAndValidatesUploadDrive(t *testing.T) {
 	}
 	if got.Credentials["upload_proxy"] != "http://upload-proxy.example:7890" {
 		t.Fatalf("upload_proxy = %q, want normalized proxy", got.Credentials["upload_proxy"])
-	}
-	if got.TeaserEnabled {
-		t.Fatal("teaserEnabled = true, want false")
-	}
-	if teaserCallbackID != "" {
-		t.Fatalf("teaser callback on create = %q, want none", teaserCallbackID)
 	}
 
 	req = httptest.NewRequest(http.MethodPost, "/admin/api/crawlers", strings.NewReader(`{
@@ -2489,12 +2432,6 @@ func TestHandleUpsertCrawlerPersistsAndValidatesUploadDrive(t *testing.T) {
 	}
 	if got.Credentials["upload_proxy"] != "http://upload-proxy.example:7890" {
 		t.Fatalf("omitted upload_proxy = %q, want preserved proxy", got.Credentials["upload_proxy"])
-	}
-	if got.TeaserEnabled {
-		t.Fatal("teaserEnabled after edit without field = true, want preserved false")
-	}
-	if teaserCallbackID != "" {
-		t.Fatalf("teaser callback after preserved edit = %q, want none", teaserCallbackID)
 	}
 
 	req = httptest.NewRequest(http.MethodPost, "/admin/api/crawlers", strings.NewReader(`{
@@ -2536,23 +2473,16 @@ func TestHandleUpsertCrawlerPersistsAndValidatesUploadDrive(t *testing.T) {
 	req = httptest.NewRequest(http.MethodPost, "/admin/api/crawlers", strings.NewReader(`{
 		"id": "crawler-upload",
 		"scriptPath": "`+scriptPath+`",
-		"uploadDriveId": "wopan-target",
-		"teaserEnabled": true
+		"uploadDriveId": "wopan-target"
 	}`))
 	rr = httptest.NewRecorder()
 	srv.handleUpsertCrawler(rr, req)
 	if rr.Code != http.StatusOK {
-		t.Fatalf("enable teaser status = %d, body = %s", rr.Code, rr.Body.String())
+		t.Fatalf("update target status = %d, body = %s", rr.Code, rr.Body.String())
 	}
 	got, err = cat.GetDrive(ctx, "crawler-upload")
 	if err != nil {
-		t.Fatalf("get crawler after teaser enable: %v", err)
-	}
-	if !got.TeaserEnabled {
-		t.Fatal("teaserEnabled after explicit enable = false, want true")
-	}
-	if teaserCallbackID != "crawler-upload" || !teaserCallbackEnabled {
-		t.Fatalf("teaser callback = %q/%v, want crawler-upload/true", teaserCallbackID, teaserCallbackEnabled)
+		t.Fatalf("get crawler after target update: %v", err)
 	}
 
 	req = httptest.NewRequest(http.MethodPost, "/admin/api/crawlers", strings.NewReader(`{

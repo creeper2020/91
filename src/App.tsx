@@ -38,6 +38,7 @@ import {
   usePageScrollRoot,
 } from "@/lib/pageScroll";
 import { previewController } from "@/lib/previewController";
+import { watchPreviewSettings } from "@/lib/previewSettings";
 import { RouteActivityProvider } from "@/lib/routeActivity";
 import { useDocumentScrollLock } from "@/lib/useDocumentScrollLock";
 import { rememberVideoReturnPath, routeToPath } from "@/lib/videoReturnPath";
@@ -367,6 +368,7 @@ function VideoDetailForeground() {
 }
 
 export default function App() {
+  useEffect(() => watchPreviewSettings(), []);
   const location = useLocation();
   const listingBackground = location.pathname.startsWith("/video/")
     ? readVideoListingBackground(location.state)

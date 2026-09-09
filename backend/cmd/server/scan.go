@@ -207,7 +207,7 @@ func (a *App) runScanWithTaskContext(ctx context.Context, driveID string) (repor
 	// retry that fails again remains failed until the next scan or manual retry.
 	if _, err := a.resetFailedGeneration(ctx, driveID, catalog.GenerationKinds{
 		Thumbnails:   thumbnailWorker != nil,
-		Previews:     previewWorker != nil && driveConfig.TeaserEnabled,
+		Previews:     previewWorker != nil && a.previewEnabled(),
 		Fingerprints: fingerprintWorker != nil,
 	}); err != nil {
 		report.AddIssue("generation_retry", err)

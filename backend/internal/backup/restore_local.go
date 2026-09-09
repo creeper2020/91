@@ -338,8 +338,8 @@ UPDATE deleted_videos
 		if _, err := tx.ExecContext(ctx, `
 INSERT INTO drives (
   id, kind, name, root_id, scan_root_id, credentials, status, last_error,
-  teaser_enabled, skip_dir_ids, created_at, updated_at
-) VALUES (?, 'localstorage', ?, '/', '/', ?, 'ok', '', 1, '[]', ?, ?)`,
+  skip_dir_ids, created_at, updated_at
+) VALUES (?, 'localstorage', ?, '/', '/', ?, 'ok', '', '[]', ?, ?)`,
 			plan.DriveID,
 			plan.Name,
 			string(credentials),

@@ -88,6 +88,8 @@ type Server struct {
 	// GetTheme 返回当前生效的主题（"dark" | "pink" | "sky"）。前台 /api/settings/theme 用，
 	// 不需要登录。无注入时返回 "dark"。
 	GetTheme func() string
+	// GetPreviewEnabled exposes only the live global preview policy to cards.
+	GetPreviewEnabled func() bool
 
 	subtitleCacheMu  sync.Mutex
 	subtitleCache    map[string]subtitleCacheEntry
@@ -234,6 +236,7 @@ func (s *Server) RegisterRoutes(r chi.Router, a *auth.Authenticator) {
 	// 公开端点：拿当前生效的主题。登录页本身要在挂前就能读，所以单独挂在
 	// 鉴权组之外。只暴露 theme 一个字段，避免泄露其他设置。
 	r.Get("/api/settings/theme", s.handleGetTheme)
+	r.Get("/api/settings/preview", s.handleGetPreviewSettings)
 
 	// 一次性分享的领取和媒体路由必须公开，但每个媒体请求都会再次校验
 	// HttpOnly 分享会话，并且只能访问该分享绑定的单个视频。
@@ -295,6 +298,12 @@ func (s *Server) handleGetTheme(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Cache-Control", "no-store")
 	writeJSON(w, http.StatusOK, map[string]any{"theme": theme})
+}
+
+func (s *Server) handleGetPreviewSettings(w http.ResponseWriter, r *http.Request) {
+	enabled := s.GetPreviewEnabled == nil || s.GetPreviewEnabled()
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusOK, map[string]bool{"previewEnabled": enabled})
 }
 
 func (s *Server) handleHome(w http.ResponseWriter, r *http.Request) {

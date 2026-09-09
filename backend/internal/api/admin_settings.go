@@ -8,10 +8,8 @@ import (
 
 // settingsDTO 是 GET/PUT /admin/api/settings 的入参/出参。
 //
-// 注意：早期的全局 previewEnabled 字段已经下沉为每盘 teaser_enabled，
-// 不再出现在这里；前端要切换某个盘的预览视频生成请用 POST /admin/api/drives 上传
-// teaserEnabled 字段。config.yaml 中的应用配置由 /admin/api/config.yaml
-// 管理；这里仅保留已有的数据库型偏好设置。
+// Application configuration, including preview.enabled, is owned by config.yaml.
+// This endpoint only retains database-backed UI preferences.
 type settingsDTO struct {
 	Theme                   string `json:"theme"`
 	AutoGenerateTagsEnabled bool   `json:"autoGenerateTagsEnabled"`

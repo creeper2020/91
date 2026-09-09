@@ -289,7 +289,7 @@ func TestReconcileLocalGeneratedAssetsAdmitsRepairedWorkBeforeReturning(t *testi
 		t.Fatalf("open catalog: %v", err)
 	}
 	defer cat.Close()
-	seedDriveWithTeaser(t, cat, "drive-id", true)
+	seedGenerationDrive(t, cat, "drive-id")
 
 	now := time.Now()
 	video := &catalog.Video{

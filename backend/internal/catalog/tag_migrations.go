@@ -131,11 +131,11 @@ UPDATE videos
 	if err := c.ensureBaseVideoIndexes(ctx); err != nil {
 		return err
 	}
-	// drives.teaser_enabled：每盘预览视频开关，替代旧的全局 preview.enabled。
-	// 升级路径：直接让 ALTER TABLE 的 DEFAULT 1 兜底 —— 每个现存 drive 都默认开启，
-	// 不读旧的 settings.preview.enabled 字段。这样老用户即便之前关过全局开关，
-	// 升级后所有盘也都恢复"默认生成预览视频"，跟新建保持一致。
-	if _, err := c.addColumnIfMissingReportNew(ctx, "drives", "teaser_enabled", "INTEGER NOT NULL DEFAULT 1"); err != nil {
+	// Preview generation is now controlled exclusively by config.yaml.
+	if err := c.dropColumnIfExists(ctx, "drives", "teaser_enabled"); err != nil {
+		return err
+	}
+	if err := c.DeleteSettings(ctx, "preview.enabled", "drives.teaser_enabled.default_open_migrated"); err != nil {
 		return err
 	}
 	// drives.skip_dir_ids：每盘扫描跳过目录集合（JSON array of string）。命中
@@ -189,13 +189,6 @@ CREATE TABLE IF NOT EXISTS deleted_videos (
 	if err := c.syncDriveScanRootIDToRootID(ctx); err != nil {
 		return err
 	}
-	// 一次性修正：早期版本（短暂存在过）会把现存 drive 的 teaser_enabled 同步成
-	// 旧的全局 preview.enabled 值，导致升级后所有 drive 都是关。"默认开启"约定下，
-	// 这里一次性把所有 drive 强制重置为 1，并用 marker setting 记号，避免之后
-	// 再覆盖用户后续在 UI 里 per-drive 改成关的设置。
-	if err := c.resetDriveTeaserEnabledToDefaultOnce(ctx); err != nil {
-		return err
-	}
 	// 一次性修正：thumbnail_status 列是后加的（DEFAULT 'pending'），所有列加之前
 	// 已有 thumbnail_url 的视频都被填成了 pending。worker 入队按 url 判定不会重复
 	// 生成，但 status 字段对管理员/统计是误导（admin API 自己已经按 url 计数所以
@@ -207,7 +200,7 @@ CREATE TABLE IF NOT EXISTS deleted_videos (
 	if err := c.requeueFailedThumbnailsWithReadyPreviewOnce(ctx); err != nil {
 		return err
 	}
-	if err := c.requeueSkippedPreviews(ctx); err != nil {
+	if err := c.requeueInactivePreviews(ctx); err != nil {
 		return err
 	}
 	if _, err := c.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_videos_content_hash ON videos(content_hash)`); err != nil {
@@ -1208,33 +1201,6 @@ func (c *Catalog) addColumnIfMissingReportNew(ctx context.Context, table, column
 	return true, nil
 }
 
-// resetDriveTeaserEnabledToDefaultOnce 把所有现存 drive 的 teaser_enabled 强制
-// 设为 1（开启），但仅在历史上没跑过这条迁移时执行（用 marker setting 记号）。
-//
-// 为什么需要：早期短暂存在过的版本会从旧的全局 preview.enabled = "0" 同步到
-// 所有 drive 的 teaser_enabled = 0；用户报告升级后页面全显示"预览视频关"。新版
-// 约定 per-drive 默认开启，所以这里跑一次性修正。
-//
-// 幂等保证：marker setting 设过了就不再跑，确保用户在 UI 里把某盘关了不会被
-// 重启时反复打开。
-func (c *Catalog) resetDriveTeaserEnabledToDefaultOnce(ctx context.Context) error {
-	const markerKey = "drives.teaser_enabled.default_open_migrated"
-	marker, err := c.GetSetting(ctx, markerKey, "")
-	if err != nil {
-		return fmt.Errorf("read %s marker: %w", markerKey, err)
-	}
-	if strings.TrimSpace(marker) == "1" {
-		return nil
-	}
-	if _, err := c.db.ExecContext(ctx, `UPDATE drives SET teaser_enabled = 1, updated_at = ?`, time.Now().UnixMilli()); err != nil {
-		return fmt.Errorf("reset teaser_enabled to default: %w", err)
-	}
-	if err := c.SetSetting(ctx, markerKey, "1"); err != nil {
-		return fmt.Errorf("write %s marker: %w", markerKey, err)
-	}
-	return nil
-}
-
 // reconcileThumbnailStatusOnce 把所有"封面 URL 已写但 thumbnail_status 仍停留在
 // 'pending'"的视频行修正为 'ready'。仅在历史上没跑过这条迁移时执行（marker 守护）。
 //
@@ -1314,7 +1280,7 @@ UPDATE videos
 	return nil
 }
 
-func (c *Catalog) requeueSkippedPreviews(ctx context.Context) error {
+func (c *Catalog) requeueInactivePreviews(ctx context.Context) error {
 	res, err := c.db.ExecContext(ctx, `
 UPDATE videos
    SET preview_file_id = '',
@@ -1322,13 +1288,13 @@ UPDATE videos
 	   preview_updated_at = 0,
        preview_status = 'pending',
        updated_at = ?
- WHERE COALESCE(preview_status, 'pending') = 'skipped'
+ WHERE COALESCE(preview_status, 'pending') IN ('skipped', 'disabled')
 `, time.Now().UnixMilli())
 	if err != nil {
-		return fmt.Errorf("requeue skipped previews: %w", err)
+		return fmt.Errorf("requeue inactive previews: %w", err)
 	}
 	if affected, err := res.RowsAffected(); err == nil && affected > 0 {
-		log.Printf("[catalog] requeued %d skipped preview(s) for generation", affected)
+		log.Printf("[catalog] requeued %d inactive preview(s) for generation", affected)
 	}
 	return nil
 }

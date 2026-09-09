@@ -209,7 +209,7 @@ test("desktop collection creates thumbnail resources only near the viewport", ()
     activePreviewHookSource,
     /function useIsActivePreview\(videoID: string\): boolean[\s\S]*?previewController\.getActiveId\(\) === videoID/
   );
-  assert.match(railSource, /import \{ useIsActivePreview \}/);
+  assert.match(railSource, /import \{ useIsActivePreview, usePreviewEnabled \}/);
   assert.doesNotMatch(railSource, /function useActivePreviewId/);
   assert.doesNotMatch(railSource, /media\.addEventListener\("change", update\)/);
 });
@@ -245,7 +245,7 @@ test("desktop and mobile collections request previews and share preview behavior
     /shouldInterceptPreviewTap\([\s\S]*?previewActive/
   );
   assert.match(componentSource, /previewController\.setActiveId\(video\.id\)/);
-  assert.match(componentSource, /import \{ useIsActivePreview \}/);
+  assert.match(componentSource, /import \{ useIsActivePreview, usePreviewEnabled \}/);
   assert.match(
     componentSource,
     /function startTouchPreviewIntent\(\)[\s\S]*?setPreviewState\("intent"\)[\s\S]*?window\.setTimeout\([\s\S]*?setShouldRenderPreview\(true\)[\s\S]*?TOUCH_PREVIEW_DELAY_MS/

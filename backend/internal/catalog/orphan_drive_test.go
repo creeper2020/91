@@ -19,11 +19,10 @@ func TestListVideosHidesMissingDriveVideosWhenDrivesExist(t *testing.T) {
 	})
 
 	if err := cat.UpsertDrive(ctx, &Drive{
-		ID:            "active-drive",
-		Kind:          "pikpak",
-		Name:          "Active",
-		RootID:        "root",
-		TeaserEnabled: true,
+		ID:     "active-drive",
+		Kind:   "pikpak",
+		Name:   "Active",
+		RootID: "root",
 	}); err != nil {
 		t.Fatalf("seed drive: %v", err)
 	}

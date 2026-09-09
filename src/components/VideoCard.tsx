@@ -12,7 +12,7 @@ import {
   TOUCH_PREVIEW_DELAY_MS,
 } from "@/lib/previewIntent";
 import { useInViewport } from "@/lib/useInViewport";
-import { useIsActivePreview } from "@/lib/useIsActivePreview";
+import { useIsActivePreview, usePreviewEnabled } from "@/lib/useIsActivePreview";
 import { preloadVideoDetailPage } from "@/lib/videoDetailRoute";
 import { formatCount } from "@/lib/format";
 import { isVideoReturnPath, routeToPath } from "@/lib/videoReturnPath";
@@ -51,6 +51,11 @@ export const VideoCard = memo(function VideoCard({
   const videoRef = useRef<HTMLVideoElement | null>(null);
 
   const previewIsActive = useIsActivePreview(video.id);
+  const previewEnabled = usePreviewEnabled();
+
+  useEffect(() => {
+    if (!previewEnabled) cleanup();
+  }, [previewEnabled, video.id]);
   const inView = useInViewport(rootRef);
 
   // 当全局活跃卡片不是自己时，立刻停止预览
@@ -115,6 +120,7 @@ export const VideoCard = memo(function VideoCard({
   }
 
   function startPreviewIntent() {
+    if (!previewController.isEnabled() || !video.previewSrc) return;
     if (!inView) return;
     if (previewIntentTimerRef.current) return;
     setPreviewState("intent");
@@ -126,6 +132,7 @@ export const VideoCard = memo(function VideoCard({
   }
 
   function startTouchPreviewIntent() {
+    if (!previewController.isEnabled() || !video.previewSrc) return;
     clearPreviewIntentTimer();
     touchPreviewArmedRef.current = true;
     previewController.setActiveId(video.id);
@@ -133,6 +140,7 @@ export const VideoCard = memo(function VideoCard({
     previewIntentTimerRef.current = window.setTimeout(() => {
       previewIntentTimerRef.current = null;
       if (
+        !previewController.isEnabled() ||
         !touchPreviewArmedRef.current ||
         previewController.getActiveId() !== video.id
       ) {
@@ -149,6 +157,7 @@ export const VideoCard = memo(function VideoCard({
   }
 
   function startPreviewNow(options: { requireInView: boolean }) {
+    if (!previewController.isEnabled() || !video.previewSrc) return;
     if (options.requireInView && !inView) return;
     clearPreviewIntentTimer();
     previewController.setActiveId(video.id);
@@ -198,6 +207,7 @@ export const VideoCard = memo(function VideoCard({
       (touchPreviewArmedRef.current || shouldRenderPreview);
     if (
       !shouldInterceptPreviewTap({
+        previewEnabled: previewController.isEnabled() && Boolean(video.previewSrc),
         pointerType: lastPointerTypeRef.current,
         canHover: canHoverRef.current,
         previewActive,
@@ -216,6 +226,7 @@ export const VideoCard = memo(function VideoCard({
     <article
       ref={rootRef as React.RefObject<HTMLElement>}
       className="video-card"
+      data-preview-enabled={previewEnabled}
       onPointerEnter={handlePointerEnter}
       onPointerLeave={handlePointerLeave}
       onPointerDown={handlePointerDown}
@@ -236,7 +247,7 @@ export const VideoCard = memo(function VideoCard({
             highPriority={highPriority}
           />
 
-          {shouldRenderPreview && (
+          {previewEnabled && shouldRenderPreview && (
             <PreviewVideo
               ref={videoRef}
               src={video.previewSrc}
@@ -247,13 +258,13 @@ export const VideoCard = memo(function VideoCard({
             />
           )}
 
-          {previewState === "loading" && <span className="preview-loader" />}
-          {previewState === "error" && (
+          {previewEnabled && previewState === "loading" && <span className="preview-loader" />}
+          {previewEnabled && previewState === "error" && (
             <span className="preview-error">预览加载失败</span>
           )}
 
           {/* 预览进度条（播放时显示在底部） */}
-          {previewState === "playing" && (
+          {previewEnabled && previewState === "playing" && (
             <div className="preview-progress" aria-hidden="true">
               <div
                 className="preview-progress__bar"
@@ -263,7 +274,7 @@ export const VideoCard = memo(function VideoCard({
           )}
 
           {/* hover 时右上角 "预览" 角标 */}
-          {previewState === "playing" && (
+          {previewEnabled && previewState === "playing" && (
             <span className="preview-tag" aria-hidden="true">
               预览
             </span>
@@ -279,7 +290,7 @@ export const VideoCard = memo(function VideoCard({
             </div>
           )}
 
-          {video.sourceLabel && previewState !== "playing" && (
+          {video.sourceLabel && (!previewEnabled || previewState !== "playing") && (
             <span
               className="source-badge"
               data-kind={sourceKindFromLabel(video.sourceLabel)}

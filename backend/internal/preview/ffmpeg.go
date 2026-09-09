@@ -1100,6 +1100,9 @@ type Worker struct {
 	Gen     TeaserGenerator
 	Catalog *catalog.Catalog
 	Drive   drives.Drive
+	// Enabled reads the shared runtime policy at admission and task start.
+	// Nil enables standalone workers. Already running tasks may finish.
+	Enabled func() bool
 	// OnPreviewReady lets the application schedule dependent local-asset work
 	// without coupling this worker to a concrete thumbnail worker.
 	OnPreviewReady func(*catalog.Video)
@@ -1130,7 +1133,7 @@ func NewWorker(gen TeaserGenerator, cat *catalog.Catalog, drv drives.Drive) *Wor
 }
 
 func (w *Worker) Enqueue(v *catalog.Video) bool {
-	if v == nil {
+	if v == nil || !w.enabled() {
 		return false
 	}
 	if !w.queue.reserve(v) {
@@ -1146,7 +1149,7 @@ func (w *Worker) Enqueue(v *catalog.Video) bool {
 }
 
 func (w *Worker) EnqueueBlocking(ctx context.Context, v *catalog.Video) bool {
-	if v == nil {
+	if v == nil || !w.enabled() {
 		return false
 	}
 	if !w.queue.reserve(v) {
@@ -1159,6 +1162,10 @@ func (w *Worker) EnqueueBlocking(ctx context.Context, v *catalog.Video) bool {
 		w.queue.release(v)
 		return false
 	}
+}
+
+func (w *Worker) enabled() bool {
+	return w.Enabled == nil || w.Enabled()
 }
 
 type ThumbWorker struct {
@@ -1607,7 +1614,7 @@ func (w *Worker) prepareQueued(ctx context.Context, v *catalog.Video) func() {
 			taskRelease()
 		}
 	}()
-	if w.Catalog == nil || v.ID == "" || ctx.Err() != nil {
+	if w.Catalog == nil || v.ID == "" || ctx.Err() != nil || !w.enabled() {
 		return nil
 	}
 	if w.TaskGuard != nil {
@@ -1629,7 +1636,7 @@ func (w *Worker) prepareQueued(ctx context.Context, v *catalog.Video) func() {
 	return func() {
 		defer taskRelease()
 		defer release()
-		if ctx.Err() != nil {
+		if ctx.Err() != nil || !w.enabled() {
 			w.queue.release(v)
 			return
 		}

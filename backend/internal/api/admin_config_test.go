@@ -125,3 +125,42 @@ func TestConfigYAMLPutReportsRestartForNonLiveFields(t *testing.T) {
 		t.Fatal("server.listen change should require restart")
 	}
 }
+
+func TestGlobalPreviewSwitchControlsRegenerationEndpoints(t *testing.T) {
+	server, _ := newConfigAPIForTest(t, "preview: {enabled: false}\n")
+	calls := 0
+	server.OnRegenPreview = func(string) { calls++ }
+	server.OnRegenAllPreviews = func() { calls++ }
+	server.OnRegenFailedPreviews = func(string) { calls++ }
+	handlers := []http.HandlerFunc{
+		server.handleRegenPreview,
+		server.handleRegenAllPreviews,
+		server.handleRegenFailedPreviews,
+	}
+	for _, handler := range handlers {
+		rr := httptest.NewRecorder()
+		handler(rr, httptest.NewRequest(http.MethodPost, "/", nil))
+		if rr.Code != http.StatusConflict {
+			t.Fatalf("disabled regeneration returned %d: %s", rr.Code, rr.Body.String())
+		}
+	}
+	if calls != 0 {
+		t.Fatal("disabled switch triggered generation")
+	}
+	rr := httptest.NewRecorder()
+	server.handlePutConfigYAML(rr, httptest.NewRequest(http.MethodPut, "/admin/api/config.yaml", strings.NewReader("preview: {enabled: true}\n")))
+	var result config.SaveResult
+	if err := json.Unmarshal(rr.Body.Bytes(), &result); err != nil || rr.Code != http.StatusOK || result.RestartRequired || !result.Settings.PreviewEnabled {
+		t.Fatalf("enable failed: status=%d, body=%s, err=%v", rr.Code, rr.Body.String(), err)
+	}
+	for _, handler := range handlers {
+		rr := httptest.NewRecorder()
+		handler(rr, httptest.NewRequest(http.MethodPost, "/", nil))
+		if rr.Code != http.StatusAccepted {
+			t.Fatalf("enabled regeneration returned %d", rr.Code)
+		}
+	}
+	if calls != len(handlers) {
+		t.Fatalf("generation callbacks = %d, want %d", calls, len(handlers))
+	}
+}

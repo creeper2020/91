@@ -23,8 +23,6 @@ const (
 	// DriveConfigUpdateRuntime covers kind, root, credentials, and provider
 	// options captured by a mounted Driver.
 	DriveConfigUpdateRuntime DriveConfigUpdateScope = 1 << iota
-	// DriveConfigUpdatePreview covers the per-drive preview switch.
-	DriveConfigUpdatePreview
 	// DriveConfigUpdateScan covers skip-directory settings.
 	DriveConfigUpdateScan
 	// DriveConfigUpdateDestructive reserves deletion. It blocks admissions while
@@ -108,10 +106,6 @@ type AdminServer struct {
 	GetTagJobStatus              func() TagJobStatus
 	GetDriveGenerationStatuses   func() map[string]DriveGenerationStatuses
 	GetPreviewGenerationVideoIDs func() map[string]bool
-	// OnTeaserEnabledChanged 在 per-drive 预览视频开关被切换后调用。
-	// enabled=true 时上层应该重新把 pending 预览视频入队（类似旧的全局开关从关到开）；
-	// enabled=false 时通常不用做事 —— worker 入队前会再次查 catalog，自然停止。
-	OnTeaserEnabledChanged func(driveID string, enabled bool)
 	// Theme 读写（"dark" | "pink" | "sky"）
 	GetTheme func() string
 	SetTheme func(theme string) error
@@ -261,7 +255,6 @@ func (a *AdminServer) Register(r chi.Router) {
 			r.Delete("/drives/{id}", a.handleDeleteDrive)
 			r.Post("/drives/{id}/rescan", a.handleRescan)
 			r.Post("/drives/{id}/tasks/stop", a.handleStopDriveTasks)
-			r.Post("/drives/{id}/teaser-enabled", a.handleSetDriveTeaserEnabled)
 			r.Post("/drives/{id}/skip-dirs", a.handleSetDriveSkipDirs)
 			r.Get("/drives/{id}/dirtree", a.handleListDriveDirTree)
 			r.Post("/drives/{id}/previews/failed/regenerate", a.handleRegenFailedPreviews)

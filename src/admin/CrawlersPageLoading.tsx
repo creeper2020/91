@@ -3,22 +3,6 @@ import { useAdminFloatingActionSpace } from "./useAdminFloatingActionSpace";
 
 const CRAWLER_LIST_SKELETON_COUNT = 3;
 
-export function CrawlerListControlsPlaceholder() {
-  return (
-    <div
-      className="admin-crawler-list__controls admin-crawler-list__controls--placeholder"
-      aria-hidden="true"
-    >
-      <div className="admin-crawler-global-teaser">
-        <span>预览视频</span>
-        <button className="toggle-switch" type="button" disabled tabIndex={-1}>
-          <span className="toggle-switch__dot" />
-        </button>
-      </div>
-    </div>
-  );
-}
-
 export function CrawlerListSkeleton() {
   return (
     <div
@@ -49,7 +33,6 @@ export function CrawlersPageLoading() {
     >
       <div className="admin-crawler-console">
         <div className="admin-card admin-crawler-list" aria-busy="true">
-          <CrawlerListControlsPlaceholder />
           <CrawlerListSkeleton />
         </div>
       </div>

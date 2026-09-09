@@ -258,7 +258,7 @@ func (a *App) scheduleManualCrawlerUploadMigration(ctx context.Context, driveID 
 		log.Printf("[scriptcrawler] drive=%s manual upload count assets: %v", driveID, err)
 		return false, "读取待上传视频失败"
 	}
-	if reason := crawlerUploadAssetBlockReason(d, assets); reason != "" {
+	if reason := crawlerUploadAssetBlockReason(a.previewEnabled(), assets); reason != "" {
 		return false, reason
 	}
 	if err := a.ensureDriveAttached(taskCtx, driveID); err != nil {
@@ -316,7 +316,7 @@ func (a *App) scheduleManualCrawlerUploadMigration(ctx context.Context, driveID 
 	return true, ""
 }
 
-func crawlerUploadAssetBlockReason(d *catalog.Drive, assets catalog.CrawlerAssetCounts) string {
+func crawlerUploadAssetBlockReason(previewEnabled bool, assets catalog.CrawlerAssetCounts) string {
 	if assets.Local <= 0 {
 		return "没有待上传的本地视频"
 	}
@@ -326,7 +326,7 @@ func crawlerUploadAssetBlockReason(d *catalog.Drive, assets catalog.CrawlerAsset
 	if assets.Fingerprint.Failed > 0 {
 		return "存在指纹生成失败的视频，请先重试或处理失败项"
 	}
-	if d != nil && d.TeaserEnabled {
+	if previewEnabled {
 		if assets.Teaser.Pending > 0 {
 			return "还有待生成的预览视频"
 		}

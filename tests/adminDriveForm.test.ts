@@ -724,21 +724,7 @@ test("crawler management is a separate admin section", () => {
   assert.doesNotMatch(crawlerPageSource, /<Upload size=\{12\} \/>\s*替换脚本文件/);
   assert.match(crawlerPageSource, /CrawlerUploadTargetField/);
   assert.match(crawlerPageSource, /uploadDriveId/);
-  assert.match(crawlerPageSource, /api\.setDriveTeaserEnabled/);
-  assert.match(crawlerPageSource, /toggleCrawlerTeasers/);
-  assert.match(crawlerPageSource, /className="admin-crawler-global-teaser"/);
-  assert.equal(crawlerPageSource.match(/className="admin-crawler-global-teaser"/g)?.length, 1);
-  assert.match(crawlerPageSource, /const allCrawlerTeasersEnabled = list\.every/);
-  assert.doesNotMatch(crawlerPageSource, /暂无爬虫，新增后默认开启预览视频生成/);
-  assert.match(
-    crawlerPageSource,
-    /\{hasCrawlers && \(\s*<div className="admin-crawler-list__controls">\s*<div className="admin-crawler-global-teaser">/
-  );
-  assert.doesNotMatch(crawlerPageSource, /admin-crawler-row__preview-toggle|onToggleTeaser/);
-  assert.match(crawlerPageSource, /className=\{`toggle-switch \$\{allCrawlerTeasersEnabled \? "is-on" : ""\}/);
-  assert.match(crawlerPageSource, /role="switch"/);
-  assert.match(crawlerPageSource, /aria-checked=\{allCrawlerTeasersEnabled\}/);
-  assert.match(crawlerPageSource, /className="toggle-switch__dot"/);
+  assert.doesNotMatch(crawlerPageSource, /setDriveTeaserEnabled|toggleCrawlerTeasers|admin-crawler-global-teaser|allCrawlerTeasersEnabled/);
   assert.match(crawlerPageSource, /预览视频/);
   assert.doesNotMatch(crawlerPageSource, /admin-crawler-preview-card-toggle/);
   assert.doesNotMatch(crawlerPageSource, /预览：开/);
@@ -761,8 +747,6 @@ test("crawler management is a separate admin section", () => {
   assert.doesNotMatch(crawlerPageSource, /label: "本轮总数"/);
   assert.doesNotMatch(crawlerPageSource, /admin-crawler-preview-card-toggle \$\{crawler\.teaserEnabled/);
   assert.doesNotMatch(adminCss, /admin-crawler-preview-card-toggle\.is-on/);
-  assert.match(adminCss, /\.admin-crawler-list__controls\s*\{[^}]*align-items\s*:\s*flex-start;[^}]*justify-content\s*:\s*flex-start/s);
-  assert.match(adminCss, /\.admin-crawler-global-teaser\s*\{[^}]*display\s*:\s*inline-grid;[^}]*justify-items\s*:\s*center/s);
   assert.match(adminCss, /\.admin-crawler-console\s*\{[^}]*width\s*:\s*min\(100%,\s*920px\);[^}]*margin-inline\s*:\s*auto/s);
   assert.match(adminCss, /\.admin-crawler-list\s*\{[^}]*border\s*:\s*0;[^}]*background\s*:\s*transparent;[^}]*box-shadow\s*:\s*none/s);
   assert.match(adminCss, /\.admin-crawler-table\s*\{[^}]*display\s*:\s*grid;[^}]*gap\s*:\s*var\(--space-3\);[^}]*padding\s*:\s*var\(--space-4\)/s);
@@ -788,7 +772,7 @@ test("crawler management is a separate admin section", () => {
   assert.match(apiSource, /uploadDriveId\?: string/);
   assert.match(apiSource, /uploadProxy\?: string/);
   assert.match(apiSource, /paused: boolean/);
-  assert.match(apiSource, /teaserEnabled: boolean/);
+  assert.doesNotMatch(apiSource, /teaserEnabled: boolean/);
   assert.doesNotMatch(apiSource, /teaserEnabled\?: boolean/);
   assert.match(apiSource, /"\/crawlers"/);
   assert.match(apiSource, /\/crawlers\/\$\{encodeURIComponent\(id\)\}\/upload/);
@@ -1015,10 +999,7 @@ test("empty crawler list renders the shared empty visual", () => {
     crawlerPageSource,
     /<AdminEmptyVisual[\s\S]*?variant="empty"[\s\S]*?text="暂无爬虫"[\s\S]*?className="admin-crawler-empty"/
   );
-  assert.match(
-    crawlerPageSource,
-    /\{hasCrawlers && \([\s\S]*?className="admin-crawler-list__controls"[\s\S]*?\)\}\s*\{loading \? \(/
-  );
+  assert.doesNotMatch(crawlerPageSource, /admin-crawler-list__controls/);
   assert.doesNotMatch(crawlerPageSource, /<SpiderIcon size=\{28\} \/>/);
   assert.match(
     adminCss,
@@ -1381,20 +1362,10 @@ test("drive generation actions are iconless and evenly distributed", () => {
   );
 });
 
-test("drive preview generation uses an accessible slider switch", () => {
-  assert.match(
-    driveComponentsSource,
-    /className=\{`toggle-switch \$\{d\.teaserEnabled \? "is-on" : ""\}/
-  );
-  assert.match(driveComponentsSource, /role="switch"/);
-  assert.match(driveComponentsSource, /aria-checked=\{d\.teaserEnabled\}/);
-  assert.match(driveComponentsSource, /className="toggle-switch__dot"/);
-  assert.match(
-    driveComponentsSource,
-    /disabled=\{togglingTeaserId === d\.id\}/
-  );
-  assert.doesNotMatch(driveComponentsSource, /previewSettingBusy|暂不能修改预览开关/);
-  assert.doesNotMatch(driveComponentsSource, /预览视频：开|预览视频：关|PowerOff/);
+test("drive preview generation has no per-drive switch", () => {
+  assert.doesNotMatch(driveComponentsSource, /teaserEnabled|onToggleTeaser|togglingTeaserId/);
+  assert.doesNotMatch(drivesPageSource, /setDriveTeaserEnabled|handleToggleTeaser/);
+  assert.doesNotMatch(apiSource, /setDriveTeaserEnabled|teaser-enabled/);
 });
 
 test("drive skip directory tree uses persistent visibility icons without extra actions", () => {

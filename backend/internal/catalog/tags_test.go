@@ -2629,7 +2629,7 @@ func TestReconcileThumbnailStatusOnce(t *testing.T) {
 	}
 }
 
-func TestRequeueSkippedPreviews(t *testing.T) {
+func TestRequeueInactivePreviews(t *testing.T) {
 	ctx := context.Background()
 	cat, err := Open(t.TempDir() + "/catalog.db")
 	if err != nil {
@@ -2647,6 +2647,7 @@ func TestRequeueSkippedPreviews(t *testing.T) {
 		wantLocal  string
 		wantFileID string
 	}{
+		{"preview-disabled", "disabled", "", "", "pending", "", ""},
 		{"preview-skipped", "skipped", "/tmp/old-preview.mp4", "old-preview-file", "pending", "", ""},
 		{"preview-ready", "ready", "/tmp/ready-preview.mp4", "ready-preview-file", "ready", "/tmp/ready-preview.mp4", "ready-preview-file"},
 		{"preview-failed", "failed", "/tmp/failed-preview.mp4", "failed-preview-file", "failed", "/tmp/failed-preview.mp4", "failed-preview-file"},
@@ -2661,10 +2662,10 @@ func TestRequeueSkippedPreviews(t *testing.T) {
 		}
 	}
 
-	if err := cat.requeueSkippedPreviews(ctx); err != nil {
+	if err := cat.requeueInactivePreviews(ctx); err != nil {
 		t.Fatalf("requeue skipped previews: %v", err)
 	}
-	if err := cat.requeueSkippedPreviews(ctx); err != nil {
+	if err := cat.requeueInactivePreviews(ctx); err != nil {
 		t.Fatalf("second requeue skipped previews: %v", err)
 	}
 
@@ -2688,8 +2689,8 @@ func TestRequeueSkippedPreviews(t *testing.T) {
 	if err != nil {
 		t.Fatalf("list pending previews: %v", err)
 	}
-	if len(pending) != 1 || pending[0].ID != "preview-skipped" {
-		t.Fatalf("pending previews = %#v, want only preview-skipped", pending)
+	if len(pending) != 2 {
+		t.Fatalf("pending previews = %#v, want skipped and disabled previews", pending)
 	}
 }
 

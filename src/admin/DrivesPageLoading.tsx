@@ -116,18 +116,6 @@ export function DriveDetailLoading({ onBack }: { onBack: () => void }) {
                 <Activity size={16} />
                 <span>生成状态</span>
               </div>
-              <div className="admin-detail-actions-inline">
-                <span className="admin-drive-preview-toggle__label">预览视频</span>
-                <button
-                  type="button"
-                  className="toggle-switch is-on"
-                  disabled
-                  role="switch"
-                  aria-checked="true"
-                >
-                  <span className="toggle-switch__dot" />
-                </button>
-              </div>
             </header>
 
             <div className="admin-gen-columns">

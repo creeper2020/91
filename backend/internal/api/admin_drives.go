@@ -44,9 +44,6 @@ func (a *AdminServer) handleListDrives(w http.ResponseWriter, r *http.Request) {
 		LastError     string `json:"lastError,omitempty"`
 		HasCredential bool   `json:"hasCredential"`
 		CanUpload     bool   `json:"canUpload"`
-		// TeaserEnabled 控制是否给本盘生成预览视频；封面生成不受影响。
-		// 前端用它在网盘列表/编辑表单展示开关状态。
-		TeaserEnabled bool `json:"teaserEnabled"`
 		// SkipDirIDs 是用户在 admin 配置的"扫描跳过目录"集合（drive 侧目录 fileID）。
 		// 前端用它在"设置跳过目录"弹窗里回显已选项；JSON 字段名 camelCase 与
 		// catalog.Drive 保持一致。
@@ -122,7 +119,6 @@ func (a *AdminServer) handleListDrives(w http.ResponseWriter, r *http.Request) {
 			Status: d.Status, LastError: d.LastError,
 			HasCredential:                 hasCred,
 			CanUpload:                     drivepkg.CapabilitiesForKind(d.Kind).Upload,
-			TeaserEnabled:                 d.TeaserEnabled,
 			SkipDirIDs:                    append([]string{}, d.SkipDirIDs...),
 			LastCrawlAt:                   lastCrawlAt,
 			STRMAllowOutsideRoot:          strmAllowOutsideRootForDrive(d),
@@ -153,10 +149,6 @@ type upsertDriveReq struct {
 	// Deprecated: 扫描起点已固定为 rootId；保留字段只为兼容旧客户端请求体。
 	ScanRootID  string            `json:"scanRootId"`
 	Credentials map[string]string `json:"credentials"`
-	// TeaserEnabled 是 per-drive 预览视频生成开关；封面生成不受影响。
-	// 用 *bool 区分 "未传" / "传了 false"：未传时表示客户端不打算改这个字段，
-	// 沿用 catalog 现有值；新建时未传一律默认开启（true）。
-	TeaserEnabled *bool `json:"teaserEnabled,omitempty"`
 	// SkipDirIDs 同样用指针区分 "未传"（沿用旧值）/ "传了空数组"（清空）。
 	// 推荐前端"设置跳过目录"走专用 POST /drives/{id}/skip-dirs；
 	// 这里支持是为了允许批量编辑场景一次性提交。
@@ -185,7 +177,7 @@ func (a *AdminServer) handleUpsertDrive(w http.ResponseWriter, r *http.Request) 
 		defer configLease.Release()
 	}
 
-	// 凭证 / TeaserEnabled 都支持 "未传 = 沿用旧值"：先把现存 drive 拉出来一次。
+	// 凭证支持 "未传 = 沿用旧值"：先把现存 drive 拉出来一次。
 	// 只有确实不存在才进入新建路径；读取失败时继续保存会误判变更类型，甚至把
 	// 同 ID 的现有凭证当成新网盘整组替换。
 	var existing *catalog.Drive
@@ -223,18 +215,6 @@ func (a *AdminServer) handleUpsertDrive(w http.ResponseWriter, r *http.Request) 
 		body.Credentials = nonEmptyCredentials(body.Credentials)
 	}
 
-	// teaserEnabled 解析顺序：
-	//   1. 请求显式带了 → 用请求值
-	//   2. 请求没带 + 编辑现有 drive → 沿用旧值
-	//   3. 请求没带 + 新建 drive → 默认 true（用户没特别说就生成）
-	teaserEnabled := true
-	switch {
-	case body.TeaserEnabled != nil:
-		teaserEnabled = *body.TeaserEnabled
-	case existing != nil:
-		teaserEnabled = existing.TeaserEnabled
-	}
-
 	// skipDirIds 解析顺序：
 	//   1. 请求显式带了（包括空数组）→ 用请求值（空数组 = 清空）
 	//   2. 请求没带 → 在 catalog 的冲突更新 SQL 中保留当前值，避免这里先读到
@@ -249,20 +229,15 @@ func (a *AdminServer) handleUpsertDrive(w http.ResponseWriter, r *http.Request) 
 	// subsequent connection-state updates.
 	d := &catalog.Drive{
 		ID: body.ID, Kind: body.Kind, Name: body.Name,
-		RootID:        catalog.NormalizeDriveRootID(body.Kind, body.RootID),
-		Credentials:   body.Credentials,
-		Status:        "disconnected",
-		TeaserEnabled: teaserEnabled,
-		SkipDirIDs:    skipDirIDs,
+		RootID:      catalog.NormalizeDriveRootID(body.Kind, body.RootID),
+		Credentials: body.Credentials,
+		Status:      "disconnected",
+		SkipDirIDs:  skipDirIDs,
 	}
 	runtimeReload := driveRuntimeReloadRequired(existing, d)
-	teaserChanged := existing != nil && existing.TeaserEnabled != teaserEnabled
 	updateScope := DriveConfigUpdateScope(0)
 	if runtimeReload {
 		updateScope |= DriveConfigUpdateRuntime
-	}
-	if teaserChanged {
-		updateScope |= DriveConfigUpdatePreview
 	}
 	if body.SkipDirIDs != nil {
 		updateScope |= DriveConfigUpdateScan
@@ -272,9 +247,8 @@ func (a *AdminServer) handleUpsertDrive(w http.ResponseWriter, r *http.Request) 
 	}
 
 	saveErr := a.Catalog.UpsertDriveWithOptions(r.Context(), d, catalog.DriveUpsertOptions{
-		ReplaceSkipDirIDs:    body.SkipDirIDs != nil,
-		ReplaceTeaserEnabled: body.TeaserEnabled != nil,
-		PatchCredentials:     patchCredentials,
+		ReplaceSkipDirIDs: body.SkipDirIDs != nil,
+		PatchCredentials:  patchCredentials,
 	})
 	if saveErr != nil {
 		writeErr(w, http.StatusInternalServerError, saveErr)
@@ -291,18 +265,6 @@ func (a *AdminServer) handleUpsertDrive(w http.ResponseWriter, r *http.Request) 
 		})
 		deferred = deferred || wasDeferred
 		runtimeErr = applyErr
-	}
-	if teaserChanged {
-		wasDeferred, applyErr := commitDriveConfigUpdate(configLease, DriveConfigUpdatePreview, func() error {
-			if a.OnTeaserEnabledChanged != nil {
-				a.OnTeaserEnabledChanged(body.ID, teaserEnabled)
-			}
-			return nil
-		})
-		deferred = deferred || wasDeferred
-		if runtimeErr == nil {
-			runtimeErr = applyErr
-		}
 	}
 	if body.SkipDirIDs != nil {
 		wasDeferred, applyErr := commitDriveConfigUpdate(configLease, DriveConfigUpdateScan, nil)

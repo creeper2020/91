@@ -67,7 +67,7 @@ future_section:
 	if !strings.Contains(text, "builtin_pack_enabled: false") {
 		t.Fatalf("built-in tag setting was not migrated:\n%s", text)
 	}
-	want := LiveSettings{NightlyStartTime: "04:25", NightlyTimezone: "Asia/Shanghai", BuiltinTagsEnabled: false, PreviewConcurrency: DefaultGenerationConcurrency, ThumbnailConcurrency: 1, FingerprintConcurrency: 1}
+	want := LiveSettings{PreviewEnabled: true, NightlyStartTime: "04:25", NightlyTimezone: "Asia/Shanghai", BuiltinTagsEnabled: false, PreviewConcurrency: DefaultGenerationConcurrency, ThumbnailConcurrency: 1, FingerprintConcurrency: 1}
 	if got := manager.LiveSettings(); got != want {
 		t.Fatalf("live settings = %#v, want %#v", got, want)
 	}
@@ -84,7 +84,7 @@ func TestManagerYAMLValuesWinOverLegacySQLiteValues(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := LiveSettings{NightlyStartTime: "02:10", NightlyTimezone: "Asia/Shanghai", BuiltinTagsEnabled: true, PreviewConcurrency: DefaultGenerationConcurrency, ThumbnailConcurrency: 1, FingerprintConcurrency: 1}
+	want := LiveSettings{PreviewEnabled: true, NightlyStartTime: "02:10", NightlyTimezone: "Asia/Shanghai", BuiltinTagsEnabled: true, PreviewConcurrency: DefaultGenerationConcurrency, ThumbnailConcurrency: 1, FingerprintConcurrency: 1}
 	if got := manager.LiveSettings(); got != want {
 		t.Fatalf("live settings = %#v, want YAML %#v", got, want)
 	}
@@ -155,7 +155,7 @@ func TestManagerReloadPublishesExternalValidChangeAndKeepsLastGoodOnError(t *tes
 	if err != nil || !changed {
 		t.Fatalf("reload changed=%v err=%v", changed, err)
 	}
-	want := LiveSettings{NightlyDisabled: true, NightlyStartTime: "06:30", NightlyTimezone: "Asia/Shanghai", BuiltinTagsEnabled: true, PreviewConcurrency: DefaultGenerationConcurrency, ThumbnailConcurrency: 1, FingerprintConcurrency: 1}
+	want := LiveSettings{PreviewEnabled: true, NightlyDisabled: true, NightlyStartTime: "06:30", NightlyTimezone: "Asia/Shanghai", BuiltinTagsEnabled: true, PreviewConcurrency: DefaultGenerationConcurrency, ThumbnailConcurrency: 1, FingerprintConcurrency: 1}
 	if got := manager.LiveSettings(); got != want {
 		t.Fatalf("settings = %#v, want %#v", got, want)
 	}
@@ -266,5 +266,44 @@ generation:
 	changed, err = manager.MigrateLegacyRuntimeSettings(LegacyRuntimeSettings{})
 	if err != nil || changed {
 		t.Fatalf("migration was not idempotent: changed=%v err=%v", changed, err)
+	}
+}
+func TestPreviewEnabledDefaultsAndHotReload(t *testing.T) {
+	for _, source := range []string{"", "preview: {}", "preview: {enabled: true}"} {
+		cfg, err := Parse([]byte(source))
+		if err != nil || !cfg.Preview.Enabled {
+			t.Fatalf("source %q: cfg=%+v, err=%v", source, cfg, err)
+		}
+	}
+	manager, path := newManagerForTest(t, "preview: {enabled: false}\n")
+	var applied []bool
+	if err := manager.SetApply(func(settings LiveSettings) error {
+		applied = append(applied, settings.PreviewEnabled)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	result, err := manager.ReplaceYAML([]byte("preview: {enabled: true}\n"), "")
+	if err != nil || result.RestartRequired || !result.Settings.PreviewEnabled {
+		t.Fatalf("enable: %+v, %v", result, err)
+	}
+	if err := os.WriteFile(path, []byte("preview: {enabled: false}\n"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if changed, err := manager.Reload(); err != nil || !changed || manager.LiveSettings().PreviewEnabled {
+		t.Fatalf("reload: changed=%v, err=%v", changed, err)
+	}
+	if len(applied) != 3 || applied[0] || !applied[1] || applied[2] {
+		t.Fatalf("applied = %v", applied)
+	}
+	if _, err := manager.ReplaceYAML([]byte("preview: {enabled: invalid}\n"), ""); err == nil {
+		t.Fatal("invalid boolean accepted")
+	}
+	if manager.LiveSettings().PreviewEnabled {
+		t.Fatal("invalid update changed the live switch")
+	}
+	reloaded, err := NewManager(path)
+	if err != nil || reloaded.LiveSettings().PreviewEnabled {
+		t.Fatalf("disabled switch was not persisted: %v", err)
 	}
 }

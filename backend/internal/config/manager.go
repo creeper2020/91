@@ -24,6 +24,7 @@ var ErrVersionConflict = errors.New("config.yaml changed since it was loaded")
 // LiveSettings is the subset of config.yaml that the running process can
 // safely apply without rebuilding its long-lived dependencies.
 type LiveSettings struct {
+	PreviewEnabled         bool   `json:"previewEnabled"`
 	ThumbnailConcurrency   int    `json:"thumbnailConcurrency"`
 	FingerprintConcurrency int    `json:"fingerprintConcurrency"`
 	NightlyDisabled        bool   `json:"nightlyDisabled"`
@@ -81,6 +82,7 @@ func NewManager(path string) (*Manager, error) {
 
 func DefaultLiveSettings() LiveSettings {
 	return LiveSettings{
+		PreviewEnabled:         true,
 		NightlyDisabled:        DefaultNightlyDisabled,
 		NightlyStartTime:       DefaultNightlyStartTime,
 		NightlyTimezone:        DefaultNightlyTimezone,
@@ -96,6 +98,7 @@ func liveSettingsFromConfig(cfg *Config) LiveSettings {
 		return DefaultLiveSettings()
 	}
 	return LiveSettings{
+		PreviewEnabled:         cfg.Preview.Enabled,
 		NightlyDisabled:        cfg.Nightly.Disabled,
 		NightlyStartTime:       cfg.Nightly.StartTime,
 		NightlyTimezone:        cfg.Nightly.Timezone,
@@ -486,6 +489,7 @@ func removeLiveDocumentValues(document any) {
 	removeNestedValue(root, "nightly", "timezone")
 	removeNestedValue(root, "nightly", "disabled")
 	removeNestedValue(root, "tags", "builtin_pack_enabled")
+	removeNestedValue(root, "preview", "enabled")
 	removeNestedValue(root, "generation", "preview_concurrency")
 	removeNestedValue(root, "generation", "thumbnail_concurrency")
 	removeNestedValue(root, "generation", "fingerprint_concurrency")

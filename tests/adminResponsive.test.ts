@@ -1293,20 +1293,10 @@ test("crawler loading keeps the real page structure and skeletonizes only crawle
   assert.match(crawlersPageLoadingSource, /const CRAWLER_LIST_SKELETON_COUNT = 3/);
   assert.match(
     crawlersPageLoadingSource,
-    /className="admin-page admin-page--with-floating-actions admin-crawlers-page"[\s\S]*?className="admin-card admin-crawler-list" aria-busy="true">\s*<CrawlerListControlsPlaceholder \/>\s*<CrawlerListSkeleton \/>/
+    /className="admin-page admin-page--with-floating-actions admin-crawlers-page"[\s\S]*?className="admin-card admin-crawler-list" aria-busy="true">\s*<CrawlerListSkeleton \/>/
   );
-  assert.match(
-    crawlersPageLoadingSource,
-    /className="admin-crawler-list__controls admin-crawler-list__controls--placeholder"[\s\S]*?className="admin-crawler-global-teaser"[\s\S]*?预览视频[\s\S]*?className="toggle-switch"/
-  );
-  assert.match(
-    crawlersPageSource,
-    /\{loading && !hasCrawlers && <CrawlerListControlsPlaceholder \/>\}/
-  );
-  assert.match(
-    ruleBody(adminCss, ".admin-crawler-list__controls--placeholder"),
-    /visibility\s*:\s*hidden/
-  );
+  assert.doesNotMatch(crawlersPageLoadingSource, /CrawlerListControlsPlaceholder|toggle-switch/);
+  assert.doesNotMatch(crawlersPageSource, /CrawlerListControlsPlaceholder/);
   assert.match(
     crawlersPageLoadingSource,
     /className="admin-crawler-table admin-crawler-table--skeleton"[\s\S]*?role="status"[\s\S]*?aria-busy="true"[\s\S]*?admin-crawler-card-skeleton admin-card-skeleton-surface/
@@ -1315,7 +1305,7 @@ test("crawler loading keeps the real page structure and skeletonizes only crawle
     crawlersPageSource,
     /className="admin-card admin-crawler-list"[\s\S]*?aria-busy=\{loading \|\| undefined\}[\s\S]*?\{loading \? \(\s*<CrawlerListSkeleton \/>/
   );
-  assert.match(crawlersPageSource, /disabled=\{loading \|\| togglingTeasers\}/);
+  assert.doesNotMatch(crawlersPageSource, /togglingTeasers/);
   assert.doesNotMatch(crawlersPageSource, /AdminLoading/);
   assert.match(skeleton, /height\s*:\s*64px/);
   assert.match(skeleton, /border\s*:\s*1px solid var\(--border-subtle\)/);
@@ -1348,10 +1338,7 @@ test("drive detail loading renders the real page shell without animated placehol
   assert.match(detailLoadingSource, /className="admin-detail-card"/);
   assert.match(detailLoadingSource, /className="admin-gen-columns"/);
   assert.match(detailLoadingSource, /className="admin-local-storage-metrics"/);
-  assert.match(
-    detailLoadingSource,
-    /className="toggle-switch is-on"[\s\S]*disabled[\s\S]*aria-checked="true"/
-  );
+  assert.doesNotMatch(detailLoadingSource, /toggle-switch/);
   assert.doesNotMatch(detailLoadingSource, /className="admin-status"/);
   assert.doesNotMatch(detailLoadingSource, /admin-card-skeleton-surface/);
   assert.doesNotMatch(detailLoadingSource, /admin-drive-detail-skeleton__card/);
@@ -1754,22 +1741,9 @@ test("mobile admin navigation uses a CPA-style sliding drawer", () => {
   assert.match(ruleBody(css, ".admin-page__header"), /margin-bottom\s*:\s*var\(--space-3\)/);
 });
 
-test("crawler card keeps the single global preview toggle at the upper left", () => {
-  const controls = ruleBody(adminCss, ".admin-crawler-list__controls");
-  const teaser = ruleBody(adminCss, ".admin-crawler-global-teaser");
-
-  assert.match(
-    crawlersPageSource,
-    /\{hasCrawlers && \(\s*<div className="admin-crawler-list__controls">\s*<div className="admin-crawler-global-teaser">/
-  );
-  assert.equal(crawlersPageSource.match(/className="admin-crawler-global-teaser"/g)?.length, 1);
-  assert.doesNotMatch(crawlersPageSource, /admin-crawler-row__preview-toggle|onToggleTeaser/);
-  assert.match(controls, /display\s*:\s*flex/);
-  assert.match(controls, /align-items\s*:\s*flex-start/);
-  assert.match(controls, /justify-content\s*:\s*flex-start/);
-  assert.match(controls, /padding\s*:\s*var\(--space-4\)\s+var\(--space-4\)\s+0/);
-  assert.match(teaser, /display\s*:\s*inline-grid/);
-  assert.match(teaser, /justify-items\s*:\s*center/);
+test("crawler cards do not expose a separate preview switch", () => {
+  assert.doesNotMatch(crawlersPageSource, /admin-crawler-global-teaser|onToggleTeaser/);
+  assert.doesNotMatch(adminCss, /admin-crawler-global-teaser|admin-crawler-list__controls/);
 });
 
 test("crawler create action reuses the drive floating action button", () => {

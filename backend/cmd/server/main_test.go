@@ -383,7 +383,7 @@ func TestEnsureConfigAdminUserMigratesCustomConfigAdmin(t *testing.T) {
 	}
 }
 
-func TestRegisterPreviewWorkerBackfillsPendingWhenDriveTeaserEnabled(t *testing.T) {
+func TestRegisterPreviewWorkerBackfillsPendingWhenGlobalPreviewEnabled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -397,7 +397,7 @@ func TestRegisterPreviewWorkerBackfillsPendingWhenDriveTeaserEnabled(t *testing.
 		}
 	})
 
-	seedDriveWithTeaser(t, cat, "drive-id", true)
+	seedGenerationDrive(t, cat, "drive-id")
 	video := &catalog.Video{
 		ID:            "video-1",
 		DriveID:       "drive-id",
@@ -458,7 +458,7 @@ func TestRegisterPreviewWorkersRunThumbnailsAndPreviewsIndependently(t *testing.
 		}
 	})
 
-	seedDriveWithTeaser(t, cat, "drive-id", true)
+	seedGenerationDrive(t, cat, "drive-id")
 	now := time.Now()
 	video := &catalog.Video{
 		ID:            "video-1",
@@ -589,7 +589,7 @@ func TestRegisterPreviewWorkersBackfillsHistoricalFingerprints(t *testing.T) {
 	t.Fatalf("fingerprint status=%q sampled=%q, want ready with hash", got.FingerprintStatus, got.SampledSHA256)
 }
 
-func TestUpdateScriptCrawlerRunStatePreservesCurrentTeaserSwitch(t *testing.T) {
+func TestUpdateScriptCrawlerRunStatePreservesCrawlerConfiguration(t *testing.T) {
 	ctx := context.Background()
 	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
 	if err != nil {
@@ -609,12 +609,8 @@ func TestUpdateScriptCrawlerRunStatePreservesCurrentTeaserSwitch(t *testing.T) {
 			"script_path": "/tmp/crawler.py",
 			"target_new":  "10",
 		},
-		TeaserEnabled: false,
 	}); err != nil {
 		t.Fatalf("seed crawler drive: %v", err)
-	}
-	if err := cat.SetDriveTeaserEnabled(ctx, "crawler-id", true); err != nil {
-		t.Fatalf("toggle teaser: %v", err)
 	}
 
 	app := &App{cat: cat}
@@ -624,9 +620,6 @@ func TestUpdateScriptCrawlerRunStatePreservesCurrentTeaserSwitch(t *testing.T) {
 	got, err := cat.GetDrive(ctx, "crawler-id")
 	if err != nil {
 		t.Fatalf("get crawler drive: %v", err)
-	}
-	if !got.TeaserEnabled {
-		t.Fatal("teaserEnabled = false after run state update, want preserved true")
 	}
 	if got.Status != "ok" || got.LastError != "" {
 		t.Fatalf("status=%q lastError=%q, want ok with no error", got.Status, got.LastError)
@@ -816,7 +809,7 @@ func TestDriveConfigUpdateDefersEveryTaskSensitiveScope(t *testing.T) {
 	ctx := context.Background()
 
 	for _, scope := range []api.DriveConfigUpdateScope{
-		api.DriveConfigUpdatePreview,
+		api.DriveConfigUpdateRuntime,
 		api.DriveConfigUpdateScan,
 	} {
 		_, taskDone, admitted := app.registerDriveTaskContext(ctx, "drive-id", 0)
@@ -866,7 +859,7 @@ func TestDriveConfigUpdateDefersEveryTaskSensitiveScope(t *testing.T) {
 	}
 }
 
-func TestDeferredPreviewConfigRestoresWorkersStoppedDuringDrain(t *testing.T) {
+func TestDeferredScanConfigRestoresWorkersStoppedDuringDrain(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
@@ -901,11 +894,11 @@ func TestDeferredPreviewConfigRestoresWorkersStoppedDuringDrain(t *testing.T) {
 		t.Fatal("task admission rejected")
 	}
 	lease, _ := app.beginDriveConfigUpdate("drive-id")
-	if reason := lease.Authorize(api.DriveConfigUpdatePreview); reason != "" {
-		t.Fatalf("authorize preview update: %s", reason)
+	if reason := lease.Authorize(api.DriveConfigUpdateScan); reason != "" {
+		t.Fatalf("authorize scan update: %s", reason)
 	}
 	callbackSawWorkers := make(chan bool, 1)
-	deferred, err := lease.Commit(api.DriveConfigUpdatePreview, func() error {
+	deferred, err := lease.Commit(api.DriveConfigUpdateScan, func() error {
 		app.mu.Lock()
 		ready := app.workers["drive-id"] != nil &&
 			app.thumbWorkers["drive-id"] != nil &&
@@ -979,8 +972,8 @@ func TestAbortedDeferredConfigRestoresWorkersBeforeUnblocking(t *testing.T) {
 		t.Fatal("task admission rejected")
 	}
 	lease, _ := app.beginDriveConfigUpdate("drive-id")
-	if reason := lease.Authorize(api.DriveConfigUpdatePreview); reason != "" {
-		t.Fatalf("authorize preview update: %s", reason)
+	if reason := lease.Authorize(api.DriveConfigUpdateScan); reason != "" {
+		t.Fatalf("authorize scan update: %s", reason)
 	}
 	if !app.stopDriveTasks(ctx, "drive-id") {
 		t.Fatal("stopDriveTasks returned false")
@@ -1334,8 +1327,8 @@ func TestScheduleScanRunsDifferentDrivesConcurrently(t *testing.T) {
 			t.Fatalf("close catalog: %v", err)
 		}
 	})
-	seedDriveWithTeaser(t, cat, "drive-a", true)
-	seedDriveWithTeaser(t, cat, "drive-b", true)
+	seedGenerationDrive(t, cat, "drive-a")
+	seedGenerationDrive(t, cat, "drive-b")
 
 	started := make(chan string, 2)
 	release := make(chan struct{})
@@ -1505,7 +1498,6 @@ func TestReloadDriveRuntimeDoesNotStartCrawlerUploadMigration(t *testing.T) {
 			"script_path":     scriptPath,
 			"upload_drive_id": "pikpak-target",
 		},
-		TeaserEnabled: true,
 	}); err != nil {
 		t.Fatalf("seed crawler: %v", err)
 	}
@@ -1547,11 +1539,10 @@ func TestScheduleManualCrawlerUploadMigrationRunsWhenAssetsReady(t *testing.T) {
 		}
 	})
 	if err := cat.UpsertDrive(ctx, &catalog.Drive{
-		ID:            "crawler-ready",
-		Kind:          scriptcrawler.Kind,
-		Name:          "Ready Crawler",
-		RootID:        "/",
-		TeaserEnabled: true,
+		ID:     "crawler-ready",
+		Kind:   scriptcrawler.Kind,
+		Name:   "Ready Crawler",
+		RootID: "/",
 		Credentials: map[string]string{
 			"script_path":     "/tmp/ready.py",
 			"upload_drive_id": "pikpak-target",
@@ -1635,11 +1626,10 @@ func TestScheduleManualCrawlerUploadMigrationRejectsPendingFingerprint(t *testin
 		}
 	})
 	if err := cat.UpsertDrive(ctx, &catalog.Drive{
-		ID:            "crawler-pending",
-		Kind:          scriptcrawler.Kind,
-		Name:          "Pending Crawler",
-		RootID:        "/",
-		TeaserEnabled: true,
+		ID:     "crawler-pending",
+		Kind:   scriptcrawler.Kind,
+		Name:   "Pending Crawler",
+		RootID: "/",
 		Credentials: map[string]string{
 			"script_path":     "/tmp/pending.py",
 			"upload_drive_id": "pikpak-target",
@@ -1775,7 +1765,7 @@ func TestRunScanStartsFingerprintBeforeThumbnailAndPreviewDrain(t *testing.T) {
 			t.Fatalf("close catalog: %v", err)
 		}
 	})
-	seedDriveWithTeaser(t, cat, "drive-id", true)
+	seedGenerationDrive(t, cat, "drive-id")
 
 	dataPath := filepath.Join(t.TempDir(), "scan-video.mp4")
 	data := []byte("scan video content for independent fingerprint")
@@ -1860,7 +1850,7 @@ func TestRunScanBackfillsExistingFingerprintBeforeTaskReturns(t *testing.T) {
 			t.Fatalf("close catalog: %v", err)
 		}
 	})
-	seedDriveWithTeaser(t, cat, "drive-id", false)
+	seedGenerationDrive(t, cat, "drive-id")
 
 	now := time.Now()
 	if err := cat.UpsertVideo(ctx, &catalog.Video{
@@ -1922,11 +1912,11 @@ func TestNightlyTargetsComeFromCatalogBeforeDriveAttach(t *testing.T) {
 	})
 
 	for _, d := range []*catalog.Drive{
-		{ID: "115", Kind: "p115", Name: "115", RootID: "0", TeaserEnabled: true},
-		{ID: "pikpak", Kind: "pikpak", Name: "PikPak", RootID: "0", TeaserEnabled: true},
-		{ID: "crawler-main", Kind: scriptcrawler.Kind, Name: "Crawler", RootID: "/", Credentials: map[string]string{"script_path": "/tmp/crawler.py"}, TeaserEnabled: true},
-		{ID: "crawler-paused", Kind: scriptcrawler.Kind, Name: "Paused Crawler", RootID: "/", Credentials: map[string]string{"script_path": "/tmp/paused.py", "paused": "true"}, TeaserEnabled: true},
-		{ID: "crawler-deleted", Kind: scriptcrawler.Kind, Name: "Deleted Crawler", RootID: "/", Credentials: map[string]string{}, TeaserEnabled: true},
+		{ID: "115", Kind: "p115", Name: "115", RootID: "0"},
+		{ID: "pikpak", Kind: "pikpak", Name: "PikPak", RootID: "0"},
+		{ID: "crawler-main", Kind: scriptcrawler.Kind, Name: "Crawler", RootID: "/", Credentials: map[string]string{"script_path": "/tmp/crawler.py"}},
+		{ID: "crawler-paused", Kind: scriptcrawler.Kind, Name: "Paused Crawler", RootID: "/", Credentials: map[string]string{"script_path": "/tmp/paused.py", "paused": "true"}},
+		{ID: "crawler-deleted", Kind: scriptcrawler.Kind, Name: "Deleted Crawler", RootID: "/", Credentials: map[string]string{}},
 	} {
 		if err := cat.UpsertDrive(ctx, d); err != nil {
 			t.Fatalf("seed drive %s: %v", d.ID, err)
@@ -1964,7 +1954,6 @@ func TestAttachDriveSkipsUnconfiguredScriptCrawler(t *testing.T) {
 		Credentials: map[string]string{
 			"upload_drive_id": "pikpak",
 		},
-		TeaserEnabled: true,
 	}
 	if err := cat.UpsertDrive(ctx, drive); err != nil {
 		t.Fatalf("seed deleted crawler: %v", err)
@@ -1999,11 +1988,10 @@ func TestAttachDriveRejectsUnknownKind(t *testing.T) {
 		}
 	})
 	d := &catalog.Drive{
-		ID:            "unknown-main",
-		Kind:          "unknown",
-		Name:          "Unknown",
-		RootID:        "/",
-		TeaserEnabled: true,
+		ID:     "unknown-main",
+		Kind:   "unknown",
+		Name:   "Unknown",
+		RootID: "/",
 	}
 	if err := cat.UpsertDrive(ctx, d); err != nil {
 		t.Fatalf("seed drive: %v", err)
@@ -2033,7 +2021,7 @@ func TestFailedThumbnailsDoNotBlockPreviewGeneration(t *testing.T) {
 		}
 	})
 
-	seedDriveWithTeaser(t, cat, "drive-id", true)
+	seedGenerationDrive(t, cat, "drive-id")
 	now := time.Now()
 	video := &catalog.Video{
 		ID:            "video-failed-thumb",
@@ -2110,8 +2098,8 @@ func TestRegenFailedPreviewsQueuesOnlyFailedVideosForDrive(t *testing.T) {
 		}
 	})
 
-	seedDriveWithTeaser(t, cat, "drive-id", true)
-	seedDriveWithTeaser(t, cat, "other-drive", true)
+	seedGenerationDrive(t, cat, "drive-id")
+	seedGenerationDrive(t, cat, "other-drive")
 	now := time.Now()
 	for _, v := range []*catalog.Video{
 		{ID: "target-failed", DriveID: "drive-id", FileID: "file-1", Title: "Target Failed", PreviewStatus: "failed"},
@@ -3524,12 +3512,11 @@ func TestCleanupDriveVideosForDeleteRemovesRowsAndGeneratedAssetsOnly(t *testing
 	}
 
 	if err := cat.UpsertDrive(ctx, &catalog.Drive{
-		ID:            "local-main",
-		Kind:          "localstorage",
-		Name:          "Local",
-		RootID:        "/",
-		Credentials:   map[string]string{"path": originalDir},
-		TeaserEnabled: true,
+		ID:          "local-main",
+		Kind:        "localstorage",
+		Name:        "Local",
+		RootID:      "/",
+		Credentials: map[string]string{"path": originalDir},
 	}); err != nil {
 		t.Fatalf("seed drive: %v", err)
 	}
@@ -3624,12 +3611,11 @@ func TestDeleteVideoRemovesGeneratedAssetsKeepsLocalOriginalAndTombstones(t *tes
 	}
 	t.Cleanup(func() { _ = cat.Close() })
 	if err := cat.UpsertDrive(ctx, &catalog.Drive{
-		ID:            "local-main",
-		Kind:          "localstorage",
-		Name:          "Local",
-		RootID:        "/",
-		Credentials:   map[string]string{"path": originalDir},
-		TeaserEnabled: true,
+		ID:          "local-main",
+		Kind:        "localstorage",
+		Name:        "Local",
+		RootID:      "/",
+		Credentials: map[string]string{"path": originalDir},
 	}); err != nil {
 		t.Fatalf("seed drive: %v", err)
 	}
@@ -3835,11 +3821,10 @@ func TestDeleteVideoRemovesScriptCrawlerSourceFile(t *testing.T) {
 	t.Cleanup(func() { _ = cat.Close() })
 
 	if err := cat.UpsertDrive(ctx, &catalog.Drive{
-		ID:            "crawler-main",
-		Kind:          scriptcrawler.Kind,
-		Name:          "Crawler",
-		RootID:        "/",
-		TeaserEnabled: true,
+		ID:     "crawler-main",
+		Kind:   scriptcrawler.Kind,
+		Name:   "Crawler",
+		RootID: "/",
 	}); err != nil {
 		t.Fatalf("seed drive: %v", err)
 	}
@@ -4058,11 +4043,10 @@ func TestCleanupDriveVideosForDeleteScriptCrawlerRemovesOnlyLocalRows(t *testing
 	})
 
 	if err := cat.UpsertDrive(ctx, &catalog.Drive{
-		ID:            driveID,
-		Kind:          scriptcrawler.Kind,
-		Name:          "Crawler",
-		RootID:        "/",
-		TeaserEnabled: true,
+		ID:     driveID,
+		Kind:   scriptcrawler.Kind,
+		Name:   "Crawler",
+		RootID: "/",
 	}); err != nil {
 		t.Fatalf("seed crawler drive: %v", err)
 	}
@@ -4202,11 +4186,10 @@ func TestMissingDriveInspectionPreservesRowsAndGeneratedAssets(t *testing.T) {
 	})
 
 	if err := cat.UpsertDrive(ctx, &catalog.Drive{
-		ID:            "active-drive",
-		Kind:          "pikpak",
-		Name:          "Active",
-		RootID:        "root",
-		TeaserEnabled: true,
+		ID:     "active-drive",
+		Kind:   "pikpak",
+		Name:   "Active",
+		RootID: "root",
 	}); err != nil {
 		t.Fatalf("seed active drive: %v", err)
 	}
@@ -4837,17 +4820,13 @@ func (d *serverRestorableLocalUploadDrive) Remove(ctx context.Context, _ string)
 	return nil
 }
 
-// seedDriveWithTeaser 在 catalog 里 upsert 一个测试用的 drive 行，把 TeaserEnabled
-// 设为 enabled。teaser 入队判断现在按 per-drive 而不是全局 setting，所以涉及到
-// teaser worker 的测试都要先把 drive 行写进 catalog。
-func seedDriveWithTeaser(t *testing.T, cat *catalog.Catalog, driveID string, enabled bool) {
+func seedGenerationDrive(t *testing.T, cat *catalog.Catalog, driveID string) {
 	t.Helper()
 	if err := cat.UpsertDrive(context.Background(), &catalog.Drive{
-		ID:            driveID,
-		Kind:          "fake",
-		Name:          driveID,
-		RootID:        "0",
-		TeaserEnabled: enabled,
+		ID:     driveID,
+		Kind:   "fake",
+		Name:   driveID,
+		RootID: "0",
 	}); err != nil {
 		t.Fatalf("seed drive: %v", err)
 	}

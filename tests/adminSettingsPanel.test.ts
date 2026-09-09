@@ -452,3 +452,8 @@ test("compact configuration rows stay inline on mobile", () => {
     /\.admin-config-control--switch\s*\{[^}]*flex-direction:\s*column;[^}]*justify-content:\s*center;/s
   );
 });
+test("media settings expose the only global preview generation switch", () => {
+  assert.match(pageSource, /id="preview-enabled-toggle"/);
+  assert.match(pageSource, /aria-checked=\{draft\.previewEnabled\}/);
+  assert.match(pageSource, /updateVisualField\("previewEnabled", !draft\.previewEnabled\)/);
+});

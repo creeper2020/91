@@ -243,9 +243,6 @@ CREATE TABLE IF NOT EXISTS drives (
     credentials   TEXT,                          -- JSON: cookie / refresh_token 等
     status        TEXT DEFAULT 'disconnected',   -- disconnected / ok / error
     last_error    TEXT,
-    -- 是否给该盘生成预览视频：1 开 / 0 关。封面生成不受影响。
-    -- 替代了早期的全局 preview.enabled 设置（保留旧 setting 行不再读）。
-    teaser_enabled INTEGER NOT NULL DEFAULT 1,
     -- 扫描时要跳过的目录 ID 集合（JSON array of string）。命中其中任意一个的目录及其
     -- 全部子目录都不会被递归扫描，并进入发现快照的策略排除集合 X。
     -- 替代了早期硬编码"影视"目录的特例分支。

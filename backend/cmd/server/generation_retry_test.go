@@ -19,14 +19,7 @@ func failedGenerationScanApp(t *testing.T, enabled bool) (*App, *serverTreeScanD
 	t.Helper()
 	app, drv := scanResultTestApp(t)
 	ctx := context.Background()
-	drive, err := app.cat.GetDrive(ctx, drv.ID())
-	if err != nil {
-		t.Fatal(err)
-	}
-	drive.TeaserEnabled = enabled
-	if err := app.cat.UpsertDrive(ctx, drive); err != nil {
-		t.Fatal(err)
-	}
+	app.applyPreviewEnabled(ctx, enabled)
 	now := time.Now()
 	for _, id := range []string{"failed", "removed"} {
 		if err := app.cat.UpsertVideo(ctx, &catalog.Video{

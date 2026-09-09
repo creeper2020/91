@@ -370,7 +370,7 @@ func Load(path string) (*Config, error) {
 // loading and the management API use this function, so an accepted panel save
 // is guaranteed to satisfy the same invariants as a process restart.
 func Parse(data []byte) (*Config, error) {
-	var c Config
+	c := Config{Preview: Preview{Enabled: true}}
 	if err := yaml.Unmarshal(data, &c); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}

@@ -190,7 +190,6 @@ type driveOperationGate struct {
 	applyScheduled bool
 	pendingScopes  api.DriveConfigUpdateScope
 	runtimeApply   func() error
-	previewApply   func() error
 	scanApply      func() error
 	activeConfig   *catalog.Drive
 }
@@ -279,7 +278,6 @@ func (g *driveOperationGate) retireLocked() {
 	g.pending = false
 	g.pendingScopes = 0
 	g.runtimeApply = nil
-	g.previewApply = nil
 	g.scanApply = nil
 	g.applyScheduled = false
 	g.blocked = true
@@ -469,7 +467,7 @@ func (lease *driveConfigUpdateLease) Commit(scope api.DriveConfigUpdateScope, ap
 	}
 	allowed := lease.authorizedScope
 	if allowed&api.DriveConfigUpdateRuntime != 0 {
-		allowed |= api.DriveConfigUpdatePreview | api.DriveConfigUpdateScan
+		allowed |= api.DriveConfigUpdateScan
 	}
 	if scope&allowed != scope {
 		return false, fmt.Errorf("configuration scope %d was not authorized", scope)
@@ -492,10 +490,6 @@ func (lease *driveConfigUpdateLease) Commit(scope api.DriveConfigUpdateScope, ap
 		lease.gate.pendingScopes |= scope
 		if scope&api.DriveConfigUpdateRuntime != 0 {
 			lease.gate.runtimeApply = apply
-			apply = nil
-		}
-		if scope&api.DriveConfigUpdatePreview != 0 {
-			lease.gate.previewApply = apply
 			apply = nil
 		}
 		if scope&api.DriveConfigUpdateScan != 0 {
@@ -668,7 +662,6 @@ func (a *App) applyPendingDriveConfigLocked(driveID string, gate *driveOperation
 	gate.mu.Lock()
 	scopes := gate.pendingScopes
 	runtimeApply := gate.runtimeApply
-	previewApply := gate.previewApply
 	scanApply := gate.scanApply
 	gate.mu.Unlock()
 
@@ -680,14 +673,9 @@ func (a *App) applyPendingDriveConfigLocked(driveID string, gate *driveOperation
 	// At this point the old task generation is fully drained. Publish the latest
 	// persisted snapshot before notifying scope-specific consumers, then restore
 	// workers stopped during the wait. Runtime remounts already replace workers;
-	// the restart marker makes this equally reliable for preview/scan-only saves.
+	// the restart marker makes this equally reliable for scan-only saves.
 	a.refreshActiveDriveConfigAfterApply(driveID)
 	a.restoreDriveGenerationWorkers(driveID, gate)
-	if scopes&api.DriveConfigUpdatePreview != 0 {
-		if err := safelyApplyDriveConfig(previewApply); err != nil {
-			log.Printf("[drive %s] apply deferred preview configuration: %v", driveID, err)
-		}
-	}
 	if scopes&api.DriveConfigUpdateScan != 0 {
 		if err := safelyApplyDriveConfig(scanApply); err != nil {
 			log.Printf("[drive %s] apply deferred scan configuration: %v", driveID, err)
@@ -697,7 +685,6 @@ func (a *App) applyPendingDriveConfigLocked(driveID string, gate *driveOperation
 	gate.mu.Lock()
 	gate.pendingScopes = 0
 	gate.runtimeApply = nil
-	gate.previewApply = nil
 	gate.scanApply = nil
 	gate.pending = false
 	gate.applying = false
@@ -1204,6 +1191,7 @@ func (a *App) newDriveGenerationWorkers(drv drives.Drive) (*preview.Worker, *pre
 	}
 	gen := preview.New(previewCfg)
 	previewWorker := preview.NewWorker(gen, a.cat, drv)
+	previewWorker.Enabled = a.previewEnabled
 	thumbWorker := preview.NewThumbWorker(gen, a.cat, drv)
 	thumbnailLimiter, previewLimiter, fingerprintLimiter := a.generationLimits()
 	previewWorker.Limiter = previewLimiter
@@ -1348,7 +1336,6 @@ func (a *App) attachScriptCrawler(d *catalog.Drive, drv *scriptcrawler.Driver) {
 		FingerprintLimiter: fingerprintLimiter,
 		Driver:             drv,
 		Catalog:            a.cat,
-		GetDriveConfig:     a.activeDriveConfig,
 		CrawlerName:        d.Name,
 		Protocol:           protocol,
 		PythonPath:         pythonPath,
@@ -1360,7 +1347,6 @@ func (a *App) attachScriptCrawler(d *catalog.Drive, drv *scriptcrawler.Driver) {
 		LocalPreviewDir:    a.cfg.Storage.LocalPreviewDir,
 		ProxyURL:           proxyURL,
 		ConfigJSON:         configJSON,
-		DisablePreview:     !d.TeaserEnabled,
 		OnProgress: func(progress scriptcrawler.CrawlProgress) {
 			scanned := progress.Checked
 			if scanned < progress.TotalEntries {
@@ -1977,6 +1963,9 @@ func (a *App) enqueueRegisteredDriveGenerationAndWait(ctx context.Context) error
 }
 
 func (a *App) enqueuePending(ctx context.Context, driveID string, w *preview.Worker) {
+	if !a.previewEnabled() {
+		return
+	}
 	release, _, admitted := a.driveOperationGate(driveID).beginTask(ctx, driveTaskScopePreview)
 	if !admitted {
 		return
@@ -1992,6 +1981,9 @@ func (a *App) enqueuePending(ctx context.Context, driveID string, w *preview.Wor
 	}
 	log.Printf("[preview] enqueue %d pending videos for drive=%s", len(pending), driveID)
 	for _, v := range pending {
+		if !a.previewEnabled() {
+			return
+		}
 		if !w.EnqueueBlocking(ctx, v) {
 			log.Printf("[preview] enqueue pending canceled for drive=%s", driveID)
 			return
@@ -2000,13 +1992,11 @@ func (a *App) enqueuePending(ctx context.Context, driveID string, w *preview.Wor
 }
 
 func (a *App) enqueueDriveGeneration(ctx context.Context, driveID string, worker *preview.Worker, thumbWorker *preview.ThumbWorker) {
-	// 封面 worker 始终入队（与早期"全局 preview.enabled=false 时仍然生成封面"
-	// 的行为一致）；预览视频 worker 仅在该 drive 的 TeaserEnabled 为 true 时入队。
-	// 两条队列互不等待，避免封面批量生成拖住预览视频生成。
+	// Thumbnail generation is independent of the global preview switch.
 	if thumbWorker != nil {
 		a.enqueueThumbnails(ctx, driveID, thumbWorker)
 	}
-	if worker == nil || !a.teaserEnabledForDrive(ctx, driveID) {
+	if worker == nil || !a.previewEnabled() {
 		return
 	}
 	a.enqueuePending(ctx, driveID, worker)
